@@ -473,10 +473,15 @@ impl SnapshotEncoder {
         // Index current by id. Ids are a wrapping u16 counter, unique among live.
         let cur_by_id = |id: u16| cur.iter().find(|z| z.id == id);
 
-        let removed: Vec<u16> =
-            base.iter().map(|z| z.id).filter(|id| cur_by_id(*id).is_none()).collect();
-        let added: Vec<&WireZombie> =
-            cur.iter().filter(|z| !base.iter().any(|b| b.id == z.id)).collect();
+        let removed: Vec<u16> = base
+            .iter()
+            .map(|z| z.id)
+            .filter(|id| cur_by_id(*id).is_none())
+            .collect();
+        let added: Vec<&WireZombie> = cur
+            .iter()
+            .filter(|z| !base.iter().any(|b| b.id == z.id))
+            .collect();
         let survivors: Vec<(&WireZombie, &WireZombie)> = base
             .iter()
             .filter_map(|b| cur_by_id(b.id).map(|c| (c, b)))
@@ -611,7 +616,10 @@ impl SnapshotDecoder {
                 Self::read_zombie_delta(&mut r, &base.zombies)?
             }
         } else {
-            self.baseline.as_ref().map(|b| b.zombies.clone()).unwrap_or_default()
+            self.baseline
+                .as_ref()
+                .map(|b| b.zombies.clone())
+                .unwrap_or_default()
         };
 
         // loot
@@ -619,25 +627,39 @@ impl SnapshotDecoder {
             let n = r.u16()? as usize;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                v.push(WireLoot { id: r.u16()?, kind: r.u8()?, pos: r.pos()? });
+                v.push(WireLoot {
+                    id: r.u16()?,
+                    kind: r.u8()?,
+                    pos: r.pos()?,
+                });
             }
             v
         } else {
-            self.baseline.as_ref().map(|b| b.loot.clone()).unwrap_or_default()
+            self.baseline
+                .as_ref()
+                .map(|b| b.loot.clone())
+                .unwrap_or_default()
         };
 
         // grenades
         let gn = r.u8()? as usize;
         let mut grenades = Vec::with_capacity(gn);
         for _ in 0..gn {
-            grenades.push(WireGrenade { id: r.u8()?, pos: r.pos()? });
+            grenades.push(WireGrenade {
+                id: r.u8()?,
+                pos: r.pos()?,
+            });
         }
 
         // events
         let sn = r.u8()? as usize;
         let mut shots = Vec::with_capacity(sn);
         for _ in 0..sn {
-            shots.push(WireShot { slot: r.u8()?, end: r.pos()?, hit_kind: r.u8()? });
+            shots.push(WireShot {
+                slot: r.u8()?,
+                end: r.pos()?,
+                hit_kind: r.u8()?,
+            });
         }
         let bn = r.u8()? as usize;
         let mut booms = Vec::with_capacity(bn);
@@ -729,7 +751,10 @@ impl SnapshotDecoder {
         })
     }
 
-    fn read_zombie_delta(r: &mut Reader, base: &[WireZombie]) -> Result<Vec<WireZombie>, CodecError> {
+    fn read_zombie_delta(
+        r: &mut Reader,
+        base: &[WireZombie],
+    ) -> Result<Vec<WireZombie>, CodecError> {
         let rn = r.u16()? as usize;
         let mut removed = Vec::with_capacity(rn);
         for _ in 0..rn {
@@ -741,8 +766,11 @@ impl SnapshotDecoder {
             added.push(Self::read_zombie_full(r)?);
         }
 
-        let mut survivors: Vec<WireZombie> =
-            base.iter().filter(|z| !removed.contains(&z.id)).copied().collect();
+        let mut survivors: Vec<WireZombie> = base
+            .iter()
+            .filter(|z| !removed.contains(&z.id))
+            .copied()
+            .collect();
 
         let bits = r.take(survivors.len().div_ceil(8))?.to_vec();
         for (i, z) in survivors.iter_mut().enumerate() {
@@ -783,5 +811,9 @@ pub fn quant_pos3(x: f32, y: f32, z: f32) -> [i16; 3] {
 /// Rasterization helper used by AABB-related tests elsewhere; kept here so the
 /// codec module has no dependency on map generation.
 pub fn aabb_center(b: &Aabb) -> [f32; 3] {
-    [(b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5, (b.z0 + b.z1) * 0.5]
+    [
+        (b.x0 + b.x1) * 0.5,
+        (b.y0 + b.y1) * 0.5,
+        (b.z0 + b.z1) * 0.5,
+    ]
 }

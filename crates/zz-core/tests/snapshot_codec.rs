@@ -21,7 +21,14 @@ fn player(slot: u8) -> WirePlayer {
 }
 
 fn zombie(id: u16) -> WireZombie {
-    WireZombie { id, kind: 0, state: 0, pos: [id as i16 * 10, 0, 500], yaw: 0, health: 100 }
+    WireZombie {
+        id,
+        kind: 0,
+        state: 0,
+        pos: [id as i16 * 10, 0, 500],
+        yaw: 0,
+        health: 100,
+    }
 }
 
 fn base_snapshot() -> Snapshot {
@@ -32,7 +39,11 @@ fn base_snapshot() -> Snapshot {
         paused: false,
         players: (0..5).map(player).collect(),
         zombies: (0..50).map(zombie).collect(),
-        loot: vec![WireLoot { id: 1, kind: 0, pos: [0, 0, 0] }],
+        loot: vec![WireLoot {
+            id: 1,
+            kind: 0,
+            pos: [0, 0, 0],
+        }],
         grenades: vec![],
         shots: vec![],
         booms: vec![],
@@ -78,14 +89,19 @@ fn delta_chain_reconstructs_final_state() {
             }
         }
         if step % 7 == 0 && !snap.zombies.is_empty() {
-            snap.zombies.remove((rng.next() * snap.zombies.len() as f64) as usize);
+            snap.zombies
+                .remove((rng.next() * snap.zombies.len() as f64) as usize);
         }
         if step % 5 == 0 {
             snap.zombies.push(zombie(1000 + step as u16));
         }
         // loot appears/disappears occasionally
         if step == 13 {
-            snap.loot.push(WireLoot { id: 2, kind: 1, pos: [100, 0, 100] });
+            snap.loot.push(WireLoot {
+                id: 2,
+                kind: 1,
+                pos: [100, 0, 100],
+            });
         }
         if step == 29 {
             snap.loot.clear();
@@ -117,7 +133,10 @@ fn skipped_entity_sections_carry_baseline() {
         z.pos[0] += 50;
     }
     let out = dec.decode(&enc.encode(&snap, false)).unwrap();
-    assert_eq!(out.zombies, zombies_before, "decoder must keep the old zombies");
+    assert_eq!(
+        out.zombies, zombies_before,
+        "decoder must keep the old zombies"
+    );
 
     // next tick includes the section — decoder catches up to current positions
     snap.tick += 1;
@@ -194,7 +213,10 @@ fn truncation_never_panics_and_errors() {
     let frame = enc.encode(&snap, true);
     for cut in 0..frame.len() {
         let mut dec = SnapshotDecoder::new();
-        assert!(dec.decode(&frame[..cut]).is_err(), "cut at {cut} must error");
+        assert!(
+            dec.decode(&frame[..cut]).is_err(),
+            "cut at {cut} must error"
+        );
     }
 }
 
