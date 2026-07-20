@@ -3,7 +3,48 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ZombieZap</title>
+    <title>ZOMBIEZAP</title>
+    <meta
+      name="description"
+      content="free co-op zombie survival in your browser"
+    />
+
+    <!-- Open Graph / social unfurl (absolute URLs for crawlers) -->
+    <meta property="og:title" content="ZOMBIEZAP" />
+    <meta
+      property="og:description"
+      content="free co-op zombie survival in your browser"
+    />
+    <meta property="og:image" content="https://zombiezap.com/og.jpg" />
+    <meta property="og:url" content="https://zombiezap.com/" />
+    <meta property="og:type" content="website" />
+
+    <!-- Twitter / X large card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="ZOMBIEZAP" />
+    <meta
+      name="twitter:description"
+      content="free co-op zombie survival in your browser"
+    />
+    <meta name="twitter:image" content="https://zombiezap.com/og.jpg" />
+
+    <!-- Favicons (stable names at site root) -->
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+    <!--
+      Trunk copy-file: ships share assets to dist/ at the site root with
+      exact filenames (no content hashing). The directive <link> itself is
+      removed from the built HTML. See Trunk guide → Assets → copy-file.
+    -->
+    <link data-trunk rel="copy-file" href="og.jpg" />
+    <link data-trunk rel="copy-file" href="favicon.ico" />
+    <link data-trunk rel="copy-file" href="favicon-16.png" />
+    <link data-trunk rel="copy-file" href="favicon-32.png" />
+    <link data-trunk rel="copy-file" href="apple-touch-icon.png" />
+
     <link data-trunk rel="css" href="styles.css" />
     <!--
       Release: Trunk.toml cargo_profile = "wasm-release" on --release.

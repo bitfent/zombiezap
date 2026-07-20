@@ -1,0 +1,15 @@
+{
+  "name": "zombiezap-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic brand asset generator for ZombieZap (pure-JS, no native deps)",
+  "scripts": {
+    "gen:brand": "node gen-brand.mjs"
+  },
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "opentype.js": "^1.3.4",
+    "pngjs": "^7.0.0"
+  }
+}
