@@ -144,3 +144,15 @@ work next:
     reachable via `bevy::render::render_resource` (or re-exports on
     `bevy::image` internals). Prefer `TextureFormat::Rgba8UnormSrgb` for
     hand-filled RGBA buffers.
+
+19. **bevy_egui 0.41 multipass (menu + lobby):** add `EguiPlugin::default()` and
+    schedule UI systems on `EguiPrimaryContextPass` (not bare `Update`). Context
+    access is fallible: `contexts.ctx_mut()?` and the system returns Bevy
+    `Result`. Dark style uses `ctx.set_theme(Theme::Dark)` +
+    `ctx.style_mut_of(Theme::Dark, …)` (the old `ctx.style()` /
+    `set_style` pair is gone). Clipboard copy for invite links:
+    `ui.ctx().copy_text(url)` → egui `OutputCommand::CopyText` → bevy_egui
+    `process_output_system` → `EguiClipboard` (native arboard + wasm
+    `navigator.clipboard`; works on both when the page is a secure context).
+    The overlay paints `seams::LobbyView` and pushes `seams::UiIntent` only —
+    never mutates `Session` or talks to `NetClient`.
