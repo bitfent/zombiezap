@@ -54,6 +54,7 @@ pub fn generate_map(env: EnvKind, seed: &str) -> GameMap {
         EnvKind::MountainTown => super::mountain::generate(seed),
         EnvKind::DesertTown => super::desert::generate(seed),
         EnvKind::SeaTown => super::sea::generate(seed),
+        EnvKind::RomeEur => super::rome_eur::generate(seed),
     }
 }
 
