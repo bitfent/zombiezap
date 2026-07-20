@@ -31,11 +31,22 @@ impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Session::default())
             .insert_resource(Predicted::default())
+            .insert_resource(crate::seams::UiQueue::default())
+            .insert_resource(crate::seams::LobbyView::default())
+            .insert_resource(crate::seams::LatestSnapshot::default())
+            .insert_resource(crate::seams::LastStats::default())
+            .insert_resource(crate::seams::FxQueue::default())
+            .insert_resource(crate::seams::SfxQueue::default())
+            .insert_resource(crate::seams::Roster::default())
+            .insert_resource(MyId::default())
+            .insert_resource(PrevSelf::default())
             .add_systems(
                 Update,
                 (
                     connect_on_start,
                     net_poll,
+                    process_intents,
+                    sync_cursor,
                     fps_controller.run_if(in_match),
                     apply_camera.run_if(in_match),
                     interpolate_remotes.run_if(in_match),
@@ -52,11 +63,14 @@ pub enum Session {
     #[default]
     Boot,
     Connecting,
+    /// Connected; name entry + create/join UI showing.
+    Menu,
+    /// In a lobby waiting room (code shared, roster visible).
+    InLobby,
     Playing {
         my_slot: u8,
     },
-    /// Team wiped (or self dead): spectate frozen world until M4-client adds
-    /// the stats screen.
+    /// Team wiped: stats overlay over the frozen world.
     Ended {
         my_slot: u8,
     },
@@ -71,13 +85,33 @@ impl Session {
     }
 }
 
-fn in_match(session: Res<Session>) -> bool {
+/// Our connection id from Welcome — identifies "me" in lobby rosters.
+#[derive(Resource, Default)]
+struct MyId(String);
+
+/// Previous own vitals, for deriving hurt/pickup sound triggers.
+#[derive(Resource, Default)]
+struct PrevSelf {
+    health: u8,
+    ammo_reserve: u8,
+    grenades: u8,
+}
+
+pub fn in_match(session: Res<Session>) -> bool {
     session.my_slot().is_some()
 }
 
 /// True while the skeleton fly-camera should still fly (menu/boot states).
 pub fn menu_active(session: Res<Session>) -> bool {
     session.my_slot().is_none()
+}
+
+/// The lobby/menu overlay is interactive (cursor must stay free).
+pub fn ui_active(session: Res<Session>) -> bool {
+    matches!(
+        *session,
+        Session::Menu | Session::InLobby | Session::Ended { .. }
+    )
 }
 
 /// Client-side predicted self. The camera derives from this, never from raw
@@ -123,6 +157,19 @@ pub struct RemoteZombie {
     buf: VecDeque<(f64, Vec3, f32)>,
 }
 
+/// All seam-resource writes bundled to stay under Bevy's system-param limit.
+#[derive(bevy::ecs::system::SystemParam)]
+struct SeamWrites<'w> {
+    my_id: ResMut<'w, MyId>,
+    lobby_view: ResMut<'w, crate::seams::LobbyView>,
+    last_stats: ResMut<'w, crate::seams::LastStats>,
+    latest: ResMut<'w, crate::seams::LatestSnapshot>,
+    fx: ResMut<'w, crate::seams::FxQueue>,
+    sfx: ResMut<'w, crate::seams::SfxQueue>,
+    prev_self: ResMut<'w, PrevSelf>,
+    roster: ResMut<'w, crate::seams::Roster>,
+}
+
 /// Lazily-created shared handles for remote visuals.
 #[derive(Resource)]
 struct RemoteAssets {
@@ -161,6 +208,7 @@ fn net_poll(
     assets: Option<Res<RemoteAssets>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut seams: SeamWrites,
 ) {
     // one-time visual handle setup
     if assets.is_none() {
@@ -192,20 +240,52 @@ fn net_poll(
     for ev in net.drain() {
         match ev {
             NetEvent::Connected => {
-                let name = std::env::var("ZZ_NAME").unwrap_or_else(|_| "survivor".into());
-                net.send_msg(&ClientMsg::Hello { name });
-                info!("connected — hello sent");
+                info!("connected");
+                if *session == Session::Connecting {
+                    *session = Session::Menu;
+                }
+            }
+            NetEvent::Msg(ServerMsg::Welcome { player_id, .. }) => {
+                seams.my_id.0 = player_id;
+            }
+            NetEvent::Msg(ServerMsg::LobbyState {
+                code,
+                host_id,
+                players,
+                env,
+                invite_url,
+            }) => {
+                seams.lobby_view.code = code;
+                seams.lobby_view.invite_url = invite_url;
+                seams.lobby_view.is_host = host_id == seams.my_id.0;
+                seams.lobby_view.env = Some(env);
+                seams.lobby_view.players = players
+                    .iter()
+                    .map(|p| (p.name.clone(), p.id == host_id, p.id == seams.my_id.0))
+                    .collect();
+                seams.lobby_view.status.clear();
+                // fresh lobby state moves Menu→InLobby; after a match it waits
+                // for the player to dismiss the stats overlay (BackToLobby)
+                if matches!(*session, Session::Menu | Session::Connecting) {
+                    *session = Session::InLobby;
+                }
             }
             NetEvent::Msg(ServerMsg::GameStart {
                 map_seed,
                 env,
                 your_slot,
-                ..
+                players,
             }) => {
                 info!("game_start: slot {your_slot}, env {env:?}, seed {map_seed}");
                 commands.insert_resource(CurrentMap(generate_map(env, &map_seed)));
                 *session = Session::Playing { my_slot: your_slot };
                 *predicted = Predicted::default();
+                *seams.prev_self = PrevSelf::default();
+                seams.last_stats.0 = None;
+                seams.roster.0 = players
+                    .iter()
+                    .map(|p| (p.slot, p.name.clone(), p.slot == your_slot))
+                    .collect();
             }
             NetEvent::Msg(ServerMsg::MatchEnd { stats }) => {
                 info!(
@@ -213,19 +293,79 @@ fn net_poll(
                     stats.zombies_killed,
                     stats.duration_ms / 1000
                 );
+                seams.sfx.0.push_back(crate::seams::Sfx::TeamWipe);
+                seams.last_stats.0 = Some(stats);
                 if let Some(slot) = session.my_slot() {
                     *session = Session::Ended { my_slot: slot };
                 }
             }
+            NetEvent::Msg(ServerMsg::Error { message }) => {
+                warn!("server error: {message}");
+                seams.lobby_view.status = message;
+            }
             NetEvent::Msg(_) => {}
             NetEvent::Closed(reason) => {
                 warn!("disconnected: {reason} — reconnecting");
+                seams.lobby_view.status = format!("disconnected: {reason}");
                 *session = Session::Boot;
             }
             NetEvent::Snap(snap) => {
                 let (Some(my_slot), Some(map)) = (session.my_slot(), map.as_deref()) else {
                     continue;
                 };
+
+                // ── seams: visual + sound triggers derived from the wire ───
+                for s in &snap.shots {
+                    let end = Vec3::new(
+                        dequant_pos(s.end[0]),
+                        dequant_pos(s.end[1]),
+                        dequant_pos(s.end[2]),
+                    );
+                    let from_me = s.slot == my_slot;
+                    seams.fx.0.push_back(crate::seams::VisualEvent::Shot {
+                        slot: s.slot,
+                        end,
+                        hit_kind: s.hit_kind,
+                        from_me,
+                    });
+                    seams.sfx.0.push_back(crate::seams::Sfx::Shoot { from_me });
+                    if from_me && s.hit_kind == 1 {
+                        seams.sfx.0.push_back(crate::seams::Sfx::HitConfirm);
+                    }
+                    if from_me && s.hit_kind >= 2 {
+                        seams.sfx.0.push_back(crate::seams::Sfx::KillConfirm {
+                            headshot: s.hit_kind == 3,
+                        });
+                    }
+                }
+                for b in &snap.booms {
+                    let pos = Vec3::new(
+                        dequant_pos(b.pos[0]),
+                        dequant_pos(b.pos[1]),
+                        dequant_pos(b.pos[2]),
+                    );
+                    let dist = (pos
+                        - Vec3::new(predicted.body.x, predicted.body.y, predicted.body.z))
+                    .length();
+                    seams
+                        .fx
+                        .0
+                        .push_back(crate::seams::VisualEvent::Boom { pos });
+                    seams.sfx.0.push_back(crate::seams::Sfx::Explosion { dist });
+                }
+                if let Some(me) = snap.players.iter().find(|p| p.slot == my_slot) {
+                    if me.health < seams.prev_self.health {
+                        seams.sfx.0.push_back(crate::seams::Sfx::Hurt);
+                    }
+                    if me.ammo_reserve > seams.prev_self.ammo_reserve
+                        || me.grenades > seams.prev_self.grenades
+                    {
+                        seams.sfx.0.push_back(crate::seams::Sfx::Pickup);
+                    }
+                    seams.prev_self.health = me.health;
+                    seams.prev_self.ammo_reserve = me.ammo_reserve;
+                    seams.prev_self.grenades = me.grenades;
+                }
 
                 // ── self: adopt server truth, replay unacked inputs ────────
                 if let Some(me) = snap.players.iter().find(|p| p.slot == my_slot) {
@@ -345,7 +485,98 @@ fn net_poll(
                         commands.entity(e).despawn();
                     }
                 }
+
+                seams.latest.0 = Some(snap);
             }
+        }
+    }
+}
+
+// ── UI intents → protocol ──────────────────────────────────────────────────
+
+fn process_intents(
+    mut queue: ResMut<crate::seams::UiQueue>,
+    mut lobby_view: ResMut<crate::seams::LobbyView>,
+    mut session: ResMut<Session>,
+    mut net: ResMut<NetClient>,
+    latest: Res<crate::seams::LatestSnapshot>,
+) {
+    use crate::seams::UiIntent;
+    while let Some(intent) = queue.0.pop_front() {
+        match intent {
+            UiIntent::SetName(n) => lobby_view.name = n,
+            UiIntent::CreateLobby(env) => {
+                send_hello(&mut net, &lobby_view.name);
+                net.send_msg(&ClientMsg::CreateLobby { env });
+                lobby_view.status = "creating lobby…".into();
+            }
+            UiIntent::JoinLobby(code) => {
+                let code = code.trim().to_uppercase();
+                if code.is_empty() {
+                    lobby_view.status = "enter a lobby code".into();
+                    continue;
+                }
+                send_hello(&mut net, &lobby_view.name);
+                net.send_msg(&ClientMsg::JoinLobby { code });
+                lobby_view.status = "joining…".into();
+            }
+            UiIntent::SetEnv(env) => net.send_msg(&ClientMsg::SetEnv { env }),
+            UiIntent::StartGame => net.send_msg(&ClientMsg::StartGame),
+            UiIntent::LeaveLobby => {
+                net.send_msg(&ClientMsg::LeaveLobby);
+                *session = Session::Menu;
+                let name = lobby_view.name.clone();
+                *lobby_view = crate::seams::LobbyView {
+                    name,
+                    ..Default::default()
+                };
+            }
+            UiIntent::BackToLobby => {
+                // the server already returned the roster to the lobby; we just
+                // dismiss the stats overlay
+                *session = Session::InLobby;
+            }
+            UiIntent::PauseToggle => {
+                let paused = latest.0.as_ref().is_some_and(|s| s.paused);
+                net.send_msg(if paused {
+                    &ClientMsg::Resume
+                } else {
+                    &ClientMsg::Pause
+                });
+            }
+        }
+    }
+}
+
+fn send_hello(net: &mut NetClient, name: &str) {
+    let name = if name.trim().is_empty() {
+        "survivor"
+    } else {
+        name.trim()
+    };
+    net.send_msg(&ClientMsg::Hello {
+        name: name.to_string(),
+    });
+}
+
+/// The cursor is free whenever interactive UI is up; the click-to-grab flow
+/// (main.rs) only applies in-match.
+fn sync_cursor(session: Res<Session>, mut windows: Query<&mut bevy::window::CursorOptions>) {
+    if !session.is_changed() {
+        return;
+    }
+    let free = matches!(
+        *session,
+        Session::Menu
+            | Session::InLobby
+            | Session::Ended { .. }
+            | Session::Boot
+            | Session::Connecting
+    );
+    if free {
+        for mut c in windows.iter_mut() {
+            c.grab_mode = bevy::window::CursorGrabMode::None;
+            c.visible = true;
         }
     }
 }

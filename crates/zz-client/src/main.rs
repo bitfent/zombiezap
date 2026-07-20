@@ -3,9 +3,13 @@
 //! Native: `cargo run -p zz-client`
 //! Browser: `cd web && trunk serve` (see README).
 
+mod audio;
 mod game;
+mod hud;
+mod lobby_ui;
 mod map_render;
 mod net;
+mod seams;
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
@@ -51,13 +55,17 @@ fn main() {
             FrameTimeDiagnosticsPlugin::default(),
             map_render::MapRenderPlugin,
             game::GamePlugin,
+            lobby_ui::LobbyUiPlugin,
+            hud::HudPlugin,
+            audio::AudioPlugin,
         ))
         .insert_resource(net::NetClient::disconnected())
         .add_systems(Startup, (setup_scene, setup_ui))
         .add_systems(
             Update,
             (
-                toggle_cursor_grab,
+                // click-to-grab only applies in a match; menus keep the cursor
+                toggle_cursor_grab.run_if(game::in_match),
                 // the fly camera only flies before a match starts; in-match
                 // the FPS controller in game.rs owns the camera transform
                 fly_camera_look.run_if(game::menu_active),
