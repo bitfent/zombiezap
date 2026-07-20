@@ -1,0 +1,25 @@
+/* Full-viewport dark shell for the Bevy WebGL2 canvas. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0b0c0e;
+  color: #e8e8ea;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Parent fills the viewport so fit_canvas_to_parent can size the canvas. */
+body {
+  display: flex;
+}
+
+#zz-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  outline: none;
+  touch-action: none;
+}

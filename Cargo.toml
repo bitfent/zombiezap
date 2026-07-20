@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["crates/zz-core", "crates/zz-server", "crates/zz-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Versions verified against crates.io 2026-07-20. Bevy 0.19 / bevy_egui 0.41 /
+# ewebsock 0.8 enter at M3 (client); they are pinned here so every crate agrees.
+[workspace.dependencies]
+zz-core = { path = "crates/zz-core" }
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: correctly-rounded f64 parsing — the golden fixtures carry
+# full-precision doubles and the default fast path is off by 1 ULP on some.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+libm = "0.2"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.7", features = ["fs"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+bevy = { version = "0.19", default-features = false }
+bevy_egui = "0.41"
+ewebsock = "0.8"
+
+# Own code compiles fast, dependencies (Bevy!) compile optimized once.
+# line-tables-only debug info keeps backtraces useful while cutting the
+# target/ dir dramatically (full Bevy debug info filled a 99%-full disk).
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = "line-tables-only"
+
+# Browser bundle: small over fast. Native release keeps the default speed profile.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true

@@ -1,0 +1,24 @@
+# Trunk web shell for zz-client (wasm32 + WebGL2).
+#
+# From this directory:
+#   trunk serve          # dev server with auto-rebuild
+#   trunk build          # debug wasm → web/dist/
+#
+# Smaller browser bundle (uses workspace [profile.wasm-release]):
+#   trunk build --release --cargo-profile wasm-release
+# (requires Trunk that forwards --cargo-profile; otherwise set in Cargo.toml
+#  via CARGO_PROFILE or build with: cargo build -p zz-client --target
+#  wasm32-unknown-unknown --profile wasm-release and wire assets manually.)
+
+[build]
+target = "index.html"
+dist = "dist"
+public_url = "/"
+
+[watch]
+watch = ["../crates/zz-client", "."]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+open = false

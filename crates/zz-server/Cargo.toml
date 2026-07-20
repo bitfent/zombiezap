@@ -1,0 +1,19 @@
+[package]
+name = "zz-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZombieZap authoritative WebSocket game server: lobbies, 30 TPS rooms, zombie AI, combat, loot."
+
+[dependencies]
+zz-core = { workspace = true }
+libm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

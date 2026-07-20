@@ -1,0 +1,58 @@
+[package]
+name = "zz-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZombieZap first-person client: Bevy, native for dev and wasm32 for the browser."
+
+[dependencies]
+# zz-core re-enters with netcode (protocol / map / sim). Skeleton is Bevy-only.
+bevy = { workspace = true, features = [
+    # --- app core (default_app pieces, no scene/audio) ---
+    "std",
+    "async_executor",
+    "multi_threaded",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_state",
+    "reflect_auto_register",
+
+    # --- windowing / platform ---
+    "bevy_window",
+    "bevy_winit",
+    "x11",
+    "wayland",
+    "webgl2",
+    "default_font",
+
+    # --- render + pbr (no gltf / animation / audio) ---
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_light",
+    "bevy_camera",
+    "bevy_mesh",
+    "bevy_material",
+    "bevy_image",
+    "bevy_shader",
+    "bevy_color",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd_rust",
+    "png",
+
+    # --- ui + text ---
+    "bevy_text",
+    "bevy_ui",
+    "bevy_ui_render",
+] }
+
+# netcode: poll-based WebSocket, one API for native + wasm
+[dependencies.ewebsock]
+workspace = true
+
+[dependencies.zz-core]
+workspace = true
+
+[dependencies.serde_json]
+workspace = true

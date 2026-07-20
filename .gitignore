@@ -1,11 +1,10 @@
+# Rust
+target/
+# Trunk output
+web/dist/
+# legacy TS tooling
 node_modules/
 dist/
 *.log
 .env
 .DS_Store
-shotante.db
-contracts/forge-out/
-contracts/forge-cache/
-.wallets/
-apps/server/replays/
-render.mainnet.env
