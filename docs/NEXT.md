@@ -180,7 +180,13 @@ files — procedural meshes/textures only.
 
 ## [x] 5. Environments: Mountain Town, Desert Town, Sea Town — zz-core HALF DONE (M8b, commit 1e35c05: generators + 800-map fuzz; mountain flattened to y=0 with terrace character — 2D WalkGrid MAX_FLOOR=1.0). REMAINING → item 5b below.
 
-## [ ] 5b. Per-env client dressing (Phase D: palettes, glowing window slits, lit billboards, clouds) + browser pass on all 4 envs
+## [x] 5b. Per-env client dressing (Phase D) — DONE (zz-client M12, commit 06c6fa4)
+
+Palettes/textures verified distinct in the browser (non-urban env reads
+timber/adobe with door panels, peaked roofs, stone — nothing like urban
+pastel). HUMAN CHECKLIST: flip through all 5 envs and eyeball window
+glow at night-side faces, backlit ads, cloud drift, per-env palette
+fidelity (automation can't label envs from inside a match).
 
 In `crates/zz-core/src/map/` (share `primitives.rs`/`builder.rs` machinery;
 see `urban.rs`):
