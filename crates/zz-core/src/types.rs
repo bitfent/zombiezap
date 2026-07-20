@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The four procedural map environments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvKind {
+    Urban,
+    MountainTown,
+    DesertTown,
+    SeaTown,
+}
+
 /// Axis-aligned box — the only collision primitive in the game.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Aabb {
