@@ -1,0 +1,11 @@
+[package]
+name = "zz-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZombieZap first-person client: Bevy, native for dev and wasm32 for the browser."
+
+# Bevy lands in M3 (with a curated feature list). Keeping the stub Bevy-free
+# keeps `cargo test` on the workspace fast until then.
+[dependencies]
+zz-core = { workspace = true }

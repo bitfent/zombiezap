@@ -1,0 +1,13 @@
+[package]
+name = "zz-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZombieZap shared deterministic simulation: movement, raycast, mapgen, protocol, snapshot codec. Compiles natively (server) and to wasm32 (client) — one sim, two targets."
+
+# Deliberately tiny: no tokio, no bevy, no wasm-bindgen. Determinism across
+# native and wasm is the whole point of this crate (libm for transcendentals).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libm = { workspace = true }

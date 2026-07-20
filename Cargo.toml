@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/zz-core", "crates/zz-server", "crates/zz-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Versions verified against crates.io 2026-07-20. Bevy 0.19 / bevy_egui 0.41 /
+# ewebsock 0.8 enter at M3 (client); they are pinned here so every crate agrees.
+[workspace.dependencies]
+zz-core = { path = "crates/zz-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libm = "0.2"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.7", features = ["fs"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+bevy = { version = "0.19", default-features = false }
+bevy_egui = "0.41"
+ewebsock = "0.8"
+
+# Own code compiles fast, dependencies (Bevy!) compile optimized once.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Browser bundle: small over fast. Native release keeps the default speed profile.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
