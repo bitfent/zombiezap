@@ -168,18 +168,47 @@ day is when persistence gets designed on purpose — not before.
 
 ## Roadmap
 
+### Done
+
 | Milestone | State |
 |---|---|
-| Shared sim core, golden-exact port | ✅ |
+| Shared sim core, golden-exact port from the TS original | ✅ |
 | Authoritative server: horde AI, director, combat, loot, stats | ✅ |
 | Playable client: prediction, HUD, FX, audio, stats screen | ✅ |
 | Lobbies: codes, invite links, host migration, rematch | ✅ |
-| Browser build (wasm) served by the game server | 🔄 in flight |
-| Mobile touch controls + share/OG package | ⏭ next |
-| Visual identity: zombies that read as zombies, a rifle that kicks | ⏭ next |
-| Mountain Town · Desert Town · Sea Town environments | ⏭ next |
-| Proximity voice chat (stay close or lose comms) | ⏭ next |
-| Difficulty tuning at real latency, with real players | soon after |
+| Browser build, served by the game server | ✅ verified live: page → lobby → match, in a real browser |
+
+Also banked from that browser session: background tabs used to get
+presence-kicked in 8 s (render loop throttles → heartbeat stops); the server
+now sends protocol-level pings, which browsers answer even from throttled
+tabs. Dead connections still time out.
+
+### Next, in order
+
+1. **Mobile.** Touch controls (left-half stick, right-half aim drag, on-screen
+   FIRE/JUMP/GRENADE — the scheme proven in `legacy/`), soft-keyboard-safe
+   name/code entry, audio unlock on first touch. The bar: phones are not a
+   port target, they are half the audience.
+2. **Share package.** OG image + meta tags so every pasted invite link
+   unfurls as a proper card; favicons. (Later: per-lobby dynamic unfurls —
+   "Klaus needs backup, 3/5 alive".)
+3. **Visual identity.** PS2-level is fine; *reading wrong* is not. Zombies
+   become lurching articulated figures with kind variants and attack
+   telegraphs, players become survivors, a rifle viewmodel kicks and
+   flashes, and the low-res retro render target lands (also the phone
+   performance lever).
+4. **The other three towns.** Mountain, Desert, and Sea generators with
+   per-environment palettes — each map must be recognizable at a glance.
+5. **Proximity voice.** Raw PCM over the game socket, gated by distance —
+   stray from the group and you can't hear them. No WebRTC, nothing stored.
+6. **Tuning at real latency.** Director curve, hit feel at 50–100 ms, wasm
+   size diet (currently ~5.5 MB brotli), a 5-player-plus-200-zombie stress
+   histogram — with real players on the deployed server.
+
+Deploy target: **zombiezap.com** (single Render service, `render.yaml` in
+the root; `PUBLIC_URL` is both the game URL and the invite-link base). One
+known deploy caveat: Trunk's `wasm-opt` step needs binaryen present in
+Render's build image — first deploy log will tell.
 
 Billboards already exist in every map as non-colliding ad surfaces with
 placeholder art; the ad platform behind them is deliberately post-v1, as are
