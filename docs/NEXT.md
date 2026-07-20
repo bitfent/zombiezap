@@ -101,7 +101,23 @@ Port the ShotAnte touch scheme — reference implementation:
   aim, shoot, throw, host and join by code. Landscape hint shown in
   portrait.
 
-## [~] 3b. Rome EUR real-place map (USER REQUEST 2026-07-20) — R2a DONE (zz-core M11a, commit 304c5e2: baker + fixture, 764 AABBs, hollow basilica w/ portal+columns+dome tiers, 4 gates, piazzale spawns, fuzz green). REMAINING R2b (client): warm Mediterranean env_lighting entry, ROME EUR lobby picker button, OSM footer attribution, big-arena scaling checks (director pacing, occlusion bake, ground texture res), browser walkthrough of the basilica interior.
+## [x] 3b. Rome EUR real-place map (USER REQUEST 2026-07-20) — DONE (R2a 304c5e2 + R2b 8982846)
+
+Browser-verified live 2026-07-20: ROME EUR in the picker, piazzale spawn
+under warm Mediterranean light, real OSM travertine blocks at true 500 m
+scale, billboard + cover, OSM footer attribution, rifle hitscan confirmed
+(ACC 100% on a fired shot). Playtest findings for item 7:
+- Director pacing on the big map IS sparse as flagged: AFK survival 213 s
+  vs 18 s urban — zombies walk minutes to cross 250 m. Needs env-aware
+  pacing (spawn-at-nearer-gates or per-map director scale).
+- FPS slid 286 → ~28 (debug wasm) as the horde hit ~20 on Rome — profile
+  rig entity count × big map (instancing pass from item 2 spec).
+- Damage vignette washed the whole frame red on a 2 HP graze — review
+  vignette intensity curve (likely same overlay implicated in the
+  Ended-screen FPS bug).
+HUMAN CHECKLIST (automation can't drive touch/aim): basilica interior
+walkthrough, horde close-ups, live stick/aim-drag feel, real-phone
+soft keyboard + audio unlock.
 
 Viale dei Santi Pietro e Paolo + Via Eufrate at TRUE scale, the piazzale,
 and the basilica with a playable interior. Feasibility proven; data cached.
