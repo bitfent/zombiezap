@@ -183,24 +183,32 @@ presence-kicked in 8 s (render loop throttles → heartbeat stops); the server
 now sends protocol-level pings, which browsers answer even from throttled
 tabs. Dead connections still time out.
 
+### Newly landed (this wave)
+
+| Milestone | State |
+|---|---|
+| Light & atmosphere + 480×270 retro render target: per-env sky/fog/sun, shadows baked once per map, nothing pitch black | ✅ M7a |
+| Share package: OG card, favicons, social meta, Trunk copy directives | ✅ M8c |
+| Mountain / Desert / Sea Town generators + 800-map 4-env fuzz (zz-core half) | ✅ M8b |
+| Proximity-voice server relay: BIN_VOICE frames, authoritative slot, radius fan-out (server half) | ✅ M8a |
+
 ### Next, in order
 
-1. **Mobile.** Touch controls (left-half stick, right-half aim drag, on-screen
-   FIRE/JUMP/GRENADE — the scheme proven in `legacy/`), soft-keyboard-safe
-   name/code entry, audio unlock on first touch. The bar: phones are not a
-   port target, they are half the audience.
-2. **Share package.** OG image + meta tags so every pasted invite link
-   unfurls as a proper card; favicons. (Later: per-lobby dynamic unfurls —
-   "Klaus needs backup, 3/5 alive".)
-3. **Visual identity.** PS2-level is fine; *reading wrong* is not. Zombies
-   become lurching articulated figures with kind variants and attack
-   telegraphs, players become survivors, a rifle viewmodel kicks and
-   flashes, and the low-res retro render target lands (also the phone
-   performance lever).
-4. **The other three towns.** Mountain, Desert, and Sea generators with
-   per-environment palettes — each map must be recognizable at a glance.
-5. **Proximity voice.** Raw PCM over the game socket, gated by distance —
-   stray from the group and you can't hear them. No WebRTC, nothing stored.
+1. **Visual identity.** Zombies become lurching articulated figures with
+   kind variants and attack telegraphs, players become survivors, a rifle
+   viewmodel kicks and flashes. PS2-level is fine; *reading wrong* is not.
+2. **Mobile.** Touch controls (left-half stick, right-half aim drag,
+   on-screen FIRE/JUMP/GRENADE — the scheme proven in `legacy/`),
+   soft-keyboard-safe name/code entry, audio unlock on first touch. Phones
+   are not a port target, they are half the audience.
+3. **Rome EUR real-place map.** Viale dei Santi Pietro e Paolo + Via
+   Eufrate at true 500 m scale from OpenStreetMap data, the piazzale, and
+   the basilica with a playable interior (feasibility proven; corridor
+   data + prototype in `scripts/rome-eur/`).
+4. **Per-env dressing.** Palettes, glowing window slits, lit billboards —
+   each of the four towns recognizable at a glance in the browser.
+5. **Proximity voice, client half.** Capture + playback with distance
+   fade; the server relay is already live. No WebRTC, nothing stored.
 6. **Tuning at real latency.** Director curve, hit feel at 50–100 ms, wasm
    size diet (currently ~5.5 MB brotli), a 5-player-plus-200-zombie stress
    histogram — with real players on the deployed server.

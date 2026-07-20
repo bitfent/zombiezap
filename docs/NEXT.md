@@ -10,7 +10,7 @@ map). All workspace tests green, clippy zero. PR #1 tracks `rust-rewrite`.
 
 ---
 
-## [ ] 1. Light & atmosphere + retro target (USER-APPROVED PLAN, Phase A+B)
+## [x] 1. Light & atmosphere + retro target (USER-APPROVED PLAN, Phase A+B) — DONE (zz-client M7a, commit 40a1cce; browser screenshot pass pending)
 
 User bar, verbatim: "lightweight but nice. It's ok if we have ps2 graphics
 but it must look like a game." Real failure observed live: building
@@ -76,7 +76,35 @@ Port the ShotAnte touch scheme — reference implementation:
   aim, shoot, throw, host and join by code. Landscape hint shown in
   portrait.
 
-## [ ] 4. Share package (task "M6c" part 2)
+## [ ] 3b. Rome EUR real-place map (USER REQUEST 2026-07-20)
+
+Viale dei Santi Pietro e Paolo + Via Eufrate at TRUE scale, the piazzale,
+and the basilica with a playable interior. Feasibility proven; data cached.
+
+- Source: OSM (ODbL — add "© OpenStreetMap contributors" to page footer).
+  Cached corridor extract: `scripts/rome-eur/rome-corridor.json`
+  (79 buildings, both streets; basilica way 23432370, height=88).
+  Prototype decomposition + preview: `scripts/rome-eur/bake-prototype.py`,
+  `arena-preview.svg`.
+- Arena: 500×500 m true scale (`arena_half = 250` — fits the i16 wire
+  format's ±255.9 m exactly; do NOT touch POS_SCALE, goldens are bit-exact).
+  Basilica-anchored window: 96% of both streets fit; the 4 street/edge
+  crossings become the gates.
+- Baker: port the prototype to a committed generator emitting a Rust
+  fixture module (zero-asset rule: generated CODE, not data files at
+  runtime); ~770 AABBs after 2 m-grid greedy decomposition.
+- Authored on top of the real footprints: basilica interior (hollow
+  Greek-cross nave, portal from the piazzale, columns, altar, stacked-box
+  dome tiers), street cover (parked-car/planter crates), spawn cluster on
+  the piazzale, per-env lighting entry (warm Mediterranean sun).
+- KNOWN RISKS: 6× bigger arena than today — director pacing, WalkGrid
+  resolution, ground-texture/occlusion-bake resolution all need scaling
+  checks; if 5 players feel lost, the baker takes a `--clip 300` cut
+  centered on basilica + Via Eufrate crossing.
+- DoD: fuzz-grade invariants pass on the fixture (spawns, ≥3 BFS gates);
+  60 fps in-browser; the basilica reads instantly in a screenshot.
+
+## [x] 4. Share package (task "M6c" part 2) — DONE (web M8c, commit 306fa64: og.jpg + favicons + meta + Trunk copy directives)
 
 - Generate `web/og.jpg` (1200×630): adapt `legacy/scripts/gen-brand.mjs`
   (node; pixel fonts are in `legacy/scripts/*.ttf`) for ZOMBIEZAP branding —
@@ -109,7 +137,9 @@ files — procedural meshes/textures only.
 - DoD: screenshot review — a stranger identifies "zombie game with a gun"
   instantly; native + browser parity; clippy zero; suites green.
 
-## [ ] 5. Environments: Mountain Town, Desert Town, Sea Town (task #11) — fold per-env dressing (Phase D: palettes, glowing window slits, lit billboards, clouds) in here
+## [x] 5. Environments: Mountain Town, Desert Town, Sea Town — zz-core HALF DONE (M8b, commit 1e35c05: generators + 800-map fuzz; mountain flattened to y=0 with terrace character — 2D WalkGrid MAX_FLOOR=1.0). REMAINING → item 5b below.
+
+## [ ] 5b. Per-env client dressing (Phase D: palettes, glowing window slits, lit billboards, clouds) + browser pass on all 4 envs
 
 In `crates/zz-core/src/map/` (share `primitives.rs`/`builder.rs` machinery;
 see `urban.rs`):
@@ -127,7 +157,7 @@ see `urban.rs`):
 - Fuzz: extend `crates/zz-core/tests/mapgen_fuzz.rs` to all 4 envs.
 - DoD: fuzz green ×4; load each env in browser + native; env picker works.
 
-## [ ] 6. Proximity voice (task #13)
+## [ ] 6. Proximity voice (task #13) — server relay DONE (zz-server M8a, commit 9049422: BIN_VOICE=2, authoritative slot rewrite, radius fan-out, bot suite). REMAINING: client capture/playback below.
 
 Design (ShotAnte port, one-to-N): new binary tag BIN_VOICE=2 —
 `[tag u8, speaker_slot u8, 16kHz mono i16 PCM ~120ms]`. Server
