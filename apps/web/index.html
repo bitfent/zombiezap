@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <title>ShotAnte — ante up, duel, winner takes the pot</title>
+    <meta
+      name="description"
+      content="Retro 3D browser duels with a wagered pot. Connect a wallet, ante in, fight a 2-minute 1v1, winner takes the pot."
+    />
+    <meta name="theme-color" content="#0a0a12" />
+
+    <!-- Favicons -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+
+    <!-- Open Graph / Twitter: the unfurl card is the first impression every
+         invite link makes — it has to look like the game. Per-challenge
+         unfurls come from the server's /c/:code route. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="ShotAnte" />
+    <meta property="og:title" content="ShotAnte — you've been challenged" />
+    <meta
+      property="og:description"
+      content="Retro 1v1 duels in your browser. No install. Ante ETH or USDC on Base — first to 5 kills takes the pot."
+    />
+    <meta property="og:url" content="https://shotante.com/" />
+    <meta property="og:image" content="https://shotante.com/og.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="ShotAnte — you've been challenged" />
+    <meta
+      name="twitter:description"
+      content="Retro 1v1 duels in your browser. No install. Winner takes the pot."
+    />
+    <meta name="twitter:image" content="https://shotante.com/og.jpg" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- menu overlay -->
+      <div id="menu" class="overlay">
+        <div class="menu-inner">
+        <h1 class="logo">SHOT<span class="hot">ANTE</span></h1>
+        <p class="tagline">
+          <span class="t-ante">ante up</span><span class="t-dot">·</span><span class="t-duel">duel</span><span class="t-dot">·</span><span class="t-pot">winner takes the pot</span>
+        </p>
+        <p id="ticker" class="ticker hidden"></p>
+        <!-- proximity VOICE chat is on in every match; grant the mic once here -->
+        <button id="mic-warning" class="mic-warning" type="button">
+          🎙️ Enable your mic for proximity voice chat
+        </button>
+
+        <div class="panel">
+          <!-- invite landing card (filled from /api/challenge/:code) -->
+          <div id="invite-card" class="invite-card hidden">
+            <p class="ic-title" id="ic-title">YOU'VE BEEN CHALLENGED</p>
+            <p class="ic-sub" id="ic-sub"></p>
+            <button id="ic-join" class="btn primary">JOIN THE DUEL</button>
+            <button id="ic-wallet-rejoin" class="btn ghost hidden">RETURNING? REJOIN WITH WALLET</button>
+          </div>
+
+          <!-- active DeathMatch card: your one in-flight duel, always on Home -->
+          <div id="active-match-card" class="invite-card am-card hidden">
+            <p class="ic-title" id="am-title">YOUR DEATHMATCH</p>
+            <p class="ic-sub" id="am-sub"></p>
+            <p class="hint countdown" id="am-countdown"></p>
+            <div class="link-row" id="am-link-row">
+              <input id="am-link" readonly />
+              <button id="am-copy" class="btn">COPY</button>
+            </div>
+            <div class="actions">
+              <button id="am-primary" class="btn primary">OPEN</button>
+              <button id="am-cancel" class="btn ghost">CANCEL</button>
+            </div>
+          </div>
+
+          <label for="name">CALLSIGN</label>
+          <input id="name" maxlength="16" placeholder="player_one" autocomplete="off" />
+
+          <!-- the one-tap flow: tap → link is ready → send it -->
+          <!-- shared crossed-swords glyph (the ⚔ char fell back to a tiny system glyph) -->
+          <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+            <defs>
+              <symbol id="sym-swords" viewBox="0 0 16 16">
+                <path d="M2 1h2L12.6 9.6 11 11.2 2.4 2.6Z" />
+                <path d="M14 1h-2L3.4 9.6 5 11.2 13.6 2.6Z" />
+                <rect x="8.9" y="10.3" width="5.2" height="1.7" transform="rotate(-45 11.5 11.15)" />
+                <rect x="1.9" y="10.3" width="5.2" height="1.7" transform="rotate(45 4.5 11.15)" />
+                <rect x="13" y="12.9" width="2.3" height="2.3" />
+                <rect x="0.7" y="12.9" width="2.3" height="2.3" />
+              </symbol>
+            </defs>
+          </svg>
+
+          <button id="btn-challenge" class="btn primary big">
+            <svg class="ico-swords" aria-hidden="true"><use href="#sym-swords" /></svg>
+            START A DEATHMATCH
+          </button>
+          <p class="hint center" id="hint-tap">one tap — you get a link, send it, the duel starts when they open it</p>
+
+          <div class="actions" id="home-actions">
+            <button id="btn-practice" class="btn">PRACTICE</button>
+            <button id="btn-duel" class="btn">QUICK 1v1</button>
+          </div>
+          <button id="btn-wager" class="btn wager hidden">
+            <svg class="ico-swords" aria-hidden="true"><use href="#sym-swords" /></svg>
+            QUICK WAGERED 1v1
+          </button>
+
+          <button id="btn-more" class="btn ghost">MORE OPTIONS ▾</button>
+
+          <!-- advanced: public listing, wagers, scheduling, browsing -->
+          <div id="create-panel" class="subpanel hidden">
+            <div class="actions">
+              <button id="opt-public" class="btn toggle on">PUBLIC</button>
+              <button id="opt-private" class="btn toggle">PRIVATE</button>
+            </div>
+            <div class="actions">
+              <button id="opt-free" class="btn toggle on">FREE</button>
+              <button id="opt-wagered" class="btn toggle" disabled>
+                <svg class="ico-swords" aria-hidden="true"><use href="#sym-swords" /></svg>
+                WAGERED
+              </button>
+            </div>
+            <!-- fixed-stake wager: pick a token + a USD tier (winner takes the pot) -->
+            <div id="wager-opts" class="hidden">
+              <div class="actions">
+                <button id="tok-usdc" class="btn toggle on">USDC</button>
+                <button id="tok-eth" class="btn toggle">BASE ETH</button>
+              </div>
+              <div class="actions" id="tier-row">
+                <button class="btn toggle tier" data-cents="25">$0.25</button>
+                <button class="btn toggle tier on" data-cents="100">$1</button>
+                <button class="btn toggle tier" data-cents="500">$5</button>
+                <button class="btn toggle tier" data-cents="1000">$10</button>
+              </div>
+              <p class="hint" id="wager-hint">$1 ante each · winner takes the pot</p>
+            </div>
+            <button id="btn-create-go" class="btn primary">CREATE THIS DEATHMATCH</button>
+            <button id="btn-browse" class="btn">BROWSE OPEN DEATHMATCHES</button>
+          </div>
+
+          <!-- shared lobby (host + guest, survives refreshes via stored keys) -->
+          <div id="lobby-panel" class="subpanel hidden">
+            <p class="ll-title" id="lobby-title">SEND THIS LINK TO YOUR FRIEND</p>
+            <div id="share-block">
+              <div class="link-row">
+                <input id="invite-link" readonly />
+                <button id="btn-copy-invite" class="btn">COPY</button>
+              </div>
+              <button id="btn-share" class="btn primary">SHARE LINK</button>
+              <div class="qr-wrap"><canvas id="qr" width="116" height="116"></canvas></div>
+            </div>
+            <div id="lobby-slots" class="slots">
+              <div class="slot" id="slot-host"><span class="sl-name">—</span><span class="sl-state"></span></div>
+              <div class="slot" id="slot-guest"><span class="sl-name">waiting…</span><span class="sl-state"></span></div>
+            </div>
+            <div class="chatbox">
+              <div id="chat-msgs" class="chat-msgs"></div>
+              <form id="lobby-chat-form" class="chat-form">
+                <input id="lobby-chat-input" maxlength="120" placeholder="say hi…" autocomplete="off" />
+                <button class="btn ghost" type="submit">SEND</button>
+              </form>
+            </div>
+            <p class="hint" id="room-hint">waiting for an opponent…</p>
+            <div class="actions">
+              <button id="btn-back-lobby" class="btn ghost">&larr; BACK</button>
+              <button id="btn-cancel-room" class="btn ghost danger">CANCEL DEATHMATCH</button>
+            </div>
+          </div>
+
+          <!-- open deathmatches board (live board_update push) -->
+          <div id="browse-panel" class="subpanel hidden">
+            <label>OPEN NOW</label>
+            <div id="board-open" class="rooms"><p class="hint">no open deathmatches — start one</p></div>
+          </div>
+
+          <p class="hint" id="menu-status">
+            free to play, no sign-in needed — connect a wallet (Base, MetaMask, Rabby) only for wagered duels
+          </p>
+          <button id="btn-wallet" class="btn ghost">SIGN IN WITH BASE</button>
+          <button id="btn-wallet-ext" class="btn ghost">CONNECT METAMASK / RABBY</button>
+          <div id="wallet-pick" class="actions hidden"></div>
+        </div>
+
+        <p class="keys">
+          <span class="kc"><kbd>WASD</kbd> move</span>
+          <span class="kc"><kbd>MOUSE</kbd> aim</span>
+          <span class="kc"><kbd>CLICK</kbd> shoot</span>
+          <span class="kc"><kbd>SPACE</kbd> jump</span>
+          <span class="kc"><kbd>[ ]</kbd> sensitivity</span>
+          <span class="kc gold">FIRST TO 5 KILLS</span>
+        </p>
+        </div>
+      </div>
+
+      <!-- in-game HUD -->
+      <div id="hud" class="hidden">
+        <div id="crosshair"><span class="ch-h"></span><span class="ch-v"></span><span class="ch-dot"></span></div>
+        <div id="hud-top">
+          <span id="hud-timer">2:00</span>
+          <span id="hud-score">0 — 0</span>
+        </div>
+        <div id="hud-health-wrap"><div id="hud-health"></div></div>
+        <div id="killfeed"></div>
+        <!-- proximity voice: ring above a talking opponent in range -->
+        <div id="speaking-ring" class="hidden"><span></span></div>
+        <div id="hitmarker" class="hidden">✕</div>
+        <div id="banner" class="hidden"></div>
+        <!-- mic-state pill: OFF / DENIED / LIVE; tap to self-mute -->
+        <button id="mic" class="hidden" type="button">MIC ON</button>
+        <button id="claim-btn" class="btn primary hidden">SUBMIT RESULT + CLAIM POT</button>
+        <button id="rematch-btn" class="btn hidden">REMATCH — SEND A NEW LINK</button>
+        <div id="lock-hint" class="hidden">CLICK TO AIM</div>
+        <div id="sens-toast" class="hidden"></div>
+        <!-- touch controls (visible only on touch devices) -->
+        <div id="touch-ui">
+          <div id="stick"><div id="stick-knob"></div></div>
+          <button id="btn-jump" type="button">JUMP</button>
+          <button id="btn-fire" type="button">FIRE</button>
+        </div>
+      </div>
+
+      <canvas id="game"></canvas>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

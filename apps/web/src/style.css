@@ -1,0 +1,715 @@
+/* ShotAnte — retro neon UI. Pixel fonts (OFL) + the 8-bit panel language
+   carried over from the endpoint.farm design system, re-hued for the arena:
+   danger red + signal cyan on near-black. */
+
+@font-face {
+  font-family: "Press Start 2P";
+  src: url("/fonts/press-start-2p-latin.woff2") format("woff2");
+  font-display: swap;
+}
+@font-face {
+  font-family: "VT323";
+  src: url("/fonts/vt323-latin.woff2") format("woff2");
+  font-display: swap;
+}
+
+:root {
+  --bg: #0a0a12;
+  --panel: #14141f;
+  --border: #2c2c44;
+  --text: #e8ecff;
+  --muted: #8a90b8;
+  --red: #ff3355;
+  --red-hot: #ff5577;
+  --cyan: #2ee6d6;
+  --amber: #ffd23f;
+  --pixel: "Press Start 2P", monospace;
+  --body: "VT323", monospace;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  height: 100dvh; /* track the real visible area as Safari's toolbar collapses */
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--body);
+  overflow: hidden;
+}
+
+#app { position: relative; width: 100%; height: 100%; height: 100dvh; }
+
+#game {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated; /* low internal res upscaled = the retro look */
+  cursor: crosshair;
+}
+
+/* ── menu ── */
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  /* notch-aware padding (the viewport is viewport-fit=cover) */
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  /* when the menu is taller than the screen (small phones), scroll instead of
+     clipping the logo off the top — with native momentum + elastic bounce so
+     it never feels locked */
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  overscroll-behavior-y: contain;
+  /* translucent vignette + scanlines — the live attract-mode duel renders on
+     the canvas behind, so the menu looks INTO the game instead of hiding it */
+  background:
+    repeating-linear-gradient(to bottom, transparent 0 2px, rgba(0, 0, 0, 0.22) 2px 4px),
+    radial-gradient(ellipse at center, rgba(13, 13, 28, 0.3) 0%, rgba(5, 5, 10, 0.82) 100%);
+}
+/* On desktop the wrapper is transparent (display:contents) so .overlay lays out
+   the menu exactly as before. On touch it becomes a real flex box that is always
+   1px taller than the viewport (see body.touch rule) — that sliver of overflow
+   is what lets iOS rubber-band even when nothing needs scrolling. */
+.menu-inner { display: contents; }
+.hidden { display: none !important; }
+
+.logo {
+  font-family: var(--pixel);
+  font-size: clamp(28px, 6vw, 56px);
+  margin: 0;
+  letter-spacing: 2px;
+  color: var(--text);
+
+  /* ── single glow knob ──────────────────────────────────────────────────
+     --glow scales the halo OPACITY for the whole wordmark. It's the one and
+     only dial for glow strength: set it once here, override it once per
+     breakpoint. Blur/offset stay in em so they scale with the font; opacity
+     is what we tune, because a physically smaller title (mobile) concentrates
+     the same-ratio halo into a brighter peak, so it needs LESS opacity to
+     read at the same strength as the larger desktop title. */
+  --glow: 1;
+  --glow-cyan-1: rgba(46, 230, 214, calc(0.45 * var(--glow)));
+  --glow-cyan-2: rgba(46, 230, 214, calc(0.30 * var(--glow)));
+  --glow-red-1: rgba(255, 51, 85, calc(0.45 * var(--glow)));
+  --glow-red-2: rgba(255, 51, 85, calc(0.30 * var(--glow)));
+
+  /* one cohesive neon sign: a tight inner halo + soft outer bloom, same
+     blur/spread on both colour halves so cyan + red read as one lit sign. */
+  text-shadow:
+    0 0 0.07em var(--glow-cyan-1),
+    0 0 0.28em var(--glow-cyan-2),
+    0.05em 0.05em 0 #05050a;
+}
+.logo .hot {
+  color: var(--red);
+  text-shadow:
+    0 0 0.07em var(--glow-red-1),
+    0 0 0.28em var(--glow-red-2),
+    0.05em 0.05em 0 #05050a;
+}
+.tagline {
+  font-family: var(--pixel);
+  font-size: clamp(8px, 2.7vw, 12px);
+  margin: 0;
+  letter-spacing: 1px;
+  text-align: center;
+  line-height: 1.7;
+  max-width: 100%;
+  padding-inline: 6px;
+  overflow-wrap: anywhere; /* the wide pixel font must never overflow narrow phones */
+  animation: tagline-glow 3.2s ease-in-out infinite;
+}
+.tagline .t-ante { color: var(--amber); }
+.tagline .t-duel { color: var(--cyan); }
+.tagline .t-pot { color: var(--text); }
+.tagline .t-dot { color: var(--muted); margin: 0 0.6em; }
+@keyframes tagline-glow {
+  0%, 100% { text-shadow: 0 0 0 rgba(255, 210, 63, 0); opacity: 0.85; }
+  50% { text-shadow: 0 0 14px rgba(255, 210, 63, 0.35); opacity: 1; }
+}
+
+/* live upcoming-duels strip — real board data, click to browse */
+.ticker {
+  font-family: var(--pixel);
+  font-size: 8px;
+  letter-spacing: 1px;
+  margin: 0;
+  padding: 6px 12px;
+  color: var(--cyan);
+  background: rgba(5, 5, 10, 0.65);
+  border: 2px solid var(--border);
+  cursor: pointer;
+  animation: ticker-pulse 2.4s ease-in-out infinite;
+}
+.ticker:hover { color: var(--text); }
+
+/* homepage mic-enable banner — grant the mic once for proximity voice chat.
+   A real tap target (44px) so iOS treats it as a user gesture for getUserMedia. */
+.mic-warning {
+  font-family: var(--pixel);
+  font-size: 8px;
+  letter-spacing: 1px;
+  line-height: 1.5;
+  margin: 0;
+  min-height: 44px;
+  padding: 8px 14px;
+  color: var(--bg);
+  background: var(--cyan);
+  border: 2px solid var(--cyan);
+  cursor: pointer;
+  text-align: center;
+  max-width: min(420px, 90vw);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  animation: ticker-pulse 2.4s ease-in-out infinite;
+}
+.mic-warning:hover { filter: brightness(1.1); }
+.mic-warning.hidden { display: none; }
+
+/* crossed-swords icon — inline SVG in currentColor, sized to the button text
+   (the ⚔ glyph fell back to a system font and rendered as a tiny x) */
+.ico-swords {
+  width: 1.5em;
+  height: 1.5em;
+  fill: currentColor;
+  vertical-align: -0.35em;
+  margin-right: 0.35em;
+  image-rendering: pixelated;
+}
+.btn.big .ico-swords {
+  width: 2em;
+  height: 2em;
+  vertical-align: -0.6em;
+  margin-right: 0.45em;
+}
+
+@keyframes ticker-pulse {
+  0%, 100% { opacity: 0.75; }
+  50% { opacity: 1; }
+}
+
+.panel {
+  background: var(--panel);
+  border: 3px solid var(--border);
+  padding: 22px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(420px, 92vw);
+  box-shadow: 6px 6px 0 #05050a;
+}
+.panel label { font-family: var(--pixel); font-size: 8px; color: var(--cyan); letter-spacing: 1px; }
+.panel input {
+  font-family: var(--body);
+  font-size: 22px;
+  background: #0c0c16;
+  border: 2px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  outline: none;
+}
+.panel input:focus { border-color: var(--cyan); }
+
+.actions { display: flex; gap: 10px; }
+.btn {
+  flex: 1;
+  font-family: var(--pixel);
+  font-size: 10px;
+  padding: 14px 10px;
+  background: #0c0c16;
+  color: var(--text);
+  border: 2px solid var(--border);
+  cursor: pointer;
+  letter-spacing: 1px;
+  box-shadow: 3px 3px 0 #05050a;
+}
+.btn:hover { border-color: var(--cyan); color: var(--cyan); }
+.btn.primary { background: var(--red); border-color: var(--red-hot); color: #fff; }
+.btn.primary:hover { background: var(--red-hot); color: #fff; }
+.btn.ghost { font-size: 8px; padding: 10px; }
+.btn:disabled { opacity: 0.5; cursor: default; }
+
+.hint { font-size: 17px; color: var(--muted); margin: 0; line-height: 1.4; }
+.hint.center { text-align: center; margin-top: -4px; }
+
+/* the hero action: one tap → shareable duel link */
+.btn.big {
+  font-size: 13px;
+  padding: 18px 12px;
+  box-shadow: 4px 4px 0 #05050a, 0 0 22px rgba(255, 51, 85, 0.35);
+}
+.btn.wager { border-color: var(--amber); color: var(--amber); font-size: 9px; }
+.btn.wager:hover { background: rgba(255, 210, 63, 0.12); }
+#claim-btn {
+  position: absolute;
+  top: 56%;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: auto;
+  width: auto;
+  flex: none;
+  padding: 16px 22px;
+}
+#rematch-btn {
+  position: absolute;
+  top: 66%;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: auto;
+  width: auto;
+  flex: none;
+  padding: 12px 18px;
+  font-size: 9px;
+}
+/* controls strip: keycap chips instead of a wall of mid-dots */
+.keys {
+  font-family: var(--pixel);
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 1px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px 14px;
+  max-width: 720px;
+}
+.kc {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  animation: kc-rise 0.45s ease backwards;
+}
+.kc:nth-child(1) { animation-delay: 0.05s; }
+.kc:nth-child(2) { animation-delay: 0.1s; }
+.kc:nth-child(3) { animation-delay: 0.15s; }
+.kc:nth-child(4) { animation-delay: 0.2s; }
+.kc:nth-child(5) { animation-delay: 0.25s; }
+.kc:nth-child(6) { animation-delay: 0.3s; }
+.kc:nth-child(7) { animation-delay: 0.4s; }
+.kc kbd {
+  font-family: var(--pixel);
+  font-size: 8px;
+  color: var(--text);
+  background: #14141f;
+  border: 2px solid var(--border);
+  border-bottom-width: 4px; /* keycap depth */
+  padding: 4px 6px 3px;
+}
+.kc.gold {
+  color: var(--amber);
+  border: 2px solid rgba(255, 210, 63, 0.4);
+  padding: 4px 8px;
+  animation: kc-rise 0.45s ease backwards, gold-pulse 2.6s ease-in-out 0.4s infinite;
+}
+@keyframes kc-rise {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes gold-pulse {
+  0%, 100% { border-color: rgba(255, 210, 63, 0.25); }
+  50% { border-color: rgba(255, 210, 63, 0.75); }
+}
+
+/* lobby */
+.divider { font-family: var(--pixel); font-size: 7px; color: var(--muted); text-align: center; letter-spacing: 1px; }
+.subpanel { display: flex; flex-direction: column; gap: 10px; border-top: 2px solid var(--border); padding-top: 12px; }
+.btn.toggle { font-size: 8px; opacity: 0.55; }
+.btn.toggle.on { opacity: 1; border-color: var(--cyan); color: var(--cyan); }
+.btn.toggle.on.wager-on { border-color: var(--amber); color: var(--amber); }
+/* wager selector: space the token row, tier row, and hint like the rest of the panel */
+#wager-opts { display: flex; flex-direction: column; gap: 10px; margin-top: 2px; }
+#wager-opts .hint { margin: 0; }
+#tier-row .tier { flex: 1; }
+#wallet-pick { flex-wrap: wrap; margin-top: 8px; }
+#wallet-pick .btn { flex: 1; }
+/* lobby: the link is the hero */
+.ll-title { margin: 0; font-family: var(--pixel); font-size: 10px; color: var(--amber); text-align: center; letter-spacing: 1px; }
+#share-block { display: flex; flex-direction: column; gap: 10px; }
+.link-row { display: flex; gap: 6px; }
+#invite-link {
+  flex: 1;
+  min-width: 0;
+  font-size: 18px;
+  color: var(--cyan);
+  border-color: var(--cyan);
+  background: rgba(46, 230, 214, 0.06);
+}
+.link-row .btn { flex: none; padding: 10px 14px; }
+.rooms { display: flex; flex-direction: column; gap: 8px; max-height: 160px; overflow-y: auto; }
+.room-row {
+  display: flex; align-items: center; gap: 10px;
+  background: #0c0c16; border: 2px solid var(--border); padding: 8px 10px;
+}
+.room-row .rr-name { flex: 1; font-size: 19px; }
+.room-row .rr-sub { display: block; font-size: 15px; color: var(--muted); }
+.room-row .rr-tag { font-family: var(--pixel); font-size: 7px; color: var(--amber); }
+.room-row button { flex: none; font-size: 8px; padding: 8px 12px; }
+
+/* invite landing card */
+.invite-card {
+  display: flex; flex-direction: column; gap: 8px;
+  border: 2px solid var(--red); background: rgba(255, 51, 85, 0.07);
+  padding: 12px; text-align: center;
+}
+.invite-card .ic-title { margin: 0; font-family: var(--pixel); font-size: 10px; color: var(--red-hot); letter-spacing: 1px; }
+.invite-card .ic-sub { margin: 0; font-size: 18px; color: var(--text); line-height: 1.35; }
+
+/* active DeathMatch card: your one in-flight duel, always on Home */
+.am-card { gap: 10px; border-color: var(--amber); background: rgba(255, 210, 63, 0.06); }
+.am-card #am-title { color: var(--amber); }
+.am-card #am-countdown { font-family: var(--pixel); font-size: 8px; color: var(--muted); letter-spacing: 1px; text-align: center; margin: 0; }
+.am-card .link-row { margin: 0; }
+.am-card .actions { margin: 0; }
+.btn.danger:hover { border-color: var(--red-hot); color: var(--red-hot); }
+
+/* shared lobby: player slots */
+.slots { display: flex; gap: 10px; }
+.slot {
+  flex: 1; display: flex; flex-direction: column; gap: 4px; align-items: center;
+  background: #0c0c16; border: 2px solid var(--border); padding: 8px 6px;
+}
+.slot .sl-name { font-size: 19px; overflow: hidden; text-overflow: ellipsis; max-width: 100%; white-space: nowrap; }
+.slot .sl-state { font-family: var(--pixel); font-size: 7px; color: var(--muted); letter-spacing: 1px; min-height: 9px; }
+.slot.ready { border-color: var(--cyan); }
+.slot.ready .sl-state { color: var(--cyan); }
+.slot.absent { opacity: 0.55; }
+
+.countdown { font-family: var(--pixel); font-size: 10px; color: var(--amber); text-align: center; letter-spacing: 1px; }
+.qr-wrap { display: flex; justify-content: center; }
+#qr { border: 4px solid #fff; image-rendering: pixelated; }
+
+/* schedule picker */
+#schedule-row { display: flex; flex-direction: column; gap: 8px; }
+#schedule-row.hidden { display: none; }
+input[type="datetime-local"] { color-scheme: dark; }
+#reminder-email:disabled { opacity: 0.45; font-size: 17px; }
+
+/* lobby chat (ephemeral — nothing leaves RAM) */
+.chatbox { display: flex; flex-direction: column; gap: 6px; }
+.chat-msgs {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 92px; min-height: 24px; overflow-y: auto;
+  background: #0c0c16; border: 2px solid var(--border); padding: 6px 8px;
+  font-size: 17px; line-height: 1.3;
+}
+.chat-msgs .cm-from { color: var(--cyan); }
+.chat-msgs .cm-self .cm-from { color: var(--amber); }
+.chat-form { display: flex; gap: 6px; }
+.chat-form input { flex: 1; font-size: 17px; padding: 6px 8px; }
+.chat-form button { flex: none; }
+
+/* ── HUD ── */
+#hud { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
+
+/* Geometric crosshair, exactly centered (a font glyph never is): four ticks
+   with a center gap + a 2px dot marking the TRUE aim point. */
+#crosshair {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 26px;
+  height: 26px;
+  transform: translate(-50%, -50%);
+}
+#crosshair .ch-h,
+#crosshair .ch-v {
+  position: absolute;
+  background: var(--cyan);
+  box-shadow: 0 0 5px rgba(46, 230, 214, 0.9);
+}
+#crosshair .ch-h {
+  top: 12px;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  clip-path: polygon(0 0, 31% 0, 31% 100%, 0 100%, 0 0, 69% 0, 100% 0, 100% 100%, 69% 100%, 69% 0);
+}
+#crosshair .ch-v {
+  left: 12px;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  clip-path: polygon(0 0, 100% 0, 100% 31%, 0 31%, 0 69%, 100% 69%, 100% 100%, 0 100%);
+}
+#crosshair .ch-dot {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  width: 2px;
+  height: 2px;
+  background: #fff;
+}
+#hud-top {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 26px;
+  font-family: var(--pixel);
+  font-size: 14px;
+  text-shadow: 2px 2px 0 #05050a;
+}
+#hud-timer { color: var(--amber); }
+#hud-score { color: var(--text); }
+#hud-health-wrap {
+  position: absolute;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(320px, 60vw);
+  height: 16px;
+  background: #0c0c16;
+  border: 2px solid var(--border);
+}
+#hud-health { height: 100%; width: 100%; background: linear-gradient(90deg, var(--red), var(--red-hot)); transition: width 0.15s; }
+#killfeed {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 19px;
+  color: var(--muted);
+  text-align: right;
+}
+#killfeed .kf { text-shadow: 1px 1px 0 #05050a; }
+#killfeed .kf strong { color: var(--red-hot); }
+
+/* proximity VOICE: in-game mic-state pill + opponent speaking ring */
+#mic {
+  position: absolute;
+  left: 16px;
+  bottom: 28px;
+  font-family: var(--body);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--text);
+  background: rgba(12, 12, 22, 0.82);
+  border: 2px solid var(--cyan);
+  padding: 7px 12px;
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: manipulation;
+  text-shadow: 1px 1px 0 #05050a;
+  transition: color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+#mic.live {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 10px rgba(46, 230, 214, 0.7);
+}
+#mic.muted {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+#mic.denied {
+  color: var(--muted);
+  border-color: var(--muted);
+}
+#speaking-ring {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  pointer-events: none;
+}
+#speaking-ring span {
+  display: block;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 3px solid var(--cyan);
+  box-shadow: 0 0 12px rgba(46, 230, 214, 0.8);
+  animation: speak-pulse 0.7s ease-in-out infinite;
+}
+@keyframes speak-pulse {
+  0%, 100% { transform: scale(0.82); opacity: 0.55; }
+  50% { transform: scale(1.08); opacity: 1; }
+}
+#hitmarker {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 34px;
+  color: var(--red-hot);
+  text-shadow: 0 0 8px rgba(255, 51, 85, 0.9);
+}
+#banner {
+  position: absolute;
+  top: 34%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--pixel);
+  font-size: clamp(14px, 3vw, 26px);
+  color: var(--amber);
+  text-shadow: 0 0 14px rgba(255, 210, 63, 0.5), 3px 3px 0 #05050a;
+  text-align: center;
+  line-height: 1.8;
+}
+
+#lock-hint {
+  position: absolute;
+  bottom: 30%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--pixel);
+  font-size: 11px;
+  color: var(--cyan);
+  letter-spacing: 1px;
+  text-shadow: 2px 2px 0 #05050a;
+  animation: lockpulse 1.2s steps(2) infinite;
+}
+@keyframes lockpulse { 50% { opacity: 0.35; } }
+
+#sens-toast {
+  position: absolute;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--pixel);
+  font-size: 10px;
+  color: var(--amber);
+  text-shadow: 2px 2px 0 #05050a;
+}
+
+/* ── touch controls (shown only when <body class="touch">) ── */
+#touch-ui { display: none; }
+body.touch #touch-ui { display: block; }
+body.touch #lock-hint { display: none !important; }
+
+#stick {
+  position: absolute;
+  left: 18vw;
+  top: 70vh;
+  width: 112px;
+  height: 112px;
+  margin: -56px 0 0 -56px;
+  border: 2px solid var(--border);
+  border-radius: 50%;
+  background: rgba(20, 20, 31, 0.45);
+  opacity: 0.55;
+}
+#stick.active { opacity: 0.9; border-color: var(--cyan); }
+#stick-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 44px;
+  height: 44px;
+  margin: -22px 0 0 -22px;
+  border-radius: 50%;
+  background: var(--cyan);
+  opacity: 0.8;
+  box-shadow: 0 0 10px rgba(46, 230, 214, 0.6);
+}
+#btn-fire,
+#btn-jump {
+  position: absolute;
+  pointer-events: auto;
+  font-family: var(--pixel);
+  border-radius: 50%;
+  border: 3px solid;
+  background: rgba(20, 20, 31, 0.55);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+  user-select: none;
+}
+#btn-fire {
+  right: 6vw;
+  bottom: 12vh;
+  width: 96px;
+  height: 96px;
+  font-size: 12px;
+  color: var(--red-hot);
+  border-color: var(--red);
+  box-shadow: 0 0 14px rgba(255, 51, 85, 0.4);
+}
+#btn-fire:active { background: rgba(255, 51, 85, 0.35); }
+#btn-jump {
+  right: calc(6vw + 112px);
+  bottom: calc(12vh + 70px);
+  width: 64px;
+  height: 64px;
+  font-size: 9px;
+  color: var(--cyan);
+  border-color: var(--border);
+}
+#btn-jump:active { background: rgba(46, 230, 214, 0.3); }
+
+/* touch: keep the mic pill out of the FIRE/JUMP thumb zone (lift it up-left) */
+body.touch #mic {
+  left: calc(env(safe-area-inset-left) + 12px);
+  bottom: calc(env(safe-area-inset-bottom) + 40vh);
+  font-size: 12px;
+  padding: 9px 13px;
+}
+
+body.touch #hud-health-wrap { bottom: 12px; width: 40vw; }
+/* lock scroll/bounce ONLY in-game (menu hidden) so drag-to-aim and the touch
+   stick never pan the page. The menu/lobby (menu visible) scrolls natively. */
+body.touch:has(#menu.hidden) { touch-action: none; overscroll-behavior: none; }
+
+/* ── mobile menu: keep the logo on-screen and the column tight ── */
+/* The keyboard-controls strip is meaningless without a keyboard and is the
+   biggest vertical-space hog on phones — drop it on touch devices. */
+body.touch .keys { display: none; }
+
+/* Elastic menu on touch: the wrapper carries the menu layout and is always a
+   hair taller than the scroll area, so the overlay is permanently scrollable by
+   ~1px. That gives iOS its native rubber-band bounce even when everything fits,
+   while real overflow (lobby/chat) scrolls normally. The overlay just anchors
+   from the top so nothing clips; the wrapper centers the content vertically. */
+body.touch .overlay { justify-content: flex-start; }
+body.touch .menu-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* `safe center` centres when everything fits, but falls back to flex-start
+     when the column overflows (e.g. the room-not-found error card + the sound
+     button on a short landscape screen) — plain `center` clips the top edge,
+     hiding the title where it can't even be scrolled to. */
+  justify-content: safe center;
+  gap: 18px;
+  width: 100%;
+  min-height: calc(100% + 1px);
+}
+
+@media (max-width: 540px) {
+  /* tighter rhythm on phones; vertical centering + elastic scroll are handled
+     by the body.touch .menu-inner rule above */
+  .overlay { justify-content: flex-start; gap: 12px; }
+  body.touch .menu-inner { gap: 12px; }
+
+  /* Size the wordmark to the viewport WIDTH so the wide pixel font can never
+     overflow (8 glyphs ~= 8em, so ~9.2vw keeps it inside the screen with room
+     for the glow). nowrap keeps it on one clean line. Tracking matches desktop's
+     ratio (2px/56px ≈ 0.036em) so the glyph density — and thus how the per-letter
+     halos overlap — is the same as desktop, not a tighter (stronger) packing. */
+  .logo {
+    font-size: clamp(22px, 9.2vw, 46px);
+    letter-spacing: 0.036em;
+    white-space: nowrap;
+
+    /* The one glow knob. The smaller mobile title concentrates the same-ratio
+       halo into a brighter peak, so dial the opacity down ~30% to read at the
+       same strength as desktop. Tune THIS number alone to fine-tune parity. */
+    --glow: 0.7;
+  }
+
+  /* wrap cleanly to centered lines instead of bleeding past both edges */
+  .tagline { font-size: clamp(7px, 3vw, 11px); line-height: 1.6; }
+  .tagline .t-dot { margin: 0 0.35em; }
+
+  .panel { padding: 16px; width: min(420px, 94vw); gap: 10px; }
+  .btn.big { font-size: 12px; padding: 16px 10px; }
+  .hint.center { font-size: 15px; }
+}

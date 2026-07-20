@@ -1,0 +1,23 @@
+{
+  "name": "@shotante/server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "dev:bun": "bun --watch src/index.ts",
+    "start:bun": "bun src/index.ts"
+  },
+  "dependencies": {
+    "@shotante/shared": "*",
+    "postgres": "^3.4.5",
+    "viem": "^2.52.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0"
+  }
+}

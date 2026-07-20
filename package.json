@@ -1,0 +1,33 @@
+{
+  "name": "shotante",
+  "private": true,
+  "version": "0.1.0",
+  "description": "ShotAnte — retro 3D browser duel with a wagered pot. Ante, fight, win, settle.",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace @shotante/web run dev",
+    "dev:server": "npm --workspace @shotante/server run dev",
+    "typecheck": "tsc -p packages/shared && tsc -p apps/server && tsc -p apps/web",
+    "verify:match": "node scripts/bot-match.mjs",
+    "compile:contract": "node scripts/compile-contract.mjs",
+    "test:contract": "forge test --root contracts",
+    "deploy:escrow": "node scripts/deploy-escrow.mjs",
+    "claim:fees": "node scripts/claim-fees.mjs",
+    "verify:wager": "node scripts/bot-wager.mjs",
+    "rehearse:anvil": "node scripts/rehearse-anvil.mjs",
+    "verify:challenge": "node scripts/bot-challenge.mjs",
+    "verify:reclaim": "node scripts/bot-wallet-reclaim.mjs",
+    "gen:brand": "node scripts/gen-brand.mjs",
+    "check:mapgen": "node --experimental-strip-types scripts/check-mapgen.mjs"
+  },
+  "devDependencies": {
+    "opentype.js": "^2.0.0",
+    "sharp": "^0.35.1",
+    "typescript": "^5.5.0",
+    "viem": "^2.52.2"
+  }
+}
