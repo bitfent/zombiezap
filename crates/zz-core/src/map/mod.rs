@@ -8,8 +8,12 @@
 //! Note: `ARENA_HALF` here is the **legacy** 30.0 playfield half-size. Do not
 //! use `crate::constants::ARENA_HALF` (the co-op 40.0 value).
 
+mod coop;
+mod grid;
 mod urban;
 
+pub use coop::{Billboard, GameMap, Gate, generate_map};
+pub use grid::WalkGrid;
 pub use urban::{find_open_spot, generate_arena};
 
 use crate::types::Aabb;
