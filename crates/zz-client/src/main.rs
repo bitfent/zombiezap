@@ -13,6 +13,7 @@ mod net;
 mod platform;
 mod retro;
 mod seams;
+mod touch;
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
@@ -65,6 +66,7 @@ fn main() {
             lobby_ui::LobbyUiPlugin,
             hud::HudPlugin,
             audio::AudioPlugin,
+            touch::TouchPlugin,
         ))
         .insert_resource(net::NetClient::disconnected())
         .add_systems(Startup, (setup_scene, setup_ui))
@@ -223,12 +225,23 @@ fn setup_ui(mut commands: Commands) {
 /// Left-click locks/hides the cursor; Esc releases it.
 ///
 /// Bevy 0.19: cursor grab lives on the `CursorOptions` component (no longer
-/// `Window::cursor.grab_mode`).
+/// `Window::cursor.grab_mode`). Disabled entirely in touch mode — on-screen
+/// stick/aim need a free cursor (and `?touch=1` desktop automation uses mouse
+/// as a pointer, not pointer-lock deltas).
 fn toggle_cursor_grab(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    touch: Res<touch::TouchIntent>,
     mut cursor_options: Single<&mut CursorOptions>,
 ) {
+    if touch.enabled {
+        // Keep free + visible so stick/buttons receive cursor positions.
+        if cursor_options.grab_mode != CursorGrabMode::None {
+            cursor_options.visible = true;
+            cursor_options.grab_mode = CursorGrabMode::None;
+        }
+        return;
+    }
     if mouse.just_pressed(MouseButton::Left) {
         cursor_options.visible = false;
         cursor_options.grab_mode = CursorGrabMode::Locked;

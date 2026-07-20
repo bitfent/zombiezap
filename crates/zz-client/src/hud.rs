@@ -17,6 +17,7 @@ use zz_core::snapshot::{Snapshot, WireLoot, WirePlayer, dequant_pos};
 
 use crate::game::{self, Predicted, Session};
 use crate::seams::{FxQueue, LastStats, LatestSnapshot, Roster, UiIntent, UiQueue, VisualEvent};
+use crate::touch::TouchIntent;
 
 // ── timing / layout constants ──────────────────────────────────────────────
 
@@ -50,6 +51,7 @@ impl Plugin for HudPlugin {
             Update,
             (
                 gate_visibility,
+                lift_hud_for_thumbs,
                 pause_key.run_if(game::in_match),
                 (
                     update_crosshair,
@@ -145,6 +147,42 @@ fn setup_fx_root(mut commands: Commands) {
 }
 
 // ── UI markers ─────────────────────────────────────────────────────────────
+
+/// Bottom-corner HUD panels that must clear thumbs in touch mode.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum HudCorner {
+    BottomLeft,
+    BottomRight,
+}
+
+/// Raise bottom vitals/ammo so the virtual stick (left) and FIRE cluster
+/// (right) do not cover them. Desktop keeps the original inset.
+fn lift_hud_for_thumbs(
+    touch: Res<TouchIntent>,
+    mut q: Query<(&HudCorner, &mut Node)>,
+) {
+    // Touch: park health above the stick (~28% from bottom), ammo above the
+    // FIRE button cluster. Non-touch: original 28 px bottom inset.
+    let (bl_bottom, br_bottom) = if touch.enabled {
+        (px(200.0), px(200.0))
+    } else {
+        (px(28.0), px(28.0))
+    };
+    for (corner, mut node) in &mut q {
+        match corner {
+            HudCorner::BottomLeft => {
+                if node.bottom != bl_bottom {
+                    node.bottom = bl_bottom;
+                }
+            }
+            HudCorner::BottomRight => {
+                if node.bottom != br_bottom {
+                    node.bottom = br_bottom;
+                }
+            }
+        }
+    }
+}
 
 /// Standard in-match HUD chrome (hidden unless Session::Playing).
 #[derive(Component)]
@@ -303,9 +341,11 @@ fn setup_hud_ui(mut commands: Commands) {
     commands.spawn(arm(2.0, 10.0, 0.0, 11.0));
 
     // Bottom-left: health bar + numeric.
+    // Markers used by `lift_hud_for_thumbs` so touch mode can clear the stick zone.
     commands
         .spawn((
             HudChrome,
+            HudCorner::BottomLeft,
             Node {
                 position_type: PositionType::Absolute,
                 bottom: px(28),
@@ -349,9 +389,11 @@ fn setup_hud_ui(mut commands: Commands) {
         });
 
     // Bottom-right: ammo + grenade pips.
+    // Lifted in touch mode so FIRE/JUMP/NADE thumbs don't cover ammo.
     commands
         .spawn((
             HudChrome,
+            HudCorner::BottomRight,
             Node {
                 position_type: PositionType::Absolute,
                 bottom: px(28),

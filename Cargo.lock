@@ -6856,6 +6856,7 @@ dependencies = [
  "bevy",
  "bevy_egui",
  "ewebsock",
+ "js-sys",
  "serde_json",
  "wasm-bindgen",
  "web-sys",

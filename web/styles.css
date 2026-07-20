@@ -89,3 +89,96 @@ body {
     transform: translateX(320%);
   }
 }
+
+/* ── touch soft-keyboard overlays (shown by platform.rs in menu) ─────────── */
+
+#zz-touch-fields {
+  position: fixed;
+  left: 50%;
+  top: 12%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  width: min(360px, 88vw);
+  padding: 12px 14px;
+  background: rgba(12, 14, 18, 0.92);
+  border: 1px solid #222830;
+  border-radius: 10px;
+  box-sizing: border-box;
+  pointer-events: auto;
+}
+
+.zz-touch-label {
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  color: #7a828e;
+}
+
+#zz-name-input,
+#zz-code-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 16px; /* ≥16px avoids iOS focus-zoom */
+  color: #e8e8ea;
+  background: #161a20;
+  border: 1px solid #2ee6d6;
+  border-radius: 6px;
+  padding: 10px 12px;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+#zz-code-input {
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  font-size: 1.15rem;
+}
+
+/* ── portrait landscape hint (body.touch only) ───────────────────────────── */
+
+#zz-landscape-hint {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 12, 14, 0.94);
+  pointer-events: none;
+}
+
+body.touch #zz-landscape-hint {
+  /* shown only in portrait via media query below */
+  display: none;
+}
+
+@media (orientation: portrait) {
+  body.touch #zz-landscape-hint {
+    display: flex;
+  }
+}
+
+.zz-landscape-card {
+  text-align: center;
+  letter-spacing: 0.14em;
+  color: #2ee6d6;
+  font-size: 1.05rem;
+  text-transform: lowercase;
+}
+
+.zz-landscape-icon {
+  font-size: 2.4rem;
+  margin-bottom: 0.6rem;
+  color: #e8e8ea;
+}
+
+.zz-landscape-sub {
+  margin-top: 0.45rem;
+  font-size: 0.8rem;
+  color: #7a828e;
+  letter-spacing: 0.18em;
+}

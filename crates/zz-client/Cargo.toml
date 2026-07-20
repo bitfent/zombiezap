@@ -63,11 +63,20 @@ workspace = true
 [dependencies.bevy_egui]
 workspace = true
 
-# Browser platform seam: same-origin WS URL, ?join= prefill, localStorage name.
+# Browser platform seam: same-origin WS URL, ?join= prefill, localStorage name,
+# touch detection (Navigator.maxTouchPoints), soft-keyboard HTML overlays.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Window",
     "Location",
     "Storage",
+    "Navigator",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "DomTokenList",
+    "CssStyleDeclaration",
 ] }

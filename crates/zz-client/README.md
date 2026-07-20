@@ -303,3 +303,43 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     recoil via a side channel (`ViewmodelKick`) so hud can still drain
     `FxQueue` for tracers without racing the viewmodel. Muzzle-flash uses a
     unique `StandardMaterial` handle (item 23) with alpha + visibility fade.
+
+39. **Touch mode (M10):** `platform::is_touch_mode()` — wasm uses
+    `navigator.maxTouchPoints` with `?touch=1` / `?touch=0` override; native
+    uses `ZZ_TOUCH=1`. `touch::TouchPlugin` draws stick + FIRE/JUMP/NADE on
+    the present camera (native-res bevy_ui, `GlobalZIndex(50)`). Left half
+    (~45%) owns the stick; right half drag is aim only (taps do not fire).
+    Mouse LMB is treated as a single pointer so desktop `?touch=1` is
+    automatable. Intent lands in `TouchIntent` and is OR'd into the same
+    30 Hz `PlayerInput` path in `game::fps_controller` (send cadence
+    untouched). Stick dead zone 0.35; aim sens `0.0025 * 2.0` rad/px.
+
+40. **Soft-keyboard bridge:** egui `TextEdit` never summons mobile keyboards.
+    `web/index.html` has `#zz-name-input` / `#zz-code-input` overlays;
+    `platform::set_touch_text_overlays` + DOM poll (`html_name_value` /
+    `html_code_value`) bridge into `UiIntent::SetName` / join draft while
+    `Session::Menu` on touch. Portrait shows `#zz-landscape-hint` via CSS
+    (`body.touch` + `orientation: portrait`).
+
+41. **Audio unlock:** `web/index.html` installs a one-shot
+    pointer/keydown listener that resumes any `AudioContext` it can find
+    and exposes `window.__zzUnlockAudio`. Rust `platform::unlock_audio()`
+    (called on first gesture from `touch.rs`) is the second path; a quiet
+    `Sfx::Click` is also queued to prime Bevy's audio graph inside the
+    gesture frame.
+
+### Touch automation anchors (`?touch=1`)
+
+Window-relative centres (logical px). Stick uses fractions of window size;
+buttons use fixed insets from the bottom-right:
+
+| Control | Centre (logical) |
+|---------|------------------|
+| Stick   | `(0.18 * W, 0.72 * H)` — drag ≥ 0.35 × 64 px for a direction |
+| FIRE    | `(W - 56, H - 72)` — hold to shoot |
+| JUMP    | `(W - 168, H - 150)` |
+| NADE    | `(W - 168, H - 72)` |
+
+On a 1280×720 pane: stick **(230, 518)**, FIRE **(1224, 648)**, JUMP
+**(1112, 570)**, NADE **(1112, 648)**. Aim: press-drag on the right half
+(e.g. start at `(900, 360)`, drag horizontally).

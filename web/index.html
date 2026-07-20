@@ -77,6 +77,51 @@
       </div>
     </div>
     <canvas id="zz-canvas"></canvas>
+
+    <!--
+      Soft-keyboard bridge (touch devices / ?touch=1): egui TextEdit does not
+      summon mobile keyboards. Shown only while the menu is up (platform.rs
+      toggles display). Values are polled into LobbyView / join draft.
+    -->
+    <div id="zz-touch-fields" style="display: none" aria-hidden="true">
+      <label class="zz-touch-label" for="zz-name-input">CALLSIGN</label>
+      <input
+        id="zz-name-input"
+        type="text"
+        name="zz-name"
+        autocomplete="nickname"
+        maxlength="24"
+        placeholder="survivor"
+        enterkeyhint="done"
+        autocapitalize="off"
+        spellcheck="false"
+        style="display: none"
+      />
+      <label class="zz-touch-label" for="zz-code-input">LOBBY CODE</label>
+      <input
+        id="zz-code-input"
+        type="text"
+        name="zz-code"
+        autocomplete="off"
+        maxlength="5"
+        placeholder="XXXXX"
+        enterkeyhint="go"
+        autocapitalize="characters"
+        spellcheck="false"
+        inputmode="text"
+        style="display: none"
+      />
+    </div>
+
+    <!-- Portrait orientation: ask for landscape (touch CSS shows this). -->
+    <div id="zz-landscape-hint" aria-live="polite">
+      <div class="zz-landscape-card">
+        <div class="zz-landscape-icon" aria-hidden="true">↻</div>
+        <div>rotate your phone</div>
+        <div class="zz-landscape-sub">landscape works best</div>
+      </div>
+    </div>
+
     <script>
       (function () {
         var loader = document.getElementById("zz-loading");
@@ -99,6 +144,43 @@
             hide();
           }
         }, 100);
+      })();
+
+      // Audio unlock for browser autoplay policy. Bevy/rodio AudioContexts
+      // start suspended until a user gesture; resume any we can find, and
+      // expose __zzUnlockAudio for the wasm client to call as a second path.
+      (function () {
+        var unlocked = false;
+        function unlock() {
+          if (unlocked) return;
+          unlocked = true;
+          try {
+            var AC = window.AudioContext || window.webkitAudioContext;
+            if (AC) {
+              // Resume any live contexts hanging off the page / rodio.
+              var contexts = window.__zzAudioContexts || [];
+              for (var i = 0; i < contexts.length; i++) {
+                try {
+                  if (contexts[i] && contexts[i].state === "suspended") {
+                    contexts[i].resume();
+                  }
+                } catch (e) {}
+              }
+              // Also poke a throwaway context in-gesture (helps some browsers).
+              try {
+                var c = new AC();
+                if (c.state === "suspended") c.resume();
+                // Keep a reference so later Bevy sinks may share the gesture unlock.
+                if (!window.__zzAudioContexts) window.__zzAudioContexts = [];
+                window.__zzAudioContexts.push(c);
+              } catch (e) {}
+            }
+          } catch (e) {}
+        }
+        window.__zzUnlockAudio = unlock;
+        ["pointerdown", "touchend", "click", "keydown"].forEach(function (evt) {
+          window.addEventListener(evt, unlock, { once: true, capture: true });
+        });
       })();
     </script>
   </body>

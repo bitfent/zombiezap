@@ -1,6 +1,7 @@
 //! Platform seam: native vs wasm32 differences for server URL, invite join
-//! codes, and player name persistence. game.rs / lobby_ui call these only —
-//! no `cfg` elsewhere for these concerns.
+//! codes, player name persistence, touch-mode detection, and the mobile
+//! soft-keyboard HTML overlay bridge. game.rs / lobby_ui / touch call these
+//! only — no `cfg` elsewhere for these concerns.
 
 /// WebSocket URL for the game server.
 ///
@@ -61,6 +62,148 @@ pub fn persist_name(name: &str) {
     }
 }
 
+/// Whether the client should run in touch-control mode.
+///
+/// * Wasm: `?touch=1` forces on, `?touch=0` forces off; otherwise
+///   `navigator.maxTouchPoints > 0`.
+/// * Native: `ZZ_TOUCH=1` forces on; otherwise false (mouse/keyboard).
+///
+/// Call once at startup and cache in a resource — query string / env do not
+/// change mid-session.
+pub fn is_touch_mode() -> bool {
+    if let Some(forced) = touch_override() {
+        return forced;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_max_touch_points() > 0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
+/// Explicit touch override: `Some(true)` / `Some(false)` / `None` (autodetect).
+fn touch_override() -> Option<bool> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match std::env::var("ZZ_TOUCH").ok().as_deref() {
+            Some("1") | Some("true") | Some("TRUE") => Some(true),
+            Some("0") | Some("false") | Some("FALSE") => Some(false),
+            _ => None,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_query_param("touch").and_then(|v| match v.as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        })
+    }
+}
+
+/// Mark `<body class="touch">` so CSS landscape-hint / overlay rules apply.
+/// No-op on native.
+pub fn apply_touch_body_class(enabled: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_set_body_class("touch", enabled);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = enabled;
+    }
+}
+
+/// Show/hide the HTML name + lobby-code `<input>` overlays used on touch
+/// devices (egui text fields do not summon mobile soft keyboards).
+///
+/// * `name` — menu name field
+/// * `code` — menu join-code field
+///
+/// No-op on native (touch soft-keyboard bridge is wasm-only).
+pub fn set_touch_text_overlays(name: bool, code: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Inputs use `block`; the shell is a column flex.
+        wasm_set_display("zz-name-input", name, "block");
+        wasm_set_display("zz-code-input", code, "block");
+        wasm_set_display("zz-touch-fields", name || code, "flex");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (name, code);
+    }
+}
+
+/// Read the HTML name overlay value (wasm). Returns `None` when the overlay
+/// is hidden or missing.
+pub fn html_name_value() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_input_value("zz-name-input")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Read the HTML join-code overlay value (wasm).
+pub fn html_code_value() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_input_value("zz-code-input")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Seed the HTML name overlay from the Rust-side callsign (once at startup /
+/// when LobbyView name changes from server path).
+pub fn set_html_name_value(name: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_set_input_value("zz-name-input", name);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = name;
+    }
+}
+
+/// Seed the HTML join-code overlay.
+pub fn set_html_code_value(code: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_set_input_value("zz-code-input", code);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = code;
+    }
+}
+
+/// Browser autoplay policy: resume suspended `AudioContext`s on first user
+/// gesture. Idempotent; no-op on native (desktop audio starts free).
+///
+/// Implementation: `web/index.html` installs a one-shot pointer/keydown
+/// listener that walks `window.__zzAudioContexts` and calls `.resume()`.
+/// Bevy/rodio contexts register themselves when created; we also poke any
+/// live `AudioContext` exposed on the page. Calling this from Rust after
+/// the first pointer event is a second safety net (the HTML listener is
+/// the primary path because it runs inside the user-gesture stack).
+pub fn unlock_audio() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_unlock_audio();
+    }
+}
+
 fn normalize_join(raw: String) -> Option<String> {
     let code = raw.trim().to_uppercase();
     if code.is_empty() { None } else { Some(code) }
@@ -83,20 +226,21 @@ fn wasm_server_url() -> String {
 
 #[cfg(target_arch = "wasm32")]
 fn wasm_join_code() -> Option<String> {
+    wasm_query_param("join").and_then(normalize_join)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_query_param(key: &str) -> Option<String> {
     let search = web_sys::window()
         .and_then(|w| w.location().search().ok())
         .unwrap_or_default();
-    // search is like "?join=ABCDE&foo=1" or ""
     let query = search.strip_prefix('?').unwrap_or(search.as_str());
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or("");
+        let k = parts.next().unwrap_or("");
         let val = parts.next().unwrap_or("");
-        if key == "join" {
-            // URL-decode minimal: `+` → space, `%XX` not required for lobby codes
-            // (codes are A–Z0–9), but strip percent-encoding if present is overkill.
-            let decoded = val.replace('+', " ");
-            return normalize_join(decoded);
+        if k == key {
+            return Some(val.replace('+', " "));
         }
     }
     None
@@ -124,4 +268,93 @@ fn wasm_persist_name(name: &str) {
 #[cfg(target_arch = "wasm32")]
 fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_max_touch_points() -> i32 {
+    web_sys::window()
+        .map(|w| w.navigator().max_touch_points())
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_set_body_class(class: &str, enabled: bool) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let Some(body) = document.body() else {
+        return;
+    };
+    let list = body.class_list();
+    if enabled {
+        let _ = list.add_1(class);
+    } else {
+        let _ = list.remove_1(class);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_set_display(id: &str, visible: bool, when_visible: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(el) = document_element(id) else {
+        return;
+    };
+    let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() else {
+        return;
+    };
+    let style = html.style();
+    let _ = style.set_property("display", if visible { when_visible } else { "none" });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_input_value(id: &str) -> Option<String> {
+    use wasm_bindgen::JsCast;
+    let el = document_element(id)?;
+    let input: web_sys::HtmlInputElement = el.dyn_into().ok()?;
+    // Only report when the overlay is actually shown (display != none).
+    let style = input.style();
+    if let Ok(d) = style.get_property_value("display") {
+        if d == "none" {
+            return None;
+        }
+    }
+    Some(input.value())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_set_input_value(id: &str, value: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(el) = document_element(id) else {
+        return;
+    };
+    let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() else {
+        return;
+    };
+    input.set_value(value);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn document_element(id: &str) -> Option<web_sys::Element> {
+    web_sys::window()?.document()?.get_element_by_id(id)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_unlock_audio() {
+    // Invoke the page-level unlock helper installed by web/index.html.
+    // Using Reflect keeps the dep graph free of js-sys Function bindings.
+    use wasm_bindgen::JsCast;
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let unlock = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__zzUnlockAudio"))
+        .ok()
+        .filter(|v| v.is_function());
+    if let Some(f) = unlock {
+        if let Ok(func) = f.dyn_into::<js_sys::Function>() {
+            let _ = func.call0(&window);
+        }
+    }
 }

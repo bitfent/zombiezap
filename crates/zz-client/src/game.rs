@@ -22,6 +22,7 @@ use crate::models::{
 };
 use crate::net::{NetClient, NetEvent};
 use crate::platform;
+use crate::touch::TouchIntent;
 
 /// Remote entities render this far in the past (seconds).
 const INTERP_DELAY_S: f64 = INTERP_DELAY_MS as f64 / 1000.0;
@@ -627,21 +628,29 @@ fn fps_controller(
     time: Res<Time>,
     windows: Query<&bevy::window::CursorOptions>,
     map: Option<Res<CurrentMap>>,
+    touch: Res<TouchIntent>,
     mut predicted: ResMut<Predicted>,
     mut net: ResMut<NetClient>,
 ) {
     let Some(map) = map else { return };
 
-    // mouse look only while the pointer is captured
+    // mouse look only while the pointer is captured (desktop non-touch path)
     let locked = windows
         .iter()
         .next()
         .is_some_and(|c| c.grab_mode != bevy::window::CursorGrabMode::None);
-    if locked {
+    if locked && !touch.enabled {
         let delta = mouse.delta;
         const SENS: f32 = 0.0025;
         predicted.yaw -= delta.x * SENS;
         predicted.pitch = (predicted.pitch - delta.y * SENS).clamp(-MAX_PITCH, MAX_PITCH);
+    }
+
+    // Touch aim drag (right half): already scaled radians this frame.
+    if touch.enabled {
+        predicted.yaw += touch.aim_yaw;
+        predicted.pitch =
+            (predicted.pitch + touch.aim_pitch).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
     // Keyboard turn (Q left / X right; E is taken by interact): mouse-free
@@ -660,18 +669,29 @@ fn fps_controller(
     }
 
     // fixed 30 Hz: sample intent, send, predict — one step per send
+    // (cadence untouched; touch ORs into the same bools)
     predicted.send_accum += time.delta_secs();
     while predicted.send_accum >= TICK_DT {
         predicted.send_accum -= TICK_DT;
         let input = PlayerInput {
             seq: predicted.next_seq,
-            forward: keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp),
-            backward: keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown),
-            left: keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft),
-            right: keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight),
-            jump: keys.pressed(KeyCode::Space),
-            fire: locked && buttons.pressed(MouseButton::Left),
-            grenade: keys.pressed(KeyCode::KeyG),
+            forward: keys.pressed(KeyCode::KeyW)
+                || keys.pressed(KeyCode::ArrowUp)
+                || touch.forward,
+            backward: keys.pressed(KeyCode::KeyS)
+                || keys.pressed(KeyCode::ArrowDown)
+                || touch.backward,
+            left: keys.pressed(KeyCode::KeyA)
+                || keys.pressed(KeyCode::ArrowLeft)
+                || touch.left,
+            right: keys.pressed(KeyCode::KeyD)
+                || keys.pressed(KeyCode::ArrowRight)
+                || touch.right,
+            jump: keys.pressed(KeyCode::Space) || touch.jump,
+            // Desktop: fire while locked + LMB. Touch: FIRE button only
+            // (right-side taps/drags never fire — aim is drag-only).
+            fire: (locked && buttons.pressed(MouseButton::Left) && !touch.enabled) || touch.fire,
+            grenade: keys.pressed(KeyCode::KeyG) || touch.grenade,
             interact: keys.pressed(KeyCode::KeyE),
             yaw: predicted.yaw,
             pitch: predicted.pitch,

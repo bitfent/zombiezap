@@ -10,7 +10,9 @@ use bevy_egui::{
 use zz_core::types::EnvKind;
 
 use crate::game::Session;
+use crate::platform;
 use crate::seams::{LobbyView, UiIntent, UiQueue};
+use crate::touch::TouchIntent;
 
 /// Cyan accent for interactive controls (#2ee6d6).
 const ACCENT: Color32 = Color32::from_rgb(0x2e, 0xe6, 0xd6);
@@ -46,7 +48,10 @@ impl Plugin for LobbyUiPlugin {
             app.add_plugins(EguiPlugin::default());
         }
         app.init_resource::<LobbyDraft>()
-            .add_systems(EguiPrimaryContextPass, paint_lobby_ui);
+            .add_systems(
+                EguiPrimaryContextPass,
+                (sync_touch_text_bridge, paint_lobby_ui).chain(),
+            );
     }
 }
 
@@ -56,12 +61,64 @@ struct LobbyDraft {
     join_code: String,
     /// True after we've copied `LobbyView.join_prefill` into `join_code` once.
     prefill_applied: bool,
+    /// Seeded the HTML name overlay once (touch soft-keyboard bridge).
+    html_name_seeded: bool,
+    /// Seeded the HTML code overlay once.
+    html_code_seeded: bool,
+}
+
+/// Soft-keyboard bridge: egui TextEdit does not summon mobile keyboards.
+/// On touch devices we show thin HTML `<input>` overlays (`web/index.html`)
+/// and poll their values into LobbyView / join draft each frame while Menu.
+fn sync_touch_text_bridge(
+    session: Res<Session>,
+    touch: Res<TouchIntent>,
+    lobby: Res<LobbyView>,
+    mut draft: ResMut<LobbyDraft>,
+    mut queue: ResMut<UiQueue>,
+) {
+    let in_menu = matches!(*session, Session::Menu);
+    let show = touch.enabled && in_menu;
+    platform::set_touch_text_overlays(show, show);
+
+    if !show {
+        return;
+    }
+
+    // Seed HTML fields once so the player sees the current callsign / invite.
+    if !draft.html_name_seeded {
+        platform::set_html_name_value(&lobby.name);
+        draft.html_name_seeded = true;
+    }
+    if !draft.html_code_seeded {
+        let code = if !draft.join_code.is_empty() {
+            draft.join_code.clone()
+        } else {
+            lobby.join_prefill.clone().unwrap_or_default()
+        };
+        platform::set_html_code_value(&code);
+        draft.html_code_seeded = true;
+    }
+
+    if let Some(name) = platform::html_name_value() {
+        let trimmed = name.trim().to_string();
+        if !trimmed.is_empty() && trimmed != lobby.name {
+            queue.0.push_back(UiIntent::SetName(trimmed));
+        }
+    }
+    if let Some(code) = platform::html_code_value() {
+        let norm = normalize_code(&code);
+        if norm != draft.join_code {
+            draft.join_code = norm;
+        }
+    }
 }
 
 fn paint_lobby_ui(
     mut contexts: EguiContexts,
     session: Res<Session>,
     lobby: Res<LobbyView>,
+    touch: Res<TouchIntent>,
     mut queue: ResMut<UiQueue>,
     mut draft: ResMut<LobbyDraft>,
 ) -> Result {
@@ -99,7 +156,9 @@ fn paint_lobby_ui(
 
                     match *session {
                         Session::Boot | Session::Connecting => paint_connecting(ui),
-                        Session::Menu => paint_menu(ui, &lobby, &mut draft, &mut queue),
+                        Session::Menu => {
+                            paint_menu(ui, &lobby, &mut draft, &mut queue, touch.enabled)
+                        }
                         Session::InLobby => paint_in_lobby(ui, &lobby, &mut queue),
                         Session::Playing { .. } | Session::Ended { .. } => {}
                     }
@@ -139,7 +198,13 @@ fn paint_connecting(ui: &mut egui::Ui) {
     });
 }
 
-fn paint_menu(ui: &mut egui::Ui, lobby: &LobbyView, draft: &mut LobbyDraft, queue: &mut UiQueue) {
+fn paint_menu(
+    ui: &mut egui::Ui,
+    lobby: &LobbyView,
+    draft: &mut LobbyDraft,
+    queue: &mut UiQueue,
+    touch_mode: bool,
+) {
     ui.vertical_centered(|ui| {
         title(ui);
     });
@@ -151,15 +216,29 @@ fn paint_menu(ui: &mut egui::Ui, lobby: &LobbyView, draft: &mut LobbyDraft, queu
             .size(11.0)
             .monospace(),
     );
-    let mut name = lobby.name.clone();
-    let name_edit = ui.add(
-        egui::TextEdit::singleline(&mut name)
-            .desired_width(CARD_WIDTH)
-            .hint_text("survivor")
-            .font(FontId::monospace(15.0)),
-    );
-    if name_edit.changed() {
-        queue.0.push_back(UiIntent::SetName(name));
+    if touch_mode {
+        // Soft keyboard lives in the HTML overlay; show the live value only.
+        ui.label(
+            RichText::new(if lobby.name.is_empty() {
+                "(tap name field above)"
+            } else {
+                lobby.name.as_str()
+            })
+            .color(ACCENT)
+            .monospace()
+            .size(15.0),
+        );
+    } else {
+        let mut name = lobby.name.clone();
+        let name_edit = ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .desired_width(CARD_WIDTH)
+                .hint_text("survivor")
+                .font(FontId::monospace(15.0)),
+        );
+        if name_edit.changed() {
+            queue.0.push_back(UiIntent::SetName(name));
+        }
     }
 
     ui.add_space(6.0);
@@ -181,15 +260,32 @@ fn paint_menu(ui: &mut egui::Ui, lobby: &LobbyView, draft: &mut LobbyDraft, queu
     ui.label(RichText::new("CODE").color(MUTED).size(11.0).monospace());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        let code_edit = ui.add(
-            egui::TextEdit::singleline(&mut draft.join_code)
-                .desired_width(140.0)
-                .char_limit(5)
-                .hint_text("XXXXX")
-                .font(FontId::monospace(18.0)),
-        );
-        if code_edit.changed() {
-            draft.join_code = normalize_code(&draft.join_code);
+        if touch_mode {
+            ui.label(
+                RichText::new(if draft.join_code.is_empty() {
+                    "XXXXX"
+                } else {
+                    draft.join_code.as_str()
+                })
+                .color(if draft.join_code.is_empty() {
+                    MUTED
+                } else {
+                    ACCENT
+                })
+                .monospace()
+                .size(18.0),
+            );
+        } else {
+            let code_edit = ui.add(
+                egui::TextEdit::singleline(&mut draft.join_code)
+                    .desired_width(140.0)
+                    .char_limit(5)
+                    .hint_text("XXXXX")
+                    .font(FontId::monospace(18.0)),
+            );
+            if code_edit.changed() {
+                draft.join_code = normalize_code(&draft.join_code);
+            }
         }
         if accent_button(ui, "[ JOIN ]", true).clicked() {
             queue
