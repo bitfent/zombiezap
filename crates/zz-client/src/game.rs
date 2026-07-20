@@ -359,6 +359,7 @@ fn push_sample(buf: &mut VecDeque<(f64, Vec3, f32)>, t: f64, pos: Vec3, yaw: f32
 
 // ── local controller: input → predict → send ───────────────────────────────
 
+#[allow(clippy::too_many_arguments)] // Bevy system params, not an API
 fn fps_controller(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
