@@ -16,8 +16,11 @@ type Ws =
 
 fn fast_director(rate: &str) {
     // safe here: every test in THIS binary wants an aggressive director, and
-    // the room reads the var once at creation
-    unsafe { std::env::set_var("ZZ_DIRECTOR_RATE", rate) };
+    // the room reads the vars once at creation
+    unsafe {
+        std::env::set_var("ZZ_DIRECTOR_RATE", rate);
+        std::env::set_var("MAP_SEED", "m4-dev");
+    }
 }
 
 async fn start_server() -> String {
@@ -47,8 +50,16 @@ async fn connect(url: &str, name: &str) -> (Ws, u8) {
             break;
         }
     }
-    let hello = serde_json::to_string(&ClientMsg::Hello { name: name.into() }).unwrap();
-    ws.send(Message::Text(hello.into())).await.unwrap();
+    for msg in [
+        serde_json::to_string(&ClientMsg::Hello { name: name.into() }).unwrap(),
+        serde_json::to_string(&ClientMsg::CreateLobby {
+            env: zz_core::types::EnvKind::Urban,
+        })
+        .unwrap(),
+        serde_json::to_string(&ClientMsg::StartGame).unwrap(),
+    ] {
+        ws.send(Message::Text(msg.into())).await.unwrap();
+    }
     loop {
         let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await

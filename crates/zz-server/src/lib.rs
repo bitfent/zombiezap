@@ -1,8 +1,10 @@
-//! ZombieZap game server library: the axum app, connection plumbing, and the
-//! room simulation. The binary in main.rs is a thin bind-and-serve wrapper;
-//! integration tests start the same `app()` on an ephemeral port.
+//! ZombieZap game server library: the axum app, connection plumbing, the
+//! lobby manager, and the room simulation. The binary in main.rs is a thin
+//! bind-and-serve wrapper; integration tests start the same `app()` on an
+//! ephemeral port. Everything lives in memory — no database by design.
 
 pub mod conn;
+pub mod lobby;
 pub mod room;
 
 use axum::extract::{State, WebSocketUpgrade};
@@ -12,16 +14,15 @@ use tokio::sync::mpsc;
 
 #[derive(Clone)]
 struct AppState {
-    room: mpsc::Sender<room::RoomCmd>,
+    lobby: mpsc::Sender<lobby::LobbyCmd>,
 }
 
 pub fn app() -> axum::Router {
-    let seed = std::env::var("MAP_SEED").unwrap_or_else(|_| "m4-dev".into());
-    let room = room::Room::spawn(zz_core::types::EnvKind::Urban, seed);
+    let lobby = lobby::LobbyManager::spawn();
     axum::Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_upgrade))
-        .with_state(AppState { room })
+        .with_state(AppState { lobby })
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -29,5 +30,5 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn ws_upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| conn::handle_socket(socket, state.room))
+    ws.on_upgrade(move |socket| conn::handle_socket(socket, state.lobby))
 }

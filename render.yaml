@@ -1,0 +1,18 @@
+# Render blueprint: the ZombieZap game server as a single Web Service.
+# WebSockets work on Render web services out of the box; the server binds
+# $PORT (Render-provided) and serves /healthz + /ws on one port.
+# NOTE: native (desktop) clients connect with ZZ_SERVER=wss://<service>.onrender.com/ws.
+# The browser build (M6) will be served as static files and use the same /ws.
+services:
+  - type: web
+    name: zombiezap-server
+    runtime: rust
+    plan: starter # free tier sleeps — a cold start kills a lobby (ShotAnte lesson)
+    region: frankfurt # near EU players; latency is gameplay
+    buildCommand: cargo build --release -p zz-server
+    startCommand: ./target/release/zz-server
+    healthCheckPath: /healthz
+    envVars:
+      # public origin used to build invite links (?join=CODE)
+      - key: PUBLIC_URL
+        sync: false

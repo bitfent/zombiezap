@@ -24,21 +24,62 @@ async fn start_server() -> String {
     format!("ws://{addr}/ws")
 }
 
-async fn connect(url: &str, name: &str) -> (Ws, u8) {
+fn pin_map() {
+    // room seeds derive from random lobby codes; pin the map for determinism
+    unsafe { std::env::set_var("MAP_SEED", "m4-dev") };
+}
+
+async fn open_conn(url: &str, name: &str) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("connect");
-    // welcome
     let welcome = recv_json(&mut ws).await.expect("welcome");
     assert!(matches!(welcome, ServerMsg::Welcome { .. }));
-    // hello -> game_start with our slot
     let hello = serde_json::to_string(&ClientMsg::Hello { name: name.into() }).unwrap();
     ws.send(Message::Text(hello.into())).await.unwrap();
-    let started = recv_json(&mut ws).await.expect("game_start");
-    let ServerMsg::GameStart { your_slot, .. } = started else {
-        panic!("expected game_start, got {started:?}");
+    ws
+}
+
+/// Create a lobby; returns the socket and the shareable code.
+async fn create_lobby(url: &str, name: &str) -> (Ws, String) {
+    let mut ws = open_conn(url, name).await;
+    let create = serde_json::to_string(&ClientMsg::CreateLobby {
+        env: zz_core::types::EnvKind::Urban,
+    })
+    .unwrap();
+    ws.send(Message::Text(create.into())).await.unwrap();
+    let state = recv_json(&mut ws).await.expect("lobby_state");
+    let ServerMsg::LobbyState { code, .. } = state else {
+        panic!("expected lobby_state, got {state:?}");
     };
-    (ws, your_slot)
+    (ws, code)
+}
+
+async fn join_lobby(url: &str, name: &str, code: &str) -> Ws {
+    let mut ws = open_conn(url, name).await;
+    let join = serde_json::to_string(&ClientMsg::JoinLobby { code: code.into() }).unwrap();
+    ws.send(Message::Text(join.into())).await.unwrap();
+    let state = recv_json(&mut ws).await.expect("lobby_state after join");
+    assert!(
+        matches!(state, ServerMsg::LobbyState { .. }),
+        "got {state:?}"
+    );
+    ws
+}
+
+async fn start_game(ws: &mut Ws) {
+    let start = serde_json::to_string(&ClientMsg::StartGame).unwrap();
+    ws.send(Message::Text(start.into())).await.unwrap();
+}
+
+async fn wait_game_start(ws: &mut Ws) -> u8 {
+    loop {
+        match recv_json(ws).await.expect("game_start") {
+            ServerMsg::GameStart { your_slot, .. } => return your_slot,
+            ServerMsg::LobbyState { .. } => continue, // roster churn pre-start
+            other => panic!("expected game_start, got {other:?}"),
+        }
+    }
 }
 
 /// Next meaningful JSON control message, skipping binary frames and the
@@ -87,9 +128,16 @@ fn forward_input(seq: u32, yaw: f32) -> PlayerInput {
 
 #[tokio::test]
 async fn two_bots_move_independently() {
+    pin_map();
     let url = start_server().await;
-    let (mut a, slot_a) = connect(&url, "walker").await;
-    let (_b, slot_b) = connect(&url, "camper").await;
+    let (mut a, code) = create_lobby(&url, "walker").await;
+    let mut b = join_lobby(&url, "camper", &code).await;
+    // host sees the join before starting
+    let _ = recv_json(&mut a).await.expect("roster update");
+    start_game(&mut a).await;
+    let slot_a = wait_game_start(&mut a).await;
+    let slot_b = wait_game_start(&mut b).await;
+    let _b = b;
     assert_ne!(slot_a, slot_b);
 
     // pump until the room has integrated both joins
@@ -151,8 +199,11 @@ async fn two_bots_move_independently() {
 
 #[tokio::test]
 async fn silent_socket_is_terminated_for_presence() {
+    pin_map();
     let url = start_server().await;
-    let (mut ws, _slot) = connect(&url, "ghost").await;
+    let (mut ws, _code) = create_lobby(&url, "ghost").await;
+    start_game(&mut ws).await;
+    let _slot = wait_game_start(&mut ws).await;
 
     // Say nothing and ignore pings. The server must hang up within
     // PRESENCE_TIMEOUT_MS (+ one ping interval of slack).
@@ -179,21 +230,19 @@ async fn silent_socket_is_terminated_for_presence() {
 
 #[tokio::test]
 async fn sixth_player_is_rejected() {
+    pin_map();
     let url = start_server().await;
+    let (_host, code) = create_lobby(&url, "host").await;
     let mut conns = Vec::new();
-    for i in 0..5 {
-        conns.push(connect(&url, &format!("p{i}")).await);
+    for i in 0..4 {
+        conns.push(join_lobby(&url, &format!("p{i}"), &code).await);
     }
-    // sixth: welcome arrives, then hello must yield an error, not game_start
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-    let _welcome = recv_json(&mut ws).await.expect("welcome");
-    let hello = serde_json::to_string(&ClientMsg::Hello {
-        name: "late".into(),
-    })
-    .unwrap();
-    ws.send(Message::Text(hello.into())).await.unwrap();
+    // sixth player: the join must be refused with a lobby-full error
+    let mut ws = open_conn(&url, "late").await;
+    let join = serde_json::to_string(&ClientMsg::JoinLobby { code: code.clone() }).unwrap();
+    ws.send(Message::Text(join.into())).await.unwrap();
     match recv_json(&mut ws).await {
         Some(ServerMsg::Error { message }) => assert!(message.contains("full")),
-        other => panic!("expected room-full error, got {other:?}"),
+        other => panic!("expected lobby-full error, got {other:?}"),
     }
 }
