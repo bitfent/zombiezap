@@ -54,6 +54,8 @@ impl Plugin for LobbyUiPlugin {
 #[derive(Resource, Default)]
 struct LobbyDraft {
     join_code: String,
+    /// True after we've copied `LobbyView.join_prefill` into `join_code` once.
+    prefill_applied: bool,
 }
 
 fn paint_lobby_ui(
@@ -67,6 +69,15 @@ fn paint_lobby_ui(
     match *session {
         Session::Playing { .. } | Session::Ended { .. } => return Ok(()),
         Session::Boot | Session::Connecting | Session::Menu | Session::InLobby => {}
+    }
+
+    // One-shot: seed the join field from `?join=` / `ZZ_JOIN` without fighting
+    // later edits.
+    if !draft.prefill_applied {
+        if let Some(code) = lobby.join_prefill.as_ref() {
+            draft.join_code = normalize_code(code);
+        }
+        draft.prefill_applied = true;
     }
 
     let ctx = contexts.ctx_mut()?;

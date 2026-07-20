@@ -185,3 +185,58 @@ work next:
 24. **`Button` requires `Interaction` (via `#[require]`) — edge-detect clicks with**  
     `Changed<Interaction>` + `Interaction::Pressed` and a local “was pressed”
     flag so held clicks don’t spam `UiIntent`s every frame.
+
+## M6a — browser platform seam + Trunk release
+
+`platform.rs` is the only place that branches on `cfg(target_arch = "wasm32")`
+for connect URL / invite join / name persistence:
+
+| API | Native | Wasm |
+|-----|--------|------|
+| `server_url()` | `ZZ_SERVER` or `ws://127.0.0.1:8080/ws` | same origin: `wss://` if page is https, else `ws://`, path `/ws` |
+| `join_code_from_url()` | `ZZ_JOIN` | `?join=CODE` on `location.search` |
+| `initial_name()` | `ZZ_NAME` or `"survivor"` | `localStorage["zz_name"]` or `"survivor"` |
+| `persist_name(name)` | no-op | writes `localStorage["zz_name"]` |
+
+`LobbyView.join_prefill` carries the invite code; `lobby_ui` copies it into the
+join field **once** so later typing is not overwritten.
+
+### CI / release Trunk invocation
+
+```bash
+# from workspace root (trunk 0.21+)
+cd web
+trunk build --release
+# → web/dist/  (uses [profile.wasm-release] via Trunk.toml cargo_profile,
+#               and binaryen -Oz via data-wasm-opt="z" on the rust link tag)
+```
+
+Override without config: `trunk build --release --cargo-profile wasm-release`.
+
+### Wasm-specific API notes (M6a)
+
+25. **Same-origin WebSocket only in the browser.** There is no hardcoded host:
+    `window.location.protocol` / `.host` drive the scheme. A static host that
+    is not the API origin needs a reverse proxy (serve `dist/` and `/ws` from
+    one host) or a future config seam — do not special-case hosts in client code.
+
+26. **`web-sys` features are minimal:** `Window`, `Location`, `Storage`. No
+    `Url` / `UrlSearchParams` — query parsing is a tiny split on
+    `location.search` so the wasm dep graph stays small.
+
+27. **Trunk loader UI is plain HTML/CSS.** `#zz-loading` sits over the canvas
+    until `canvas.width/height > 0` (Bevy WebGL surface ready). Trunk itself
+    does not inject a loading chrome; keep the hide script in `web/index.html`.
+
+28. **`data-wasm-opt="z"` needs binaryen (`wasm-opt`) on PATH.** Without it,
+    Trunk fails the release link step — install via package manager or
+    temporarily set `data-wasm-opt="0"` for local iteration. Rust ≥1.82
+    emits bulk-memory / nontrapping float-to-int ops; pass
+    `data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"`
+    or wasm-opt validation fails with `memory.copy` / `memory.fill` errors.
+
+29. **`NetClient` needs `unsafe impl Send + Sync` on wasm32.** ewebsock’s
+    browser `WsSender` wraps `Rc<WebSocket>` (`!Send`/`!Sync`), but Bevy’s
+    `Resource` trait still demands both bounds. The client is single-threaded
+    on wasm (main browser thread only), so the impl is sound in practice.
+    See `net.rs`.

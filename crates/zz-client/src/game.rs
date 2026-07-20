@@ -18,6 +18,7 @@ use zz_core::types::{Body, PlayerInput};
 
 use crate::map_render::CurrentMap;
 use crate::net::{NetClient, NetEvent};
+use crate::platform;
 
 /// Remote entities render this far in the past (seconds).
 const INTERP_DELAY_S: f64 = INTERP_DELAY_MS as f64 / 1000.0;
@@ -32,7 +33,11 @@ impl Plugin for GamePlugin {
         app.insert_resource(Session::default())
             .insert_resource(Predicted::default())
             .insert_resource(crate::seams::UiQueue::default())
-            .insert_resource(crate::seams::LobbyView::default())
+            .insert_resource(crate::seams::LobbyView {
+                name: platform::initial_name(),
+                join_prefill: platform::join_code_from_url(),
+                ..Default::default()
+            })
             .insert_resource(crate::seams::LatestSnapshot::default())
             .insert_resource(crate::seams::LastStats::default())
             .insert_resource(crate::seams::FxQueue::default())
@@ -182,15 +187,11 @@ struct RemoteAssets {
 
 // ── connection + message flow ──────────────────────────────────────────────
 
-fn server_url() -> String {
-    std::env::var("ZZ_SERVER").unwrap_or_else(|_| "ws://127.0.0.1:8080/ws".into())
-}
-
 fn connect_on_start(mut session: ResMut<Session>, mut net: ResMut<NetClient>) {
     if *session != Session::Boot {
         return;
     }
-    match net.connect(&server_url()) {
+    match net.connect(&platform::server_url()) {
         Ok(()) => *session = Session::Connecting,
         Err(e) => warn!("connect failed: {e} — retrying"),
     }
@@ -505,7 +506,10 @@ fn process_intents(
     use crate::seams::UiIntent;
     while let Some(intent) = queue.0.pop_front() {
         match intent {
-            UiIntent::SetName(n) => lobby_view.name = n,
+            UiIntent::SetName(n) => {
+                platform::persist_name(&n);
+                lobby_view.name = n;
+            }
             UiIntent::CreateLobby(env) => {
                 send_hello(&mut net, &lobby_view.name);
                 net.send_msg(&ClientMsg::CreateLobby { env });

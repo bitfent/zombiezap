@@ -5,15 +5,60 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ZombieZap</title>
     <link data-trunk rel="css" href="styles.css" />
+    <!--
+      Release: Trunk.toml cargo_profile = "wasm-release" on --release.
+      data-wasm-opt="z" → binaryen -Oz. Rust ≥1.82 emits bulk-memory /
+      nontrapping-fptoint; wasm-opt needs those features enabled.
+      Use data-wasm-opt="0" for faster local iteration without binaryen.
+    -->
     <link
       data-trunk
       rel="rust"
       href="../crates/zz-client/Cargo.toml"
       data-bin="zz-client"
-      data-wasm-opt="0"
+      data-wasm-opt="z"
+      data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"
     />
   </head>
   <body>
+    <!--
+      Shown until the wasm module finishes init. Trunk's generated module
+      script runs after this markup; we hide #zz-loading once the Bevy canvas
+      is sized (WebGL ready). No external fonts/CDNs.
+    -->
+    <div id="zz-loading" aria-live="polite" aria-busy="true">
+      <div class="zz-loading-card">
+        <div class="zz-loading-title">ZOMBIEZAP</div>
+        <div class="zz-loading-sub">loading…</div>
+        <div class="zz-loading-bar" aria-hidden="true">
+          <div class="zz-loading-bar-fill"></div>
+        </div>
+      </div>
+    </div>
     <canvas id="zz-canvas"></canvas>
+    <script>
+      (function () {
+        var loader = document.getElementById("zz-loading");
+        var canvas = document.getElementById("zz-canvas");
+        if (!loader || !canvas) return;
+        function hide() {
+          loader.classList.add("zz-hidden");
+          loader.setAttribute("aria-busy", "false");
+        }
+        // Bevy sets canvas width/height when the WebGL surface is ready.
+        var n = 0;
+        var id = setInterval(function () {
+          n += 1;
+          if (canvas.width > 0 && canvas.height > 0) {
+            clearInterval(id);
+            hide();
+          } else if (n > 300) {
+            // ~30s safety so a failed init does not spin forever
+            clearInterval(id);
+            hide();
+          }
+        }, 100);
+      })();
+    </script>
   </body>
 </html>

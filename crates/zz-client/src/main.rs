@@ -9,6 +9,7 @@ mod hud;
 mod lobby_ui;
 mod map_render;
 mod net;
+mod platform;
 mod seams;
 
 use std::f32::consts::{FRAC_PI_2, PI};

@@ -44,6 +44,9 @@ pub struct LobbyView {
     pub is_host: bool,
     /// One-line status/error surfaced under the controls.
     pub status: String,
+    /// One-shot prefill for the join-code field (`?join=` / `ZZ_JOIN`).
+    /// lobby_ui copies this into its draft once, then leaves it alone.
+    pub join_prefill: Option<String>,
 }
 
 /// The latest decoded world snapshot — HUD reads self stats, fx reads

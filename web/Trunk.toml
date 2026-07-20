@@ -4,16 +4,22 @@
 #   trunk serve          # dev server with auto-rebuild
 #   trunk build          # debug wasm → web/dist/
 #
-# Smaller browser bundle (uses workspace [profile.wasm-release]):
+# CI / shipping (workspace [profile.wasm-release] + wasm-opt -Oz):
+#   trunk build --release
+# Equivalent CLI if you override config:
 #   trunk build --release --cargo-profile wasm-release
-# (requires Trunk that forwards --cargo-profile; otherwise set in Cargo.toml
-#  via CARGO_PROFILE or build with: cargo build -p zz-client --target
-#  wasm32-unknown-unknown --profile wasm-release and wire assets manually.)
+#
+# Requires: rustup target add wasm32-unknown-unknown
+#           cargo install trunk --locked
+#           binaryen (wasm-opt) for data-wasm-opt on the rust link tag
 
 [build]
 target = "index.html"
 dist = "dist"
 public_url = "/"
+# Used when `trunk build --release` (or TRUNK_BUILD_RELEASE=true).
+# Maps to `cargo build --profile wasm-release`.
+cargo_profile = "wasm-release"
 
 [watch]
 watch = ["../crates/zz-client", "."]

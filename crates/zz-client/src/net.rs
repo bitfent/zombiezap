@@ -23,6 +23,14 @@ pub struct NetClient {
     connected: bool,
 }
 
+// ewebsock's wasm WsSender holds `Rc<WebSocket>`, which is !Send/!Sync.
+// Bevy still requires Resource: Send + Sync. On wasm the app is single-
+// threaded (main browser thread only), so this is sound in practice.
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for NetClient {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for NetClient {}
+
 #[allow(dead_code)] // consumed by the M3 session wiring
 impl NetClient {
     pub fn disconnected() -> Self {

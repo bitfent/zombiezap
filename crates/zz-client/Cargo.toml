@@ -62,3 +62,12 @@ workspace = true
 
 [dependencies.bevy_egui]
 workspace = true
+
+# Browser platform seam: same-origin WS URL, ?join= prefill, localStorage name.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Storage",
+] }
