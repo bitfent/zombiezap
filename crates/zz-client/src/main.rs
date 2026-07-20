@@ -3,6 +3,9 @@
 //! Native: `cargo run -p zz-client`
 //! Browser: `cd web && trunk serve` (see README).
 
+mod map_render;
+mod net;
+
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{
@@ -45,7 +48,9 @@ fn main() {
                 ..default()
             }),
             FrameTimeDiagnosticsPlugin::default(),
+            map_render::MapRenderPlugin,
         ))
+        .insert_resource(net::NetClient::disconnected())
         .add_systems(Startup, (setup_scene, setup_ui))
         .add_systems(
             Update,

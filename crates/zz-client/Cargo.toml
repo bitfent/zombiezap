@@ -46,3 +46,13 @@ bevy = { workspace = true, features = [
     "bevy_ui",
     "bevy_ui_render",
 ] }
+
+# netcode: poll-based WebSocket, one API for native + wasm
+[dependencies.ewebsock]
+workspace = true
+
+[dependencies.zz-core]
+workspace = true
+
+[dependencies.serde_json]
+workspace = true
