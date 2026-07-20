@@ -33,11 +33,12 @@ const CARD_WIDTH: f32 = 420.0;
 /// Max players shown in the lobby roster (open slots fill the rest).
 const MAX_SLOTS: usize = 5;
 
-const ENV_OPTIONS: [(&str, EnvKind); 4] = [
+const ENV_OPTIONS: [(&str, EnvKind); 5] = [
     ("URBAN", EnvKind::Urban),
     ("MOUNTAIN", EnvKind::MountainTown),
     ("DESERT", EnvKind::DesertTown),
     ("SEA", EnvKind::SeaTown),
+    ("ROME EUR", EnvKind::RomeEur),
 ];
 
 pub struct LobbyUiPlugin;
@@ -446,7 +447,6 @@ fn env_label(env: EnvKind) -> &'static str {
         EnvKind::MountainTown => "MOUNTAIN",
         EnvKind::DesertTown => "DESERT",
         EnvKind::SeaTown => "SEA",
-        // R2b: env picker button; label only so Enum match stays exhaustive.
         EnvKind::RomeEur => "ROME EUR",
     }
 }

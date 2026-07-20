@@ -182,3 +182,21 @@ body.touch #zz-landscape-hint {
   color: #7a828e;
   letter-spacing: 0.18em;
 }
+
+/* ── OSM / ODbL map attribution (Rome EUR) ───────────────────────────────── */
+
+#zz-map-attrib {
+  position: fixed;
+  bottom: 6px;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  margin: 0;
+  padding: 0 10px;
+  text-align: center;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  color: #4a5058;
+  pointer-events: none;
+  user-select: none;
+}

@@ -64,11 +64,41 @@ const GROUND_SHADOW: f32 = 0.62;
 const FACE_AMBIENT: f32 = 0.55;
 /// Hard floor for any baked factor — the "never pitch black" invariant.
 pub const MIN_LIGHT: f32 = 0.42;
-/// Ground-occlusion grid resolution (bilinearly upsampled into the texture,
-/// which also softens shadow edges).
-const OCCLUSION_RES: u32 = 256;
-/// Baked ground texture resolution (whole arena, UV 0..1 — not tiled).
-const GROUND_TEX_RES: u32 = 1024;
+/// Small-map historical baselines (Urban/Mountain/Desert/Sea, arena_half≈30).
+const BASE_OCCLUSION_RES: u32 = 256;
+const BASE_GROUND_TEX_RES: u32 = 1024;
+/// Hard GPU / CPU memory cap for procedural bake textures (edge length).
+const MAX_BAKE_TEX_RES: u32 = 2048;
+/// Ground texture: at least this many texels per world metre.
+const GROUND_TEXELS_PER_M: f32 = 2.0;
+/// Occlusion grid: each cell at most this many metres across.
+const MAX_OCCLUSION_CELL_M: f32 = 2.0;
+
+/// Ground texture resolution for a map of half-extent `arena_half`.
+///
+/// Small towns keep the historical 1024; larger arenas grow to meet
+/// ≥[`GROUND_TEXELS_PER_M`] texels/m, hard-capped at [`MAX_BAKE_TEX_RES`].
+pub fn ground_tex_res(arena_half: f32) -> u32 {
+    let diameter = (2.0 * arena_half).max(1.0);
+    let needed = (diameter * GROUND_TEXELS_PER_M).ceil() as u32;
+    needed
+        .max(BASE_GROUND_TEX_RES)
+        .next_power_of_two()
+        .clamp(1, MAX_BAKE_TEX_RES)
+}
+
+/// Ground-occlusion bake resolution for a map of half-extent `arena_half`.
+///
+/// Small towns keep 256; larger arenas grow so each cell is
+/// ≤[`MAX_OCCLUSION_CELL_M`] m, hard-capped at [`MAX_BAKE_TEX_RES`].
+pub fn occlusion_res(arena_half: f32) -> u32 {
+    let diameter = (2.0 * arena_half).max(1.0);
+    let needed = (diameter / MAX_OCCLUSION_CELL_M).ceil() as u32;
+    needed
+        .max(BASE_OCCLUSION_RES)
+        .next_power_of_two()
+        .clamp(1, MAX_BAKE_TEX_RES)
+}
 
 /// Everything the atmosphere needs, per environment.
 #[derive(Clone, Copy, Debug)]
@@ -123,15 +153,38 @@ pub fn env_lighting(env: EnvKind) -> EnvLighting {
             sun_illuminance: 11_500.0,
             sun_to: Vec3::new(-14.0, 26.0, 16.0).normalize(),
         },
-        // R2b owns the warm Mediterranean palette; interim = urban recipe.
+        // Warm Mediterranean late-afternoon: blue sky with a soft horizon,
+        // golden sun from the southwest, warm grey fill so the basilica nave
+        // reads dim-but-luminous. Map axes: +z is south (piazzale spawns face
+        // +z toward the portal on the north facade).
         EnvKind::RomeEur => EnvLighting {
-            sky: Color::srgb_u8(158, 201, 239),
-            ambient: Color::srgb_u8(150, 158, 168),
-            ambient_brightness: 950.0,
-            sun_color: Color::srgb_u8(255, 243, 218),
-            sun_illuminance: 11_000.0,
-            sun_to: Vec3::new(16.0, 28.0, 12.0).normalize(),
+            sky: Color::srgb_u8(168, 196, 230),
+            ambient: Color::srgb_u8(168, 158, 142),
+            ambient_brightness: 1_000.0,
+            sun_color: Color::srgb_u8(255, 236, 200),
+            sun_illuminance: 12_000.0,
+            sun_to: Vec3::new(-18.0, 20.0, 14.0).normalize(),
         },
+    }
+}
+
+/// Wall-family base colors (Perimeter, Cover, Building, Roof) before accent mix.
+/// Rome leans cream/travertine; the four small towns keep the pastel-city set.
+fn family_base_colors(env: EnvKind) -> [Color; 4] {
+    match env {
+        EnvKind::RomeEur => [
+            Color::srgb(0.72, 0.68, 0.60), // warm perimeter stone
+            Color::srgb(0.78, 0.62, 0.42), // warm planters / cover
+            Color::srgb(0.92, 0.86, 0.74), // cream travertine buildings
+            Color::srgb(0.48, 0.42, 0.36), // warm roof stone
+        ],
+        // Urban / Mountain / Desert / Sea — historical pastel-city palette.
+        EnvKind::Urban | EnvKind::MountainTown | EnvKind::DesertTown | EnvKind::SeaTown => [
+            Color::srgb(0.62, 0.65, 0.71),
+            Color::srgb(0.80, 0.66, 0.46),
+            Color::srgb(0.88, 0.82, 0.70),
+            Color::srgb(0.38, 0.42, 0.50),
+        ],
     }
 }
 
@@ -682,15 +735,19 @@ fn rebuild_map_system(
     }
 
     // ── Baked sun shadows (once, here; nothing shadow-related per frame) ───
+    // Resolutions derive from arena_half so the 500 m Rome EUR arena stays
+    // ≥2 texels/m / ≤2 m cells without changing the four small-town maps.
+    let occ_res = occlusion_res(map.arena_half);
+    let ground_res = ground_tex_res(map.arena_half);
     let ground_occlusion =
-        bake_ground_occlusion(OCCLUSION_RES, map.arena_half, light.sun_to, &map.walls);
+        bake_ground_occlusion(occ_res, map.arena_half, light.sun_to, &map.walls);
 
     // Procedural textures (small, nearest-filtered; wall textures tile).
     let tex_ground = images.add(gen_ground_lit(
-        GROUND_TEX_RES,
+        ground_res,
         map.arena_half,
         &ground_occlusion,
-        OCCLUSION_RES,
+        occ_res,
     ));
     let tex_concrete = images.add(tiled(gen_concrete(128, false)));
     let tex_perimeter = images.add(tiled(gen_concrete(128, true)));
@@ -703,26 +760,27 @@ fn rebuild_map_system(
         images.add(gen_ad(3, 256, 128)),
     ];
 
-    // Legacy pastel-city palette: near-white textures carry the detail, the
-    // base colors carry the hue, the accent tints the whole family.
+    // Near-white textures carry the detail; family bases carry the hue
+    // (Rome = travertine cream; other envs = pastel-city); accent mixes in.
+    let bases = family_base_colors(map.env);
     let family_mats: [Handle<StandardMaterial>; 4] = [
         materials.add(wall_material(
-            tinted(Color::srgb(0.62, 0.65, 0.71), accent),
+            tinted(bases[0], accent),
             Some(tex_perimeter.clone()),
             0.92,
         )),
         materials.add(wall_material(
-            tinted(Color::srgb(0.80, 0.66, 0.46), accent),
+            tinted(bases[1], accent),
             Some(tex_cover.clone()),
             0.90,
         )),
         materials.add(wall_material(
-            tinted(Color::srgb(0.88, 0.82, 0.70), accent),
+            tinted(bases[2], accent),
             Some(tex_concrete.clone()),
             0.88,
         )),
         materials.add(wall_material(
-            tinted(Color::srgb(0.38, 0.42, 0.50), accent),
+            tinted(bases[3], accent),
             Some(tex_roof.clone()),
             0.95,
         )),
@@ -1023,6 +1081,7 @@ mod tests {
             EnvKind::MountainTown,
             EnvKind::DesertTown,
             EnvKind::SeaTown,
+            EnvKind::RomeEur,
         ];
         let all: Vec<EnvLighting> = envs.iter().map(|e| env_lighting(*e)).collect();
         for (i, a) in all.iter().enumerate() {
@@ -1037,6 +1096,112 @@ mod tests {
                     + (ca.blue - cb.blue).abs();
                 assert!(d > 0.02, "skies of env {i} and {j} indistinguishable");
             }
+        }
+        // Rome: golden sun from the southwest, warm ambient, ~12k lux.
+        let rome = env_lighting(EnvKind::RomeEur);
+        assert!((rome.sun_illuminance - 12_000.0).abs() < 1.0);
+        assert!(rome.sun_to.x < 0.0, "southwest → −x (west)");
+        assert!(rome.sun_to.z > 0.0, "southwest → +z (south on this map)");
+        assert!((rome.ambient_brightness - 1_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn bake_resolutions_preserve_small_towns_and_scale_rome() {
+        // Historical small-map values must not regress (arena_half ≈ 30).
+        assert_eq!(ground_tex_res(30.0), 1024);
+        assert_eq!(occlusion_res(30.0), 256);
+        assert_eq!(ground_tex_res(40.0), 1024);
+        assert_eq!(occlusion_res(40.0), 256);
+
+        // Rome EUR: 500 m arena (arena_half = 250).
+        let g = ground_tex_res(250.0);
+        let o = occlusion_res(250.0);
+        assert!(g <= 2048, "ground tex hard cap");
+        assert!(o <= 2048, "occlusion hard cap");
+        // ≥ 2 texels/m across the diameter.
+        let diameter = 500.0;
+        assert!(
+            g as f32 / diameter >= 2.0 - 1e-3,
+            "ground {g} too coarse for {diameter} m"
+        );
+        // Occlusion cell ≤ 2 m.
+        assert!(
+            diameter / o as f32 <= 2.0 + 1e-3,
+            "occlusion cell {} m too large",
+            diameter / o as f32
+        );
+    }
+
+    #[test]
+    fn rome_eur_bake_time_and_resolution() {
+        use std::time::Instant;
+
+        let map = generate_map(EnvKind::RomeEur, "preview");
+        assert_eq!(map.arena_half, 250.0);
+        assert_eq!(map.env, EnvKind::RomeEur);
+        assert!(!map.walls.is_empty());
+
+        let occ_r = occlusion_res(map.arena_half);
+        let ground_r = ground_tex_res(map.arena_half);
+        let light = env_lighting(EnvKind::RomeEur);
+
+        let t0 = Instant::now();
+        let occ = bake_ground_occlusion(occ_r, map.arena_half, light.sun_to, &map.walls);
+        let occ_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let _tex = gen_ground_lit(ground_r, map.arena_half, &occ, occ_r);
+        let ground_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = Instant::now();
+        let families = build_family_meshes(&map.walls, map.arena_half);
+        let mut face_verts = 0usize;
+        for (_fam, mut geom) in families {
+            if geom.is_empty() {
+                continue;
+            }
+            bake_face_colors(&mut geom, light.sun_to, &map.walls);
+            face_verts += geom.positions.len();
+        }
+        let face_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = occ_ms + ground_ms + face_ms;
+
+        eprintln!(
+            "Rome EUR bake: walls={}, arena_half={}, occ_res={}, ground_res={}, \
+             occ={occ_ms:.1}ms ground={ground_ms:.1}ms faces={face_ms:.1}ms \
+             total={total_ms:.1}ms face_verts={face_verts}",
+            map.walls.len(),
+            map.arena_half,
+            occ_r,
+            ground_r,
+        );
+
+        // Debug budget < 8 s; release target is tighter but this suite runs
+        // without --release by default.
+        assert!(
+            total_ms < 8_000.0,
+            "Rome bake took {total_ms:.0} ms (debug budget 8000 ms)"
+        );
+        assert_eq!(occ.len(), (occ_r * occ_r) as usize);
+    }
+
+    #[test]
+    fn rome_family_bases_are_travertine_warm() {
+        let rome = family_base_colors(EnvKind::RomeEur);
+        let urban = family_base_colors(EnvKind::Urban);
+        // Building base should be creammer (higher r+g, warmer) than urban grey-pastel.
+        let rb = rome[2].to_srgba();
+        let ub = urban[2].to_srgba();
+        assert!(rb.red + rb.green > ub.red + ub.green - 0.01);
+        // Urban palette is unchanged for the four small towns.
+        for env in [
+            EnvKind::Urban,
+            EnvKind::MountainTown,
+            EnvKind::DesertTown,
+            EnvKind::SeaTown,
+        ] {
+            let b = family_base_colors(env);
+            assert_eq!(b[0].to_srgba().red, urban[0].to_srgba().red);
         }
     }
 

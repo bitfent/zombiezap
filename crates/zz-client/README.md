@@ -343,3 +343,29 @@ buttons use fixed insets from the bottom-right:
 On a 1280×720 pane: stick **(230, 518)**, FIRE **(1224, 648)**, JUMP
 **(1112, 570)**, NADE **(1112, 648)**. Aim: press-drag on the right half
 (e.g. start at `(900, 360)`, drag horizontally).
+
+42. **Rome EUR client (M11b / R2b):** `env_lighting(EnvKind::RomeEur)` is warm
+    Mediterranean late-afternoon — sky `srgb_u8(168,196,230)`, golden sun
+    `srgb_u8(255,236,200)` @ 12k lux from the southwest
+    (`sun_to ≈ normalize(-18, 20, 14)`; map +z is south), ambient warm grey
+    `srgb_u8(168,158,142)` @ 1000. Wall family bases use a travertine-cream
+    palette (`family_base_colors`) instead of the pastel-city set.
+    `ground_tex_res` / `occlusion_res` derive from `arena_half` (≥2 texels/m,
+    cell ≤2 m, hard cap 2048) so small towns stay at 1024/256 while Rome's
+    500 m arena still bakes sharp. Lobby env picker includes **ROME EUR**.
+    Page footer (`#zz-map-attrib`) credits OpenStreetMap (ODbL).
+
+### Lobby env-picker automation anchors (1280×720)
+
+Lobby card is centered (420 px wide). After host → lobby, the ENVIRONMENT
+row sits near the lower-middle of the card. Approximate click centres:
+
+| Env button | Centre (logical px @ 1280×720) |
+|------------|--------------------------------|
+| URBAN      | **(500, 455)** |
+| MOUNTAIN   | **(575, 455)** |
+| DESERT     | **(655, 455)** |
+| SEA        | **(720, 455)** |
+| ROME EUR   | **(800, 455)** — wraps to next line if tight: **(520, 485)** |
+
+Prefer a 1 px `left_click_drag` (item 36) so egui registers the press.
