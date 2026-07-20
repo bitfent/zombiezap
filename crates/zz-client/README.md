@@ -174,14 +174,14 @@ work next:
     skipped first when saturated. Synthesis is pure math + xorshift noise —
     no `rand`, no wav files.
 
-19. **`FocusPolicy` is under `bevy::ui`, not always in the umbrella prelude.**  
+22. **`FocusPolicy` is under `bevy::ui`, not always in the umbrella prelude.**  
     Use `bevy::ui::FocusPolicy::Pass` for non-interactive full-screen overlays
     (damage vignette, paused tint) so clicks fall through to menus/buttons.
 
-20. **Per-entity transparent FX need unique `StandardMaterial` handles.**  
+23. **Per-entity transparent FX need unique `StandardMaterial` handles.**  
     Mutating a shared material’s alpha fades every concurrent tracer/boom.
     Clone via `materials.add(...)` per spawn for independent lifetimes.
 
-21. **`Button` requires `Interaction` (via `#[require]`) — edge-detect clicks with**  
+24. **`Button` requires `Interaction` (via `#[require]`) — edge-detect clicks with**  
     `Changed<Interaction>` + `Interaction::Pressed` and a local “was pressed”
     flag so held clicks don’t spam `UiIntent`s every frame.
