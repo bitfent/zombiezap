@@ -73,7 +73,14 @@ Not placeholders. Zero asset files still — procedural articulated rigs:
   game with a gun"; 60 fps in-browser with 150 zombies on a mid laptop;
   side-by-side screenshot vs ShotAnte for parity.
 
-## [ ] 3. Mobile touch experience (task "M6c" part 1)
+## [x] 3. Mobile touch experience (task "M6c" part 1) — DONE (zz-client M10, commit cd6e9c8)
+
+Browser-verified 2026-07-20 with ?touch=1: virtual stick + JUMP/NADE/FIRE
+cluster render clear of the HUD; aim-drag turns the camera (verified
+live); HTML name/code overlays appear in touch mode (soft-keyboard
+bridge). REMAINING: verify on an actual phone (soft keyboard, audio
+unlock, landscape hint) once deployed — and take item 2's outstanding
+stranger-test horde screenshot using these controls.
 
 Port the ShotAnte touch scheme — reference implementation:
 `legacy/apps/web/src/game/Input.ts`.
@@ -94,7 +101,7 @@ Port the ShotAnte touch scheme — reference implementation:
   aim, shoot, throw, host and join by code. Landscape hint shown in
   portrait.
 
-## [ ] 3b. Rome EUR real-place map (USER REQUEST 2026-07-20)
+## [~] 3b. Rome EUR real-place map (USER REQUEST 2026-07-20) — R2a DONE (zz-core M11a, commit 304c5e2: baker + fixture, 764 AABBs, hollow basilica w/ portal+columns+dome tiers, 4 gates, piazzale spawns, fuzz green). REMAINING R2b (client): warm Mediterranean env_lighting entry, ROME EUR lobby picker button, OSM footer attribution, big-arena scaling checks (director pacing, occlusion bake, ground texture res), browser walkthrough of the basilica interior.
 
 Viale dei Santi Pietro e Paolo + Via Eufrate at TRUE scale, the piazzale,
 and the basilica with a playable interior. Feasibility proven; data cached.
