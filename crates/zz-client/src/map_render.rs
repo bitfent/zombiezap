@@ -8,11 +8,16 @@
 //!   entity, then spawns the whole map under ONE root entity tagged
 //!   [`MapRoot`];
 //! - zero asset files: all textures are generated in code (procedural noise /
-//!   stripes), billboards are unlit "YOUR AD HERE"-style striped panels keyed
-//!   by `ad_slot`;
+//!   stripes), billboards are unlit backlit "YOUR AD HERE"-style striped
+//!   panels keyed by `ad_slot`;
 //! - walls are grouped into a few material families by simple heuristics
 //!   (ground cover < 2 m, building walls, roofs/high boxes, perimeter) and
-//!   merged into ONE mesh per family — a handful of draw calls total.
+//!   merged into ONE mesh per family — a handful of draw calls total;
+//! - per-env palettes + texture tints (Urban pastel, Mountain timber-stone,
+//!   Desert adobe, Sea weathered dock, Rome travertine);
+//! - warm window slits on tall Building faces, merged into ONE emissive mesh;
+//! - slow procedural cloud quads under a single drift root (one transform
+//!   per frame for the whole layer).
 
 use std::f32::consts::PI;
 
@@ -169,22 +174,56 @@ pub fn env_lighting(env: EnvKind) -> EnvLighting {
 }
 
 /// Wall-family base colors (Perimeter, Cover, Building, Roof) before accent mix.
-/// Rome leans cream/travertine; the four small towns keep the pastel-city set.
+/// Each env has a distinct family so the town reads at a glance.
 fn family_base_colors(env: EnvKind) -> [Color; 4] {
     match env {
-        EnvKind::RomeEur => [
-            Color::srgb(0.72, 0.68, 0.60), // warm perimeter stone
-            Color::srgb(0.78, 0.62, 0.42), // warm planters / cover
-            Color::srgb(0.92, 0.86, 0.74), // cream travertine buildings
-            Color::srgb(0.48, 0.42, 0.36), // warm roof stone
-        ],
-        // Urban / Mountain / Desert / Sea — historical pastel-city palette.
-        EnvKind::Urban | EnvKind::MountainTown | EnvKind::DesertTown | EnvKind::SeaTown => [
+        // Pastel city: cool concrete perimeter, warm crates, stucco buildings, slate roofs.
+        EnvKind::Urban => [
             Color::srgb(0.62, 0.65, 0.71),
             Color::srgb(0.80, 0.66, 0.46),
             Color::srgb(0.88, 0.82, 0.70),
             Color::srgb(0.38, 0.42, 0.50),
         ],
+        // Timber-and-stone: grey rock perimeter, dark wood cover/cabins, stone roofs.
+        EnvKind::MountainTown => [
+            Color::srgb(0.50, 0.50, 0.52),
+            Color::srgb(0.40, 0.28, 0.18),
+            Color::srgb(0.38, 0.26, 0.16),
+            Color::srgb(0.52, 0.50, 0.46),
+        ],
+        // Adobe: sand/ochre walls, flat sand roofs, dusty cover crates.
+        EnvKind::DesertTown => [
+            Color::srgb(0.70, 0.60, 0.46),
+            Color::srgb(0.68, 0.50, 0.32),
+            Color::srgb(0.86, 0.72, 0.50),
+            Color::srgb(0.72, 0.58, 0.40),
+        ],
+        // Weathered dock: blue-grey warehouses, bleached timber, dock crates.
+        EnvKind::SeaTown => [
+            Color::srgb(0.52, 0.56, 0.60),
+            Color::srgb(0.60, 0.52, 0.40),
+            Color::srgb(0.56, 0.60, 0.66),
+            Color::srgb(0.58, 0.54, 0.46),
+        ],
+        // Travertine: cream stone, warm planters, warm roof stone.
+        EnvKind::RomeEur => [
+            Color::srgb(0.72, 0.68, 0.60),
+            Color::srgb(0.78, 0.62, 0.42),
+            Color::srgb(0.92, 0.86, 0.74),
+            Color::srgb(0.48, 0.42, 0.36),
+        ],
+    }
+}
+
+/// Per-env RGB multipliers applied when baking wall/cover/roof textures so the
+/// procedural detail itself carries the env hue (not only the material base).
+fn env_texture_tint(env: EnvKind) -> [f32; 3] {
+    match env {
+        EnvKind::Urban => [1.0, 1.0, 1.0],
+        EnvKind::MountainTown => [0.88, 0.78, 0.66], // warm timber wash
+        EnvKind::DesertTown => [1.08, 0.96, 0.72],   // sand / ochre
+        EnvKind::SeaTown => [0.86, 0.92, 0.98],      // cool bleached blue-grey
+        EnvKind::RomeEur => [1.06, 1.00, 0.90],      // cream travertine
     }
 }
 
@@ -499,6 +538,145 @@ pub fn billboard_facing_rotation(wall: u8) -> Quat {
     }
 }
 
+// ── Glowing window slits (one merged emissive mesh per map) ──────────────────
+
+/// Minimum Building-family height (m) to receive warm window slits.
+const WINDOW_MIN_HEIGHT: f32 = 2.5;
+const WINDOW_W: f32 = 0.7;
+const WINDOW_H: f32 = 0.9;
+/// Nudge slits just outside the wall face so they don't z-fight.
+const WINDOW_OUTSET: f32 = 0.04;
+/// Hard cap so a dense city never floods the single window mesh.
+const MAX_WINDOWS_PER_MAP: usize = 512;
+
+/// One emissive window quad in world space (axis-aligned normal).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowSlit {
+    pub center: [f32; 3],
+    /// Outward unit normal on a cardinal axis.
+    pub normal: [f32; 3],
+    pub half_w: f32,
+    pub half_h: f32,
+}
+
+/// Deterministic integer hash (xorshift-ish). Pure; used for window layout.
+fn hash_u32(mut n: u32) -> u32 {
+    n = n.wrapping_mul(2654435761);
+    n ^= n >> 16;
+    n = n.wrapping_mul(2246822519);
+    n ^= n >> 13;
+    n
+}
+
+/// Place warm window slits on Building-family boxes taller than
+/// [`WINDOW_MIN_HEIGHT`]. Layout is a pure function of wall index + face +
+/// cell indices — same walls → same quads. Count is hard-capped at
+/// [`MAX_WINDOWS_PER_MAP`].
+pub fn place_window_slits(walls: &[Aabb], arena_half: f32) -> Vec<WindowSlit> {
+    let mut out = Vec::new();
+    for (wi, w) in walls.iter().enumerate() {
+        if classify_wall(w, arena_half) != WallFamily::Building {
+            continue;
+        }
+        let height = (w.y1 - w.y0).abs();
+        if height < WINDOW_MIN_HEIGHT {
+            continue;
+        }
+        let sx = (w.x1 - w.x0).abs();
+        let sz = (w.z1 - w.z0).abs();
+        let mid_x = (w.x0 + w.x1) * 0.5;
+        let mid_z = (w.z0 + w.z1) * 0.5;
+
+        // Four street-facing vertical faces: (+Z, -Z, +X, -X).
+        // (normal, face_width, face_x_or_mid, face_z_or_mid, axis_is_x_face)
+        let faces: [([f32; 3], f32, f32, f32, bool); 4] = [
+            ([0.0, 0.0, 1.0], sx, mid_x, w.z1, false),
+            ([0.0, 0.0, -1.0], sx, mid_x, w.z0, false),
+            ([1.0, 0.0, 0.0], sz, w.x1, mid_z, true),
+            ([-1.0, 0.0, 0.0], sz, w.x0, mid_z, true),
+        ];
+
+        for (fi, (normal, face_w, fx, fz, x_face)) in faces.iter().enumerate() {
+            if *face_w < WINDOW_W + 0.5 {
+                continue;
+            }
+            let seed = (wi as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add((fi as u32).wrapping_mul(1597334677));
+            let h = hash_u32(seed);
+            // ~1/5 of faces stay blank (irregular street rhythm).
+            if h.is_multiple_of(5) {
+                continue;
+            }
+            let max_cols = (((*face_w - 0.4) / (WINDOW_W + 0.55)).floor() as i32).max(1);
+            let cols = 1 + (h % max_cols as u32) as i32;
+            let usable_h = height - 1.0;
+            if usable_h < WINDOW_H {
+                continue;
+            }
+            let max_rows = ((usable_h / (WINDOW_H + 0.7)).floor() as i32).max(1);
+            let rows = 1 + ((h >> 8) % max_rows as u32) as i32;
+
+            for r in 0..rows {
+                for c in 0..cols {
+                    if out.len() >= MAX_WINDOWS_PER_MAP {
+                        return out;
+                    }
+                    let cell = hash_u32(seed.wrapping_add((r as u32) * 31 + (c as u32) * 17));
+                    // Sparse irregular pattern inside the grid.
+                    if cell.is_multiple_of(7) {
+                        continue;
+                    }
+                    let u = (c as f32 + 0.5) / cols as f32;
+                    // Mid-band on the facade (above ground floor sill, below eaves).
+                    let v = 0.32 + (r as f32 + 0.5) / rows as f32 * 0.48;
+                    let along = (u - 0.5) * (*face_w - WINDOW_W);
+                    let y = w.y0 + v * height;
+                    let (px, pz) = if *x_face {
+                        (fx + normal[0] * WINDOW_OUTSET, fz + along)
+                    } else {
+                        (fx + along, fz + normal[2] * WINDOW_OUTSET)
+                    };
+                    out.push(WindowSlit {
+                        center: [px, y, pz],
+                        normal: *normal,
+                        half_w: WINDOW_W * 0.5,
+                        half_h: WINDOW_H * 0.5,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Merge window slits into one dual-sided-friendly MeshGeom (single draw call).
+pub fn build_window_mesh(slits: &[WindowSlit]) -> MeshGeom {
+    let mut geom = MeshGeom::default();
+    for s in slits {
+        let n = Vec3::from_array(s.normal);
+        let up = Vec3::Y;
+        let right = n.cross(up);
+        let right_len = right.length();
+        if right_len < 1e-4 {
+            continue;
+        }
+        let right = right / right_len;
+        let c = Vec3::from_array(s.center);
+        let hw = s.half_w;
+        let hh = s.half_h;
+        // CCW when viewed along outward normal.
+        let corners = [
+            (c - right * hw - up * hh).to_array(),
+            (c + right * hw - up * hh).to_array(),
+            (c + right * hw + up * hh).to_array(),
+            (c - right * hw + up * hh).to_array(),
+        ];
+        geom.push_face(corners, s.normal, s.half_w * 2.0, s.half_h * 2.0);
+    }
+    geom
+}
+
 // ── Procedural textures ────────────────────────────────────────────────────
 
 /// Tiny deterministic hash → [0, 1). Not rand.
@@ -510,6 +688,14 @@ fn hash_noise(x: u32, y: u32, salt: u32) -> f32 {
     n = (n ^ (n >> 13)).wrapping_mul(1274126177);
     n ^= n >> 16;
     (n & 0xffff) as f32 / 65535.0
+}
+
+fn apply_tint(r: f32, g: f32, b: f32, tint: [f32; 3]) -> [u8; 3] {
+    [
+        (r * tint[0] * 255.0).clamp(0.0, 255.0) as u8,
+        (g * tint[1] * 255.0).clamp(0.0, 255.0) as u8,
+        (b * tint[2] * 255.0).clamp(0.0, 255.0) as u8,
+    ]
 }
 
 fn rgba_image(width: u32, height: u32, pixels: Vec<u8>) -> Image {
@@ -571,10 +757,10 @@ fn gen_ground_lit(size: u32, half: f32, occlusion: &[f32], occ_res: u32) -> Imag
     rgba_image(size, size, px)
 }
 
-fn gen_concrete(size: u32, dark: bool) -> Image {
+fn gen_concrete(size: u32, dark: bool, tint: [f32; 3]) -> Image {
     let mut px = Vec::with_capacity((size * size * 4) as usize);
     // Bright bases (legacy building textures are near-white; hue comes from
-    // the material base_color multiplied on top).
+    // the material base_color multiplied on top + env texture tint).
     let base0 = if dark { 0.58 } else { 0.76 };
     for y in 0..size {
         for x in 0..size {
@@ -582,14 +768,78 @@ fn gen_concrete(size: u32, dark: bool) -> Image {
             // Faint horizontal darker bands every ~32 px.
             let band = if (y % 32) < 2 { 0.08 } else { 0.0 };
             let v = (base0 + n * 0.09 - band).clamp(0.0, 1.0);
-            let c = (v * 255.0) as u8;
-            px.extend_from_slice(&[c, c, c, 255]);
+            let rgb = apply_tint(v, v, v, tint);
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
     }
     rgba_image(size, size, px)
 }
 
-fn gen_cover(size: u32) -> Image {
+/// Mountain / sea building face: horizontal timber / plank grain.
+fn gen_wood_planks(size: u32, tint: [f32; 3], bleached: bool) -> Image {
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
+    let plank_h = 10u32;
+    for y in 0..size {
+        for x in 0..size {
+            let n = hash_noise(x, y, 11);
+            let plank = y / plank_h;
+            let seam = y % plank_h == 0;
+            let row_n = hash_noise(plank, 0, 12);
+            let base = if bleached {
+                0.62 + row_n * 0.10 + n * 0.06
+            } else {
+                0.38 + row_n * 0.12 + n * 0.08
+            };
+            let v = if seam { base * 0.72 } else { base };
+            let (r, g, b) = if bleached {
+                (v * 0.95, v * 0.92, v * 0.88)
+            } else {
+                (v * 1.05, v * 0.78, v * 0.48)
+            };
+            let rgb = apply_tint(r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), tint);
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+    }
+    rgba_image(size, size, px)
+}
+
+/// Desert building: flat adobe with soft mottling (no strong bands).
+fn gen_adobe(size: u32, tint: [f32; 3]) -> Image {
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let n = hash_noise(x, y, 13);
+            let n2 = hash_noise(x / 4, y / 4, 14);
+            let v = (0.70 + n * 0.08 + n2 * 0.06).clamp(0.0, 1.0);
+            let rgb = apply_tint(v, v * 0.90, v * 0.68, tint);
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+    }
+    rgba_image(size, size, px)
+}
+
+/// Building wall texture keyed by environment (detail + tint).
+fn gen_building_tex(env: EnvKind, size: u32) -> Image {
+    let tint = env_texture_tint(env);
+    match env {
+        EnvKind::MountainTown => gen_wood_planks(size, tint, false),
+        EnvKind::DesertTown => gen_adobe(size, tint),
+        EnvKind::SeaTown => gen_wood_planks(size, tint, true),
+        EnvKind::RomeEur | EnvKind::Urban => gen_concrete(size, false, tint),
+    }
+}
+
+fn gen_perimeter_tex(env: EnvKind, size: u32) -> Image {
+    let tint = env_texture_tint(env);
+    match env {
+        // Mountain perimeter = grey stone (dark concrete + cool tint override).
+        EnvKind::MountainTown => gen_concrete(size, true, [0.92, 0.92, 0.96]),
+        EnvKind::DesertTown => gen_adobe(size, tint),
+        _ => gen_concrete(size, true, tint),
+    }
+}
+
+fn gen_cover(size: u32, tint: [f32; 3]) -> Image {
     let mut px = Vec::with_capacity((size * size * 4) as usize);
     let border = 4u32;
     for y in 0..size {
@@ -602,22 +852,59 @@ fn gen_cover(size: u32) -> Image {
                 let v = 0.64 + n * 0.14;
                 (v, v * 0.76, v * 0.48)
             };
-            px.extend_from_slice(&[(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255]);
+            let rgb = apply_tint(r, g, b, tint);
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
     }
     rgba_image(size, size, px)
 }
 
-fn gen_roof(size: u32) -> Image {
+fn gen_roof(size: u32, tint: [f32; 3]) -> Image {
     let mut px = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
             let n = hash_noise(x, y, 5);
             let v = 0.52 + n * 0.12;
-            let c = (v.clamp(0.0, 1.0) * 255.0) as u8;
-            px.extend_from_slice(&[c, c, c, 255]);
+            let rgb = apply_tint(v, v, v, tint);
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
     }
+    rgba_image(size, size, px)
+}
+
+/// Soft cloud blob: white centre, transparent edges (unlit translucent quads).
+fn gen_cloud(size: u32) -> Image {
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
+    let cx = size as f32 * 0.5;
+    let cy = size as f32 * 0.5;
+    // Two soft ellipses for a lumpy cloud silhouette.
+    let blobs = [
+        (0.0f32, 0.0, 0.42, 0.28),
+        (-0.18, 0.06, 0.28, 0.22),
+        (0.20, -0.04, 0.26, 0.20),
+    ];
+    for y in 0..size {
+        for x in 0..size {
+            let u = (x as f32 - cx) / cx;
+            let v = (y as f32 - cy) / cy;
+            let mut a = 0.0f32;
+            for (ox, oy, rx, ry) in blobs {
+                let dx = (u - ox) / rx;
+                let dy = (v - oy) / ry;
+                let d = (dx * dx + dy * dy).sqrt();
+                // Soft falloff: 1 at centre → 0 at edge.
+                let blob = (1.0 - d).clamp(0.0, 1.0).powf(1.6);
+                a = (a + blob * 0.55).min(1.0);
+            }
+            // Slight noise so edges aren't perfect math ellipses.
+            let n = hash_noise(x, y, 77) * 0.08;
+            a = (a - n).clamp(0.0, 1.0);
+            let c = 255u8;
+            px.extend_from_slice(&[c, c, c, (a * 200.0) as u8]);
+        }
+    }
+    // Linear filtering would soft-blur; nearest keeps retro look but clouds
+    // are large so either is fine — match project nearest default.
     rgba_image(size, size, px)
 }
 
@@ -680,9 +967,28 @@ fn tinted(base: Color, accent: Color) -> Color {
 
 // ── Plugin ─────────────────────────────────────────────────────────────────
 
+/// Parent of all cloud quads; one entity, drifted slowly each frame.
+#[derive(Component)]
+struct CloudDriftRoot;
+
+/// How high above the arena floor the cloud layer sits (metres).
+const CLOUD_HEIGHT: f32 = 55.0;
+/// Slow drift amplitude (m) and period scale (rad/s).
+const CLOUD_DRIFT_AMP: f32 = 12.0;
+const CLOUD_DRIFT_SPEED: f32 = 0.04;
+
 impl Plugin for MapRenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, rebuild_map_system);
+        app.add_systems(Update, (rebuild_map_system, drift_clouds_system));
+    }
+}
+
+/// Single cheap transform on the cloud root — the only per-frame dressing cost.
+fn drift_clouds_system(time: Res<Time>, mut q: Query<&mut Transform, With<CloudDriftRoot>>) {
+    let t = time.elapsed_secs();
+    for mut xf in &mut q {
+        xf.translation.x = (t * CLOUD_DRIFT_SPEED).sin() * CLOUD_DRIFT_AMP;
+        xf.translation.z = (t * CLOUD_DRIFT_SPEED * 0.73 + 1.1).cos() * CLOUD_DRIFT_AMP * 0.7;
     }
 }
 
@@ -743,16 +1049,19 @@ fn rebuild_map_system(
         bake_ground_occlusion(occ_res, map.arena_half, light.sun_to, &map.walls);
 
     // Procedural textures (small, nearest-filtered; wall textures tile).
+    // Per-env tint + family generators so each town reads at a glance.
+    let tex_tint = env_texture_tint(map.env);
     let tex_ground = images.add(gen_ground_lit(
         ground_res,
         map.arena_half,
         &ground_occlusion,
         occ_res,
     ));
-    let tex_concrete = images.add(tiled(gen_concrete(128, false)));
-    let tex_perimeter = images.add(tiled(gen_concrete(128, true)));
-    let tex_cover = images.add(tiled(gen_cover(128)));
-    let tex_roof = images.add(tiled(gen_roof(128)));
+    let tex_building = images.add(tiled(gen_building_tex(map.env, 128)));
+    let tex_perimeter = images.add(tiled(gen_perimeter_tex(map.env, 128)));
+    let tex_cover = images.add(tiled(gen_cover(128, tex_tint)));
+    let tex_roof = images.add(tiled(gen_roof(128, tex_tint)));
+    let tex_cloud = images.add(gen_cloud(64));
     let ad_handles: [Handle<Image>; 4] = [
         images.add(gen_ad(0, 256, 128)),
         images.add(gen_ad(1, 256, 128)),
@@ -760,8 +1069,8 @@ fn rebuild_map_system(
         images.add(gen_ad(3, 256, 128)),
     ];
 
-    // Near-white textures carry the detail; family bases carry the hue
-    // (Rome = travertine cream; other envs = pastel-city); accent mixes in.
+    // Near-white textures carry the detail; family bases carry the hue;
+    // env texture tints bake into the image; accent mixes into the base.
     let bases = family_base_colors(map.env);
     let family_mats: [Handle<StandardMaterial>; 4] = [
         materials.add(wall_material(
@@ -776,7 +1085,7 @@ fn rebuild_map_system(
         )),
         materials.add(wall_material(
             tinted(bases[2], accent),
-            Some(tex_concrete.clone()),
+            Some(tex_building.clone()),
             0.88,
         )),
         materials.add(wall_material(
@@ -810,7 +1119,29 @@ fn rebuild_map_system(
         materials.add(ad_material(ad_handles[3].clone())),
     ];
 
+    // Warm window glow: one emissive material + one merged mesh for the map.
+    let window_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.88, 0.55),
+        emissive: LinearRgba::rgb(5.5, 3.6, 1.4),
+        unlit: true,
+        alpha_mode: AlphaMode::Opaque,
+        // Visible from street; thin quads, no backface needed.
+        cull_mode: Some(bevy::render::render_resource::Face::Back),
+        ..default()
+    });
+
+    let cloud_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 1.0, 1.0, 0.85),
+        base_color_texture: Some(tex_cloud),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        // Double-sided so the camera can look up from any yaw.
+        cull_mode: None,
+        ..default()
+    });
+
     let family_geoms = build_family_meshes(&map.walls, map.arena_half);
+    let window_slits = place_window_slits(&map.walls, map.arena_half);
     let half = map.arena_half;
 
     commands
@@ -847,7 +1178,21 @@ fn rebuild_map_system(
                 ));
             }
 
-            // Billboards + thin dark frames.
+            // Warm window slits — single mesh, single emissive material.
+            if !window_slits.is_empty() {
+                let wgeom = build_window_mesh(&window_slits);
+                if !wgeom.is_empty() {
+                    let mesh = meshes.add(wgeom.into_mesh());
+                    root.spawn((
+                        Mesh3d(mesh),
+                        MeshMaterial3d(window_mat),
+                        Transform::IDENTITY,
+                        Name::new("Windows"),
+                    ));
+                }
+            }
+
+            // Billboards + thin dark frames (ads are unlit + mild emissive lift).
             for (i, bb) in map.billboards.iter().enumerate() {
                 let slot = (bb.ad_slot % 4) as usize;
                 let quad = build_billboard_quad(bb.w, bb.h);
@@ -886,6 +1231,40 @@ fn rebuild_map_system(
                 ));
             }
 
+            // Procedural cloud layer: handful of big flat quads under one
+            // drift root (one cheap transform per frame for the whole set).
+            let cloud_span = half * 1.6;
+            // Deterministic placements from env discriminant + half.
+            let cloud_specs: [(f32, f32, f32); 6] = [
+                (-0.35, 0.20, 28.0),
+                (0.25, -0.30, 36.0),
+                (0.10, 0.35, 24.0),
+                (-0.15, -0.10, 40.0),
+                (0.40, 0.05, 30.0),
+                (-0.40, -0.35, 22.0),
+            ];
+            root.spawn((
+                CloudDriftRoot,
+                Transform::from_xyz(0.0, CLOUD_HEIGHT, 0.0),
+                Visibility::default(),
+                Name::new("Clouds"),
+            ))
+            .with_children(|clouds| {
+                for (i, (nx, nz, size)) in cloud_specs.iter().enumerate() {
+                    // Flat horizontal quad (local +Y up); Plane3d faces +Y.
+                    let mesh = meshes.add(Mesh::from(Plane3d::new(
+                        Vec3::Y,
+                        Vec2::splat(*size * 0.5),
+                    )));
+                    clouds.spawn((
+                        Mesh3d(mesh),
+                        MeshMaterial3d(cloud_mat.clone()),
+                        Transform::from_xyz(nx * cloud_span, 0.0, nz * cloud_span),
+                        Name::new(format!("Cloud/{i}")),
+                    ));
+                }
+            });
+
             // Map-owned sun (the skeleton backdrop light is a Placeholder and
             // is gone by now). Real-time shadow maps stay OFF — shadows were
             // baked above, once, at map build.
@@ -916,11 +1295,14 @@ fn wall_material(
     }
 }
 
+/// Unlit ad panel with a mild emissive lift so signage reads as backlit.
 fn ad_material(texture: Handle<Image>) -> StandardMaterial {
     StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(texture),
         unlit: true,
+        // Subtle warm lift — bright enough to read as backlit, not a neon bloom.
+        emissive: LinearRgba::rgb(0.55, 0.48, 0.40),
         // Single-sided, faces into the arena per orientation.
         cull_mode: Some(bevy::render::render_resource::Face::Back),
         alpha_mode: AlphaMode::Opaque,
@@ -1056,13 +1438,22 @@ mod tests {
         // Procedural textures must not panic.
         let occ = bake_ground_occlusion(8, map.arena_half, Vec3::new(0.4, 0.8, 0.3), &map.walls);
         let _ = gen_ground_lit(16, map.arena_half, &occ, 8);
-        let _ = gen_concrete(16, false);
-        let _ = gen_concrete(16, true);
-        let _ = gen_cover(16);
-        let _ = gen_roof(16);
+        let tint = env_texture_tint(EnvKind::Urban);
+        let _ = gen_concrete(16, false, tint);
+        let _ = gen_concrete(16, true, tint);
+        let _ = gen_cover(16, tint);
+        let _ = gen_roof(16, tint);
+        let _ = gen_building_tex(EnvKind::MountainTown, 16);
+        let _ = gen_building_tex(EnvKind::DesertTown, 16);
+        let _ = gen_building_tex(EnvKind::SeaTown, 16);
+        let _ = gen_cloud(16);
         for s in 0..4u8 {
             let _ = gen_ad(s, 32, 16);
         }
+        // Window slits: pure placement + mesh, deterministic.
+        let slits = place_window_slits(&map.walls, map.arena_half);
+        assert!(slits.len() <= MAX_WINDOWS_PER_MAP);
+        let _ = build_window_mesh(&slits);
 
         eprintln!(
             "preview map: walls={}, billboards={}, non_empty_wall_families={} (draw families), wall_verts={}, accent={:#08x}",
@@ -1193,16 +1584,85 @@ mod tests {
         let rb = rome[2].to_srgba();
         let ub = urban[2].to_srgba();
         assert!(rb.red + rb.green > ub.red + ub.green - 0.01);
-        // Urban palette is unchanged for the four small towns.
-        for env in [
+    }
+
+    #[test]
+    fn family_bases_are_distinct_per_env() {
+        let envs = [
             EnvKind::Urban,
             EnvKind::MountainTown,
             EnvKind::DesertTown,
             EnvKind::SeaTown,
-        ] {
-            let b = family_base_colors(env);
-            assert_eq!(b[0].to_srgba().red, urban[0].to_srgba().red);
+            EnvKind::RomeEur,
+        ];
+        let bases: Vec<[Color; 4]> = envs.iter().map(|e| family_base_colors(*e)).collect();
+        for (i, a) in bases.iter().enumerate() {
+            for (j, b) in bases.iter().enumerate().skip(i + 1) {
+                // Compare building family (index 2) — the most visible facade hue.
+                let ca = a[2].to_srgba();
+                let cb = b[2].to_srgba();
+                let d = (ca.red - cb.red).abs()
+                    + (ca.green - cb.green).abs()
+                    + (ca.blue - cb.blue).abs();
+                assert!(
+                    d > 0.05,
+                    "building bases of env {i} and {j} too similar (d={d})"
+                );
+            }
         }
+        // Mountain building should read darker/warmer wood than urban stucco.
+        let m = bases[1][2].to_srgba();
+        let u = bases[0][2].to_srgba();
+        assert!(m.red + m.green + m.blue < u.red + u.green + u.blue);
+        // Desert building warmer (higher r, lower b ratio) than sea blue-grey.
+        let d = bases[2][2].to_srgba();
+        let s = bases[3][2].to_srgba();
+        assert!(d.red > s.red);
+        assert!(s.blue > d.blue);
+    }
+
+    #[test]
+    fn window_slits_deterministic_and_bounded() {
+        let map = generate_map(EnvKind::Urban, "preview");
+        let a = place_window_slits(&map.walls, map.arena_half);
+        let b = place_window_slits(&map.walls, map.arena_half);
+        assert_eq!(a, b, "same map must yield identical window slits");
+        assert!(a.len() <= MAX_WINDOWS_PER_MAP);
+        // Tall building boxes should produce at least a few windows on urban.
+        assert!(
+            !a.is_empty(),
+            "urban preview should place some window slits"
+        );
+        // Short cover never gets windows.
+        let cover = [box_at(0.0, 0.0, 0.0, 2.0, 1.0, 2.0)];
+        assert!(place_window_slits(&cover, 30.0).is_empty());
+        // Tall building does.
+        let tall = [box_at(0.0, 0.0, 0.0, 4.0, 4.0, 0.4)];
+        let tall_slits = place_window_slits(&tall, 30.0);
+        assert!(!tall_slits.is_empty());
+        // Mesh verts = 4 per slit.
+        let geom = build_window_mesh(&tall_slits);
+        assert_eq!(geom.positions.len(), tall_slits.len() * 4);
+        assert_eq!(geom.indices.len(), tall_slits.len() * 6);
+        // Bound: even a dense wall list cannot exceed the hard cap.
+        let many: Vec<Aabb> = (0..200)
+            .map(|i| {
+                let x = (i % 20) as f32 * 5.0;
+                let z = (i / 20) as f32 * 5.0;
+                box_at(x, 0.0, z, x + 3.0, 5.0, z + 0.4)
+            })
+            .collect();
+        let dense = place_window_slits(&many, 80.0);
+        assert!(dense.len() <= MAX_WINDOWS_PER_MAP);
+    }
+
+    #[test]
+    fn ad_material_has_emissive_lift() {
+        // Pure unit check: the helper sets a non-zero emissive so ads read backlit.
+        let mat = ad_material(Handle::default());
+        assert!(mat.unlit);
+        assert!(mat.emissive.red > 0.1);
+        assert!(mat.emissive.green > 0.1);
     }
 
     #[test]

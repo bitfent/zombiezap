@@ -355,6 +355,27 @@ On a 1280×720 pane: stick **(230, 518)**, FIRE **(1224, 648)**, JUMP
     500 m arena still bakes sharp. Lobby env picker includes **ROME EUR**.
     Page footer (`#zz-map-attrib`) credits OpenStreetMap (ODbL).
 
+43. **Per-env dressing (M12 / Phase D):** all baked in `rebuild_map_system`
+    (nothing per-frame except one cloud-root transform).
+    - **Palettes:** `family_base_colors(env)` is total over all five envs —
+      Urban pastel city, Mountain dark timber + grey stone, Desert sand/ochre
+      adobe, Sea blue-grey warehouses + bleached planks, Rome travertine.
+      `env_texture_tint` multiplies into wall/cover/roof texture bake;
+      Mountain/Sea buildings use plank grain, Desert flat adobe mottling.
+    - **Window slits:** `place_window_slits` (pure) on Building-family boxes
+      taller than 2.5 m — deterministic hash of wall index + face + cell;
+      hard-capped at 512. Merged via `build_window_mesh` into **one** emissive
+      unlit mesh + one material (`LinearRgba` warm ~5.5/3.6/1.4).
+    - **Lit ads:** `ad_material` stays unlit (readable in shadow) with a mild
+      emissive lift (`LinearRgba::rgb(0.55, 0.48, 0.40)`) so panels read as
+      backlit signage in every env.
+    - **Clouds:** six large `Plane3d` quads, shared soft-blob texture
+      (`gen_cloud`, alpha falloff), unlit `AlphaMode::Blend`, parented under
+      `CloudDriftRoot` at y≈55. `drift_clouds_system` only translates that
+      root (sin/cos, ~0.04 rad/s) — draw-call budget otherwise unchanged.
+    - **WebGL2:** still no texture view-format tricks (item 35); cloud/window
+      images are plain `Rgba8UnormSrgb`.
+
 ### Lobby env-picker automation anchors (1280×720)
 
 Lobby card is centered (420 px wide). After host → lobby, the ENVIRONMENT
