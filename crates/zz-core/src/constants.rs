@@ -102,6 +102,11 @@ pub const DROP_CHANCE_GRENADE: f64 = 0.05;
 pub const LOOT_AMMO_AMOUNT: u8 = 24;
 pub const LOOT_HEAL_AMOUNT: u8 = 25;
 
+// ── voice chat ─────────────────────────────────────────────────────────────
+/// 3D euclidean metres: BIN_VOICE frames relay only to teammates inside this
+/// radius of the speaker (authoritative positions).
+pub const CHAT_PROXIMITY_RADIUS: f32 = 25.0;
+
 // ── lobby ──────────────────────────────────────────────────────────────────
 pub const MAX_PLAYERS: usize = 5;
 /// Lobby codes use this unambiguous alphabet (no 0/O/1/I) — ShotAnte's.

@@ -14,7 +14,9 @@ use zombies::{FlowField, SpatialHash, Zombie};
 use zz_core::constants::*;
 use zz_core::map::{GameMap, WalkGrid, generate_map};
 use zz_core::movement::step_body;
-use zz_core::protocol::{MatchStats, PlayerStats, RosterPlayer, ServerMsg};
+use zz_core::protocol::{
+    MatchStats, PlayerStats, RosterPlayer, ServerMsg, decode_voice, encode_voice,
+};
 use zz_core::snapshot::{
     Snapshot, SnapshotEncoder, WireBoom, WireGrenade, WireLoot, WirePlayer, WireShot, WireZombie,
     quant_pitch, quant_pos3, quant_yaw8, quant_yaw16,
@@ -36,12 +38,45 @@ pub enum RoomCmd {
         conn_id: u64,
         input: PlayerInput,
     },
+    /// Raw `BIN_VOICE` frame from the wire; room validates, rewrites slot, relays.
+    Voice {
+        conn_id: u64,
+        frame: Vec<u8>,
+    },
     Pause {
         conn_id: u64,
     },
     Resume {
         conn_id: u64,
     },
+}
+
+/// Pure helper: indices of other *live* players within [`CHAT_PROXIMITY_RADIUS`]
+/// (3D euclidean) of `sender`. `positions` is parallel to the room player list:
+/// `(x, y, z, alive)`. Sender is never included.
+fn voice_recipients(sender: usize, positions: &[(f32, f32, f32, bool)]) -> Vec<usize> {
+    if sender >= positions.len() {
+        return Vec::new();
+    }
+    let (sx, sy, sz, _) = positions[sender];
+    let r2 = CHAT_PROXIMITY_RADIUS * CHAT_PROXIMITY_RADIUS;
+    positions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(x, y, z, alive))| {
+            if i == sender || !alive {
+                return None;
+            }
+            let dx = x - sx;
+            let dy = y - sy;
+            let dz = z - sz;
+            if dx * dx + dy * dy + dz * dz <= r2 {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -224,6 +259,7 @@ impl Room {
                         }
                     }
                 }
+                RoomCmd::Voice { conn_id, frame } => self.relay_voice(conn_id, frame),
                 RoomCmd::Pause { conn_id } => {
                     if !self.paused
                         && !self.ended
@@ -310,6 +346,32 @@ impl Room {
                 id: format!("c{}", gone.conn_id),
             };
             self.broadcast_json(&msg);
+        }
+    }
+
+    /// Validate a client voice frame, rewrite the speaker slot with the
+    /// sender's authoritative slot (anti-spoof), and non-blockingly fan out
+    /// to in-range live teammates. Malformed / oversized frames drop silently.
+    fn relay_voice(&mut self, conn_id: u64, frame: Vec<u8>) {
+        let Some((_spoofed_slot, pcm)) = decode_voice(&frame) else {
+            // bad tag / short / empty / oversized — drop, keep the connection
+            return;
+        };
+        let Some(sender_idx) = self.players.iter().position(|p| p.conn_id == conn_id) else {
+            return;
+        };
+        let auth_slot = self.players[sender_idx].slot;
+        let Some(out) = encode_voice(auth_slot, pcm) else {
+            return;
+        };
+        let positions: Vec<(f32, f32, f32, bool)> = self
+            .players
+            .iter()
+            .map(|p| (p.body.x, p.body.y, p.body.z, p.alive))
+            .collect();
+        for i in voice_recipients(sender_idx, &positions) {
+            // same non-blocking path as snapshots — never stall the tick
+            let _ = self.players[i].tx.try_send(OutMsg::Bin(out.clone()));
         }
     }
 
@@ -732,5 +794,57 @@ impl Room {
             shots: self.shots.clone(),
             booms: self.booms.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::voice_recipients;
+    use zz_core::constants::CHAT_PROXIMITY_RADIUS;
+
+    #[test]
+    fn voice_recipients_in_range_relayed() {
+        // sender at origin; teammate 10 m away on x — inside 25 m radius
+        let positions = [
+            (0.0, 0.0, 0.0, true),
+            (10.0, 0.0, 0.0, true),
+        ];
+        assert_eq!(voice_recipients(0, &positions), vec![1]);
+        assert_eq!(voice_recipients(1, &positions), vec![0]);
+    }
+
+    #[test]
+    fn voice_recipients_out_of_range_dropped() {
+        let far = CHAT_PROXIMITY_RADIUS + 1.0;
+        let positions = [
+            (0.0, 0.0, 0.0, true),
+            (far, 0.0, 0.0, true),
+        ];
+        assert!(voice_recipients(0, &positions).is_empty());
+        assert!(voice_recipients(1, &positions).is_empty());
+    }
+
+    #[test]
+    fn voice_recipients_sender_never_included() {
+        // two others in range; sender must not appear in its own recipient list
+        let positions = [
+            (0.0, 0.0, 0.0, true),
+            (1.0, 0.0, 0.0, true),
+            (0.0, 0.0, 1.0, true),
+        ];
+        let recips = voice_recipients(0, &positions);
+        assert_eq!(recips, vec![1, 2]);
+        assert!(!recips.contains(&0));
+    }
+
+    #[test]
+    fn voice_recipients_skips_dead_and_exact_radius() {
+        let r = CHAT_PROXIMITY_RADIUS;
+        let positions = [
+            (0.0, 0.0, 0.0, true),
+            (r, 0.0, 0.0, true),  // exactly on the radius — included (<=)
+            (5.0, 0.0, 0.0, false), // dead — never
+        ];
+        assert_eq!(voice_recipients(0, &positions), vec![1]);
     }
 }
