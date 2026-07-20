@@ -119,3 +119,28 @@ work next:
 13. **LUT stack needs `ktx2` + a zstd backend.**  
     Enabling `tonemapping_luts` without `zstd_rust` (or `zstd_c`) fails at
     compile time inside `bevy_image`.
+
+14. **`despawn()` is recursive for children.**  
+    There is no `despawn_recursive()` in 0.19 — `EntityCommands::despawn()`
+    already despawns `Children` (and other relationship targets configured to
+    cascade). Use `try_despawn()` when missing entities should not warn.
+
+15. **Hand-made `Image` sampler:** set `image.sampler = ImageSampler::nearest()`
+    (or `ImageSampler::Descriptor(ImageSamplerDescriptor::nearest())`) after
+    `Image::new(...)`. Defaults come from `ImagePlugin` (`ImageSampler::Default`).
+
+16. **Procedural mesh construction:**  
+    `Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())`
+    + `with_inserted_attribute(Mesh::ATTRIBUTE_{POSITION,NORMAL,UV_0}, …)`
+    + `with_inserted_indices(Indices::U32(…))`. `Indices` / `PrimitiveTopology`
+    live under `bevy::mesh` (not always in the umbrella prelude).
+
+17. **Ambient light is a resource, not only a component.**  
+    `GlobalAmbientLight` (resource, default brightness 80) lights the scene;
+    optional `AmbientLight` component on a `Camera` overrides it. Map render
+    tunes the global ambient on rebuild.
+
+18. **Image GPU types:** `Extent3d` / `TextureDimension` / `TextureFormat` are
+    reachable via `bevy::render::render_resource` (or re-exports on
+    `bevy::image` internals). Prefer `TextureFormat::Rgba8UnormSrgb` for
+    hand-filled RGBA buffers.
