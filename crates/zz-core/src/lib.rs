@@ -6,6 +6,7 @@
 //! implementation of any of it anywhere else. No I/O, no async, no engine.
 
 pub mod constants;
+pub mod map;
 pub mod math;
 pub mod movement;
 pub mod protocol;
