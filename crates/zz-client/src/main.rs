@@ -3,6 +3,7 @@
 //! Native: `cargo run -p zz-client`
 //! Browser: `cd web && trunk serve` (see README).
 
+mod game;
 mod map_render;
 mod net;
 
@@ -49,6 +50,7 @@ fn main() {
             }),
             FrameTimeDiagnosticsPlugin::default(),
             map_render::MapRenderPlugin,
+            game::GamePlugin,
         ))
         .insert_resource(net::NetClient::disconnected())
         .add_systems(Startup, (setup_scene, setup_ui))
@@ -56,8 +58,10 @@ fn main() {
             Update,
             (
                 toggle_cursor_grab,
-                fly_camera_look,
-                fly_camera_move,
+                // the fly camera only flies before a match starts; in-match
+                // the FPS controller in game.rs owns the camera transform
+                fly_camera_look.run_if(game::menu_active),
+                fly_camera_move.run_if(game::menu_active),
                 update_fps,
             ),
         )
