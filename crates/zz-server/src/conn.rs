@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use zz_core::constants::{MAX_INPUTS_PER_SECOND, PING_INTERVAL_MS, PRESENCE_TIMEOUT_MS};
-use zz_core::protocol::{BIN_INPUT, ClientMsg, ServerMsg, decode_input, parse_client_msg};
+use zz_core::protocol::{
+    BIN_INPUT, BIN_VOICE, ClientMsg, ServerMsg, decode_input, parse_client_msg,
+};
 
 use crate::lobby::LobbyCmd;
 use crate::room::{OutMsg, RoomCmd};
@@ -94,19 +96,32 @@ pub async fn handle_socket(mut ws: WebSocket, lobby: mpsc::Sender<LobbyCmd>) {
                         None => {}                         // garbage drops
                     },
                     Message::Binary(bin) => {
-                        if bin.first() == Some(&BIN_INPUT)
-                            && let Some(r) = &room
-                        {
-                            if window_start.elapsed() >= Duration::from_secs(1) {
-                                window_start = Instant::now();
-                                window_count = 0;
+                        match bin.first().copied() {
+                            Some(BIN_INPUT) => {
+                                if let Some(r) = &room {
+                                    if window_start.elapsed() >= Duration::from_secs(1) {
+                                        window_start = Instant::now();
+                                        window_count = 0;
+                                    }
+                                    window_count += 1;
+                                    if window_count <= MAX_INPUTS_PER_SECOND
+                                        && let Some(input) = decode_input(&bin)
+                                    {
+                                        let _ = r.try_send(RoomCmd::Input { conn_id, input });
+                                    }
+                                }
                             }
-                            window_count += 1;
-                            if window_count <= MAX_INPUTS_PER_SECOND
-                                && let Some(input) = decode_input(&bin)
-                            {
-                                let _ = r.try_send(RoomCmd::Input { conn_id, input });
+                            Some(BIN_VOICE) => {
+                                // Room validates, rewrites slot, and proximity-fans-out.
+                                // Not counted against the input flood cap; never blocks.
+                                if let Some(r) = &room {
+                                    let _ = r.try_send(RoomCmd::Voice {
+                                        conn_id,
+                                        frame: bin.to_vec(),
+                                    });
+                                }
                             }
+                            _ => {} // unknown binary tags drop
                         }
                     }
                     Message::Close(_) => break,

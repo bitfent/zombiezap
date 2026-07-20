@@ -12,9 +12,14 @@ use crate::types::{EnvKind, PlayerInput};
 /// Binary frame tags (first byte of every binary WebSocket frame).
 pub const BIN_INPUT: u8 = 0;
 pub const BIN_SNAPSHOT: u8 = 1;
+/// Proximity voice: `[tag, speaker_slot, 16 kHz mono i16 LE PCM…]`.
+pub const BIN_VOICE: u8 = 2;
 
 /// Length of a `BIN_INPUT` frame in bytes.
 pub const INPUT_FRAME_LEN: usize = 14;
+
+/// Max PCM payload for a `BIN_VOICE` frame: 16 kHz × 0.120 s × 2 bytes/sample.
+pub const MAX_VOICE_PAYLOAD: usize = 3840;
 
 // ── client → server (JSON) ─────────────────────────────────────────────────
 
@@ -189,6 +194,35 @@ pub fn decode_input(frame: &[u8]) -> Option<PlayerInput> {
         yaw,
         pitch,
     })
+}
+
+/// Encode a proximity-voice frame: `[0]=BIN_VOICE`, `[1]=slot`, `[2..]=pcm`.
+/// `None` if `pcm` is empty or longer than [`MAX_VOICE_PAYLOAD`]. Never panics.
+pub fn encode_voice(slot: u8, pcm: &[u8]) -> Option<Vec<u8>> {
+    if pcm.is_empty() || pcm.len() > MAX_VOICE_PAYLOAD {
+        return None;
+    }
+    let mut frame = Vec::with_capacity(2 + pcm.len());
+    frame.push(BIN_VOICE);
+    frame.push(slot);
+    frame.extend_from_slice(pcm);
+    Some(frame)
+}
+
+/// Decode a `BIN_VOICE` frame. `None` on wrong tag, short, empty PCM, or
+/// oversized payload. Never panics.
+pub fn decode_voice(frame: &[u8]) -> Option<(u8, &[u8])> {
+    if frame.len() < 3 {
+        return None;
+    }
+    if frame[0] != BIN_VOICE {
+        return None;
+    }
+    let pcm = &frame[2..];
+    if pcm.is_empty() || pcm.len() > MAX_VOICE_PAYLOAD {
+        return None;
+    }
+    Some((frame[1], pcm))
 }
 
 /// Tolerant JSON parse: `None` on malformed/unknown (drop, don't error) —
@@ -395,5 +429,47 @@ mod tests {
         assert_eq!(parse_client_msg("{"), None);
         assert_eq!(parse_client_msg(r#"{"type":"bogus"}"#), None);
         assert_eq!(parse_client_msg(""), None);
+    }
+
+    #[test]
+    fn voice_frame_round_trip() {
+        let pcm = [0x01u8, 0x00, 0xFF, 0x7F];
+        let frame = encode_voice(3, &pcm).expect("encode");
+        assert_eq!(frame[0], BIN_VOICE);
+        assert_eq!(frame[1], 3);
+        assert_eq!(&frame[2..], &pcm);
+        let (slot, back) = decode_voice(&frame).expect("decode");
+        assert_eq!(slot, 3);
+        assert_eq!(back, &pcm);
+
+        // max-size payload
+        let max = vec![0xABu8; MAX_VOICE_PAYLOAD];
+        let frame = encode_voice(0, &max).expect("max encode");
+        assert_eq!(frame.len(), 2 + MAX_VOICE_PAYLOAD);
+        let (slot, back) = decode_voice(&frame).expect("max decode");
+        assert_eq!(slot, 0);
+        assert_eq!(back, max.as_slice());
+    }
+
+    #[test]
+    fn decode_voice_rejects_bad_frames() {
+        assert_eq!(decode_voice(&[]), None);
+        assert_eq!(decode_voice(&[BIN_VOICE]), None);
+        assert_eq!(decode_voice(&[BIN_VOICE, 0]), None); // empty PCM
+        assert_eq!(decode_voice(&[BIN_INPUT, 0, 1, 2]), None); // wrong tag
+        assert_eq!(decode_voice(&[BIN_SNAPSHOT, 0, 1]), None);
+        assert_eq!(decode_voice(&[0xFF, 0, 1]), None);
+
+        // oversized PCM (MAX + 1 bytes after header)
+        let mut over = vec![BIN_VOICE, 1];
+        over.extend(std::iter::repeat_n(0u8, MAX_VOICE_PAYLOAD + 1));
+        assert_eq!(decode_voice(&over), None);
+    }
+
+    #[test]
+    fn encode_voice_rejects_empty_and_oversized() {
+        assert_eq!(encode_voice(0, &[]), None);
+        let over = vec![0u8; MAX_VOICE_PAYLOAD + 1];
+        assert_eq!(encode_voice(0, &over), None);
     }
 }
