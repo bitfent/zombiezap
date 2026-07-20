@@ -43,7 +43,17 @@ Phase B — retro identity target:
   main.rs camera wiring). Bevy 0.19 render-target notes are in
   crates/zz-client/README.md items 14-18.
 
-## [ ] 2. REAL zombies + survivor + weapon rigs (Phase C — user priority)
+## [x] 2. REAL zombies + survivor + weapon rigs (Phase C — user priority) — DONE (zz-client M9, commit f9d338b)
+
+Browser-verified 2026-07-20 as far as automation allows: rifle viewmodel
+with front sight bottom-right through the retro target; rig cuboids
+(head/arms distinct, kind colors) confirmed at point-blank in death
+frames; teammate health-bar HUD; 2-player lobby (invite ?join= prefill →
+join → roster → match → two-row stats) all work; peak horde 16, ~200 fps
+single tab. OUTSTANDING acceptance (blocked on item 3's ?touch=1
+clickable controls for automation movement): the mid-range stranger-test
+horde screenshot — silhouette variants, telegraph pose, desynced phases,
+eye glow. Take it FIRST thing after item 3 lands.
 
 Not placeholders. Zero asset files still — procedural articulated rigs:
 - Zombie: head/torso/2 arms/2 legs cuboids on joint pivots; lurching walk
