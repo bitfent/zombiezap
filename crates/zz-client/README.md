@@ -289,3 +289,17 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     reliably. Keyboard turn keys (Q/X, `game.rs`) exist partly so future
     touch-mode automation (`?touch=1`, item 3) can drive the player with
     clicks alone.
+
+37. **Procedural humanoid rigs (M9):** articulated cuboids hang from empty
+    joint-pivot entities (`models.rs`). One shared `Cuboid` mesh + a small
+    material bank (3 zombie kinds, 5 slot colours, 1 emissive eye, 1 gun) —
+    never per-zombie unique mesh/material handles (ShotAnte draw-call warning).
+    Walk cycles are client-only from interpolated velocity; phase offset is a
+    pure hash of entity id. Death crumples are short-lived FX entities — do
+    not delay `net_poll` despawn bookkeeping.
+
+38. **Viewmodel parenting:** first-person rifle is a `ChildOf` the 3D
+    `Camera3d` entity (camera-local bottom-right). Own `Shot` events kick
+    recoil via a side channel (`ViewmodelKick`) so hud can still drain
+    `FxQueue` for tracers without racing the viewmodel. Muzzle-flash uses a
+    unique `StandardMaterial` handle (item 23) with alpha + visibility fade.

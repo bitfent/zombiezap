@@ -93,7 +93,23 @@ pub enum Sfx {
     Pickup,
     TeamWipe,
     Click,
+    /// Proximity zombie growl; volume already distance-scaled by game.rs.
+    Growl { volume: f32 },
 }
 
 #[derive(Resource, Default)]
 pub struct SfxQueue(pub VecDeque<Sfx>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sfx_growl_is_constructible() {
+        let g = Sfx::Growl { volume: 0.5 };
+        match g {
+            Sfx::Growl { volume } => assert!((volume - 0.5).abs() < 1e-6),
+            _ => panic!("expected Growl"),
+        }
+    }
+}

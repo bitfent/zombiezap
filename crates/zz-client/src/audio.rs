@@ -22,16 +22,20 @@ const MAX_CONCURRENT: usize = 8;
 fn sfx_priority(sfx: &Sfx) -> u8 {
     match sfx {
         Sfx::Shoot { from_me: false } => 0,
-        Sfx::Click => 1,
-        Sfx::Shoot { from_me: true } => 2,
-        Sfx::HitConfirm => 3,
-        Sfx::Pickup => 4,
-        Sfx::Hurt => 5,
-        Sfx::KillConfirm { .. } => 6,
-        Sfx::Explosion { .. } => 7,
-        Sfx::TeamWipe => 8,
+        Sfx::Growl { .. } => 1,
+        Sfx::Click => 2,
+        Sfx::Shoot { from_me: true } => 3,
+        Sfx::HitConfirm => 4,
+        Sfx::Pickup => 5,
+        Sfx::Hurt => 6,
+        Sfx::KillConfirm { .. } => 7,
+        Sfx::Explosion { .. } => 8,
+        Sfx::TeamWipe => 9,
     }
 }
+
+/// Hard cap on concurrent growl voices (~6); combat SFX still use the pool.
+const MAX_GROWLS: usize = 6;
 
 // ---------------------------------------------------------------------------
 // Custom Decodable: pre-baked mono f32 samples
@@ -116,11 +120,16 @@ struct SfxBank {
     pickup: Handle<SynthClip>,
     team_wipe: Handle<SynthClip>,
     click: Handle<SynthClip>,
+    growl: Handle<SynthClip>,
 }
 
 /// Marks a spawned one-shot SFX voice for concurrent-count queries.
 #[derive(Component)]
 struct SfxVoice;
+
+/// Marker for growl voices so we can enforce a ~6 concurrent cap.
+#[derive(Component)]
+struct GrowlVoice;
 
 pub struct AudioPlugin;
 
@@ -161,6 +170,9 @@ fn setup_sfx_bank(mut commands: Commands, mut clips: ResMut<Assets<SynthClip>>) 
         click: clips.add(SynthClip {
             samples: Arc::from(synth_click()),
         }),
+        growl: clips.add(SynthClip {
+            samples: Arc::from(synth_growl()),
+        }),
     };
     commands.insert_resource(bank);
 }
@@ -169,18 +181,25 @@ fn drain_sfx_queue(
     mut queue: ResMut<SfxQueue>,
     bank: Res<SfxBank>,
     voices: Query<&SfxVoice>,
+    growls: Query<&GrowlVoice>,
     mut commands: Commands,
 ) {
     let mut active = voices.iter().count();
+    let mut growl_active = growls.iter().count();
 
     while let Some(sfx) = queue.0.pop_front() {
         let priority = sfx_priority(&sfx);
+        let is_growl = matches!(sfx, Sfx::Growl { .. });
 
         // Cap concurrent voices. Queue is always drained (sole consumer) so
         // saturated frames drop events instead of backlog-ing. Lowest
-        // priority (remote shoots = 0, then click) is skipped first when
+        // priority (remote shoots = 0, then growls) is skipped first when
         // saturated; everything is hard-capped at MAX_CONCURRENT.
         if active >= MAX_CONCURRENT {
+            continue;
+        }
+        // Growls also hard-cap at ~6 concurrent voices.
+        if is_growl && growl_active >= MAX_GROWLS {
             continue;
         }
         // Under mild pressure (near cap), still drop remote shoots first.
@@ -209,13 +228,24 @@ fn drain_sfx_queue(
             Sfx::Pickup => (bank.pickup.clone(), 1.0),
             Sfx::TeamWipe => (bank.team_wipe.clone(), 1.0),
             Sfx::Click => (bank.click.clone(), 0.7),
+            Sfx::Growl { volume } => (bank.growl.clone(), volume.clamp(0.05, 0.85)),
         };
 
-        commands.spawn((
-            AudioPlayer(handle),
-            PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume)),
-            SfxVoice,
-        ));
+        if is_growl {
+            commands.spawn((
+                AudioPlayer(handle),
+                PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume)),
+                SfxVoice,
+                GrowlVoice,
+            ));
+            growl_active += 1;
+        } else {
+            commands.spawn((
+                AudioPlayer(handle),
+                PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume)),
+                SfxVoice,
+            ));
+        }
         active += 1;
     }
 }
@@ -446,6 +476,34 @@ pub(crate) fn synth_click() -> Vec<f32> {
     finalize(buf)
 }
 
+/// ~280 ms guttural zombie growl: low filtered noise + slow sine rumble.
+pub(crate) fn synth_growl() -> Vec<f32> {
+    let n = samples_for_ms(280.0);
+    let mut buf = vec![0.0; n];
+    let mut noise = XorShift32::new(0xDEAD_BEEF);
+    let mut lp = 0.0_f32;
+    let alpha = 0.06_f32;
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let u = i as f32 / n as f32;
+        // Slow attack, long decay — animal snarl.
+        let env = if u < 0.12 {
+            u / 0.12
+        } else {
+            (1.0 - (u - 0.12) / 0.88).max(0.0).powf(1.4)
+        };
+        let white = noise.next_f32();
+        lp += alpha * (white - lp);
+        // Sub-rumble + formant-ish mid growl.
+        let rumble = sine(t * 55.0) * 0.55 + sine(t * 90.0 + 0.3) * 0.25;
+        let grit = lp * 0.7;
+        // Mild amplitude modulation for a throaty pulse.
+        let throat = 0.7 + 0.3 * sine(t * 7.0);
+        *s = (rumble + grit) * 0.55 * env * throat;
+    }
+    finalize(buf)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -511,6 +569,11 @@ mod tests {
     #[test]
     fn click_length_and_bounds() {
         assert_buffer_ok(&synth_click(), 10.0, 30.0);
+    }
+
+    #[test]
+    fn growl_length_and_bounds() {
+        assert_buffer_ok(&synth_growl(), 240.0, 320.0);
     }
 
     #[test]

@@ -17,6 +17,9 @@ use zz_core::snapshot::{dequant_pos, dequant_yaw8, dequant_yaw16};
 use zz_core::types::{Body, PlayerInput};
 
 use crate::map_render::CurrentMap;
+use crate::models::{
+    self, CrumpleFx, HumanoidRig, RigAssets, Viewmodel, GROWL_RANGE,
+};
 use crate::net::{NetClient, NetEvent};
 use crate::platform;
 
@@ -45,6 +48,8 @@ impl Plugin for GamePlugin {
             .insert_resource(crate::seams::Roster::default())
             .insert_resource(MyId::default())
             .insert_resource(PrevSelf::default())
+            .insert_resource(ViewmodelKick::default())
+            .insert_resource(GrowlMemory::default())
             .add_systems(
                 Update,
                 (
@@ -55,6 +60,12 @@ impl Plugin for GamePlugin {
                     fps_controller.run_if(in_match),
                     apply_camera.run_if(in_match),
                     interpolate_remotes.run_if(in_match),
+                    animate_rigs.run_if(in_match),
+                    tick_crumples.run_if(in_match),
+                    ensure_viewmodel.run_if(in_match),
+                    tick_viewmodel_sys.run_if(in_match),
+                    proximity_growls.run_if(in_match),
+                    cleanup_match_visuals,
                 )
                     .chain(),
             );
@@ -160,7 +171,26 @@ pub struct RemotePlayer {
 #[derive(Component)]
 pub struct RemoteZombie {
     pub id: u16,
+    pub kind: u8,
+    /// Snapshot attack state (1 = telegraph / windup).
+    pub state: u8,
     buf: VecDeque<(f64, Vec3, f32)>,
+}
+
+/// Tracks own-shot recoil kicks so the viewmodel can react without racing hud's Fx drain.
+#[derive(Resource, Default)]
+struct ViewmodelKick {
+    pending: u32,
+}
+
+/// Last half-second growl bucket we already fired for, so each (id, bucket)
+/// yields at most one growl (not one per frame while the hash is hot).
+#[derive(Resource, Default)]
+struct GrowlMemory {
+    /// (zombie id, time-bucket) pairs fired this bucket window; cleared when
+    /// the global bucket advances.
+    bucket: u32,
+    fired: HashSet<u16>,
 }
 
 /// All seam-resource writes bundled to stay under Bevy's system-param limit.
@@ -174,15 +204,6 @@ struct SeamWrites<'w> {
     sfx: ResMut<'w, crate::seams::SfxQueue>,
     prev_self: ResMut<'w, PrevSelf>,
     roster: ResMut<'w, crate::seams::Roster>,
-}
-
-/// Lazily-created shared handles for remote visuals.
-#[derive(Resource)]
-struct RemoteAssets {
-    player_mesh: Handle<Mesh>,
-    player_mats: Vec<Handle<StandardMaterial>>,
-    zombie_mesh: Handle<Mesh>,
-    zombie_mats: [Handle<StandardMaterial>; 3], // walker, runner, brute
 }
 
 // ── connection + message flow ──────────────────────────────────────────────
@@ -206,43 +227,17 @@ fn net_poll(
     time: Res<Time>,
     map: Option<Res<CurrentMap>>,
     mut remotes: Query<(Entity, &mut RemotePlayer)>,
-    mut zombies: Query<(Entity, &mut RemoteZombie)>,
-    assets: Option<Res<RemoteAssets>>,
+    mut zombies: Query<(Entity, &mut RemoteZombie, &Transform, Option<&HumanoidRig>)>,
+    assets: Option<Res<RigAssets>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut seams: SeamWrites,
+    mut vm_kick: ResMut<ViewmodelKick>,
 ) {
-    // one-time visual handle setup
+    // one-time shared rig mesh/material bank
     if assets.is_none() {
-        let palette = [
-            Color::srgb(0.95, 0.35, 0.35),
-            Color::srgb(0.35, 0.55, 0.95),
-            Color::srgb(0.95, 0.85, 0.30),
-            Color::srgb(0.65, 0.40, 0.90),
-            Color::srgb(0.35, 0.90, 0.75),
-        ];
-        // Small emissive floor so remote players / zombies separate from baked
-        // architecture in shadow (Phase A: entity-vs-world contrast).
-        let entity_mat = |c: Color| StandardMaterial {
-            base_color: c,
-            emissive: c.to_linear() * 0.12,
-            perceptual_roughness: 0.75,
-            metallic: 0.0,
-            ..default()
-        };
-        commands.insert_resource(RemoteAssets {
-            player_mesh: meshes.add(Capsule3d::new(PLAYER_RADIUS, 1.0)),
-            player_mats: palette
-                .iter()
-                .map(|c| materials.add(entity_mat(*c)))
-                .collect(),
-            zombie_mesh: meshes.add(Cuboid::new(0.7, 1.8, 0.7)),
-            zombie_mats: [
-                materials.add(entity_mat(Color::srgb(0.35, 0.55, 0.30))),
-                materials.add(entity_mat(Color::srgb(0.55, 0.65, 0.25))),
-                materials.add(entity_mat(Color::srgb(0.30, 0.40, 0.25))),
-            ],
-        });
+        let bank = RigAssets::build(&mut meshes, &mut materials);
+        commands.insert_resource(bank);
         return; // assets visible next frame; nothing else depends on this tick
     }
     let assets = assets.unwrap();
@@ -288,6 +283,13 @@ fn net_poll(
                 players,
             }) => {
                 info!("game_start: slot {your_slot}, env {env:?}, seed {map_seed}");
+                // Clear leftover remotes / crumples from a previous match.
+                for (e, _, _, _) in zombies.iter() {
+                    commands.entity(e).despawn();
+                }
+                for (e, _) in remotes.iter() {
+                    commands.entity(e).despawn();
+                }
                 commands.insert_resource(CurrentMap(generate_map(env, &map_seed)));
                 *session = Session::Playing { my_slot: your_slot };
                 *predicted = Predicted::default();
@@ -297,6 +299,7 @@ fn net_poll(
                     .iter()
                     .map(|p| (p.slot, p.name.clone(), p.slot == your_slot))
                     .collect();
+                vm_kick.pending = 0;
             }
             NetEvent::Msg(ServerMsg::MatchEnd { stats }) => {
                 info!(
@@ -340,6 +343,10 @@ fn net_poll(
                         from_me,
                     });
                     seams.sfx.0.push_back(crate::seams::Sfx::Shoot { from_me });
+                    if from_me {
+                        // Viewmodel recoil + muzzle flash (own Shot only).
+                        vm_kick.pending = vm_kick.pending.saturating_add(1);
+                    }
                     if from_me && s.hit_kind == 1 {
                         seams.sfx.0.push_back(crate::seams::Sfx::HitConfirm);
                     }
@@ -429,24 +436,24 @@ fn net_poll(
                     {
                         push_sample(&mut rp.buf, now, pos, yaw);
                     } else {
-                        let mat =
-                            assets.player_mats[p.slot as usize % assets.player_mats.len()].clone();
-                        commands
-                            .spawn((
-                                RemotePlayer {
-                                    slot: p.slot,
-                                    buf: VecDeque::new(),
-                                },
-                                Transform::from_translation(pos),
-                                Visibility::default(),
-                            ))
-                            .with_children(|c| {
-                                c.spawn((
-                                    Mesh3d(assets.player_mesh.clone()),
-                                    MeshMaterial3d(mat),
-                                    Transform::from_xyz(0.0, 0.95, 0.0),
-                                ));
-                            });
+                        let mut buf = VecDeque::new();
+                        push_sample(&mut buf, now, pos, yaw);
+                        let mut ent = commands.spawn((
+                            RemotePlayer {
+                                slot: p.slot,
+                                buf,
+                            },
+                            Transform::from_translation(pos),
+                            Visibility::default(),
+                        ));
+                        let rig = models::attach_humanoid(
+                            &mut ent,
+                            &assets,
+                            false,
+                            p.slot,
+                            p.slot as u16,
+                        );
+                        ent.insert(rig);
                     }
                 }
                 for (e, rp) in remotes.iter() {
@@ -455,7 +462,7 @@ fn net_poll(
                     }
                 }
 
-                // ── zombies: upsert + sample, despawn missing ──────────────
+                // ── zombies: upsert + sample, crumple then despawn missing ─
                 let live_ids: HashSet<u16> = snap.zombies.iter().map(|z| z.id).collect();
                 for z in &snap.zombies {
                     let pos = Vec3::new(
@@ -464,35 +471,43 @@ fn net_poll(
                         dequant_pos(z.pos[2]),
                     );
                     let yaw = dequant_yaw8(z.yaw);
-                    if let Some((_, mut rz)) = zombies.iter_mut().find(|(_, rz)| rz.id == z.id) {
+                    let kind = z.kind.min(2);
+                    if let Some((_, mut rz, _, _)) =
+                        zombies.iter_mut().find(|(_, rz, _, _)| rz.id == z.id)
+                    {
+                        rz.state = z.state;
+                        rz.kind = kind;
                         push_sample(&mut rz.buf, now, pos, yaw);
                     } else {
-                        let mat = assets.zombie_mats[z.kind.min(2) as usize].clone();
-                        let scale = match z.kind {
-                            1 => Vec3::new(0.8, 1.0, 0.8),  // runner: lean
-                            2 => Vec3::new(1.5, 1.25, 1.5), // brute: massive
-                            _ => Vec3::ONE,
-                        };
-                        commands
-                            .spawn((
-                                RemoteZombie {
-                                    id: z.id,
-                                    buf: VecDeque::new(),
-                                },
-                                Transform::from_translation(pos).with_scale(scale),
-                                Visibility::default(),
-                            ))
-                            .with_children(|c| {
-                                c.spawn((
-                                    Mesh3d(assets.zombie_mesh.clone()),
-                                    MeshMaterial3d(mat),
-                                    Transform::from_xyz(0.0, 0.9, 0.0),
-                                ));
-                            });
+                        let scale = models::kind_scale(kind);
+                        let mut buf = VecDeque::new();
+                        push_sample(&mut buf, now, pos, yaw);
+                        let mut ent = commands.spawn((
+                            RemoteZombie {
+                                id: z.id,
+                                kind,
+                                state: z.state,
+                                buf,
+                            },
+                            Transform::from_translation(pos).with_scale(scale),
+                            Visibility::default(),
+                        ));
+                        let rig =
+                            models::attach_humanoid(&mut ent, &assets, true, kind, z.id);
+                        ent.insert(rig);
                     }
                 }
-                for (e, rz) in zombies.iter() {
+                // Despawn missing: fire-and-forget crumple, then bookkeeping despawn.
+                for (e, rz, tf, _rig) in zombies.iter() {
                     if !live_ids.contains(&rz.id) {
+                        models::spawn_crumple(
+                            &mut commands,
+                            &assets,
+                            tf.translation,
+                            tf.rotation.to_euler(EulerRot::YXZ).0,
+                            tf.scale,
+                            rz.kind,
+                        );
                         commands.entity(e).despawn();
                     }
                 }
@@ -746,4 +761,214 @@ fn angle_lerp(a: f32, b: f32, k: f32) -> f32 {
         d -= tau;
     }
     a + d * k
+}
+
+// ── rig animation / viewmodel / growls ─────────────────────────────────────
+
+/// Sync attack telegraph from snapshot state, then pose limbs from motion.
+///
+/// Root transforms (on Remote*) and joint transforms (body/limb pivots) are
+/// disjoint via Without filters, so both queries can coexist.
+#[allow(clippy::type_complexity)]
+fn animate_rigs(
+    time: Res<Time>,
+    mut zombies: Query<(&RemoteZombie, &Transform, &mut HumanoidRig), Without<RemotePlayer>>,
+    mut players: Query<
+        (&Transform, &mut HumanoidRig),
+        (With<RemotePlayer>, Without<RemoteZombie>),
+    >,
+    mut joints: Query<
+        &mut Transform,
+        (
+            Without<RemotePlayer>,
+            Without<RemoteZombie>,
+            Without<HumanoidRig>,
+        ),
+    >,
+) {
+    let dt = time.delta_secs().max(1e-4);
+
+    for (rz, tf, mut rig) in zombies.iter_mut() {
+        rig.attacking = rz.state == 1;
+        let pose = models::compute_rig_pose(&mut rig, tf.translation, dt);
+        apply_joint_pose(&mut joints, &rig, pose);
+    }
+    for (tf, mut rig) in players.iter_mut() {
+        rig.attacking = false;
+        let pose = models::compute_rig_pose(&mut rig, tf.translation, dt);
+        apply_joint_pose(&mut joints, &rig, pose);
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn apply_joint_pose(
+    joints: &mut Query<
+        &mut Transform,
+        (
+            Without<RemotePlayer>,
+            Without<RemoteZombie>,
+            Without<HumanoidRig>,
+        ),
+    >,
+    rig: &HumanoidRig,
+    pose: models::RigPose,
+) {
+    if let Ok(mut body) = joints.get_mut(rig.body) {
+        body.translation.y = pose.body_y;
+    }
+    for (e, angle) in [
+        (rig.left_arm, pose.left_arm_x),
+        (rig.right_arm, pose.right_arm_x),
+        (rig.left_leg, pose.left_leg_x),
+        (rig.right_leg, pose.right_leg_x),
+    ] {
+        if let Ok(mut tf) = joints.get_mut(e) {
+            tf.rotation = Quat::from_rotation_x(angle);
+        }
+    }
+}
+
+fn tick_crumples(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut q: Query<(Entity, &mut CrumpleFx)>,
+    mut transforms: Query<&mut Transform, Without<CrumpleFx>>,
+) {
+    let dt = time.delta_secs();
+    for (e, mut fx) in q.iter_mut() {
+        let Ok(mut body_tf) = transforms.get_mut(fx.body) else {
+            commands.entity(e).despawn();
+            continue;
+        };
+        if models::tick_crumple(&mut fx, &mut body_tf, dt) {
+            commands.entity(e).despawn();
+        }
+    }
+}
+
+/// Spawn the FP rifle once per match when the camera is available.
+fn ensure_viewmodel(
+    mut commands: Commands,
+    assets: Option<Res<RigAssets>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cam: Query<Entity, With<Camera3d>>,
+    existing: Query<Entity, With<Viewmodel>>,
+) {
+    if !existing.is_empty() {
+        return;
+    }
+    let Some(assets) = assets else { return };
+    let Ok(camera) = cam.single() else { return };
+    models::spawn_viewmodel(&mut commands, camera, &assets, &mut materials);
+}
+
+fn tick_viewmodel_sys(
+    time: Res<Time>,
+    mut kick: ResMut<ViewmodelKick>,
+    mut vm_q: Query<(&mut Viewmodel, &mut Transform)>,
+    mut vis_q: Query<&mut Visibility, Without<Viewmodel>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let Ok((mut vm, mut tf)) = vm_q.single_mut() else {
+        return;
+    };
+    while kick.pending > 0 {
+        models::viewmodel_on_shot(&mut vm);
+        kick.pending -= 1;
+    }
+    let flash_vis = vis_q.get_mut(vm.flash_entity).ok();
+    let flash_mat = materials.get_mut(&vm.flash_mat);
+    // tick_viewmodel wants Option<&mut T>; reborrow carefully
+    match (flash_vis, flash_mat) {
+        (Some(mut vis), Some(mut mat)) => {
+            models::tick_viewmodel(
+                &mut vm,
+                &mut tf,
+                Some(&mut vis),
+                Some(&mut *mat),
+                time.delta_secs(),
+            );
+        }
+        (Some(mut vis), None) => {
+            models::tick_viewmodel(&mut vm, &mut tf, Some(&mut vis), None, time.delta_secs());
+        }
+        (None, Some(mut mat)) => {
+            models::tick_viewmodel(
+                &mut vm,
+                &mut tf,
+                None,
+                Some(&mut *mat),
+                time.delta_secs(),
+            );
+        }
+        (None, None) => {
+            models::tick_viewmodel(&mut vm, &mut tf, None, None, time.delta_secs());
+        }
+    }
+}
+
+/// Nearby zombies growl occasionally (deterministic id+time hash, no rand).
+/// Rising-edge per (id, half-second bucket) so we don't enqueue every frame.
+fn proximity_growls(
+    time: Res<Time>,
+    predicted: Res<Predicted>,
+    zombies: Query<(&RemoteZombie, &Transform)>,
+    mut sfx: ResMut<crate::seams::SfxQueue>,
+    mut mem: ResMut<GrowlMemory>,
+) {
+    if !predicted.synced {
+        return;
+    }
+    let now = time.elapsed_secs_f64();
+    let bucket = (now * 2.0).floor() as u32;
+    if mem.bucket != bucket {
+        mem.bucket = bucket;
+        mem.fired.clear();
+    }
+    let me = Vec3::new(predicted.body.x, predicted.body.y, predicted.body.z);
+    for (rz, tf) in zombies.iter() {
+        let dist = me.distance(tf.translation);
+        if dist > GROWL_RANGE {
+            continue;
+        }
+        if !models::should_growl(rz.id, now) {
+            continue;
+        }
+        if !mem.fired.insert(rz.id) {
+            continue; // already growled this bucket
+        }
+        // Distance-scale volume; closer = louder.
+        let volume = (1.0 - dist / GROWL_RANGE).clamp(0.12, 0.85);
+        sfx.0
+            .push_back(crate::seams::Sfx::Growl { volume });
+    }
+}
+
+/// Despawn match-only visuals when leaving Playing/Ended.
+fn cleanup_match_visuals(
+    session: Res<Session>,
+    mut commands: Commands,
+    players: Query<Entity, With<RemotePlayer>>,
+    zombies: Query<Entity, With<RemoteZombie>>,
+    crumples: Query<Entity, With<CrumpleFx>>,
+    viewmodels: Query<Entity, With<Viewmodel>>,
+) {
+    if !session.is_changed() {
+        return;
+    }
+    let keep = matches!(
+        *session,
+        Session::Playing { .. } | Session::Ended { .. }
+    );
+    if keep {
+        return;
+    }
+    for e in players
+        .iter()
+        .chain(zombies.iter())
+        .chain(crumples.iter())
+        .chain(viewmodels.iter())
+    {
+        commands.entity(e).despawn();
+    }
 }

@@ -8,6 +8,7 @@ mod game;
 mod hud;
 mod lobby_ui;
 mod map_render;
+mod models;
 mod net;
 mod platform;
 mod retro;
