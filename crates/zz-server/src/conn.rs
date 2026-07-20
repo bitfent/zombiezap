@@ -125,6 +125,13 @@ pub async fn handle_socket(mut ws: WebSocket, lobby: mpsc::Sender<LobbyCmd>) {
                 if send_json(&mut ws, &ServerMsg::Ping { t }).await.is_err() {
                     break;
                 }
+                // Protocol-level ping too: browsers auto-pong these in the
+                // network process even while the tab is throttled/backgrounded
+                // (the app-level pong above needs the render loop). A throttled
+                // tab stays present; a closed tab still dies with the socket.
+                if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
             }
             out = out_rx.recv() => {
                 let Some(out) = out else { break };

@@ -205,26 +205,27 @@ async fn silent_socket_is_terminated_for_presence() {
     start_game(&mut ws).await;
     let _slot = wait_game_start(&mut ws).await;
 
-    // Say nothing and ignore pings. The server must hang up within
-    // PRESENCE_TIMEOUT_MS (+ one ping interval of slack).
-    let deadline = Duration::from_millis(
+    // A DEAD connection: stop reading entirely, so the WS stack sends no
+    // auto-pongs to the server's protocol pings. (Merely silent-but-reading
+    // clients now stay present by design — browsers auto-pong even from
+    // throttled background tabs.) The server must kick us while we sleep.
+    tokio::time::sleep(Duration::from_millis(
         zz_core::constants::PRESENCE_TIMEOUT_MS + 2 * zz_core::constants::PING_INTERVAL_MS,
-    );
-    let start = std::time::Instant::now();
-    let closed = tokio::time::timeout(deadline, async {
+    ))
+    .await;
+    // resume reading: the close/reset must already be waiting for us
+    let ended = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match ws.next().await {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
-                _ => {} // keep draining snapshots/pings without answering
+                _ => {} // drain whatever was buffered before the kick
             }
         }
     })
     .await;
-    assert!(closed.is_ok(), "server never closed a silent socket");
     assert!(
-        start.elapsed() >= Duration::from_millis(zz_core::constants::PRESENCE_TIMEOUT_MS - 500),
-        "closed suspiciously early: {:?}",
-        start.elapsed()
+        ended.is_ok(),
+        "server never closed a dead (non-ponging) socket"
     );
 }
 
