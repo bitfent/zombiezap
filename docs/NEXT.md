@@ -10,7 +10,52 @@ map). All workspace tests green, clippy zero. PR #1 tracks `rust-rewrite`.
 
 ---
 
-## [ ] 1. Mobile touch experience (task "M6c" part 1)
+## [ ] 1. Light & atmosphere + retro target (USER-APPROVED PLAN, Phase A+B)
+
+User bar, verbatim: "lightweight but nice. It's ok if we have ps2 graphics
+but it must look like a game." Real failure observed live: building
+interiors and shadowed streets render pitch black; zombies invisible.
+
+Phase A — light (port ShotAnte's recipe; see legacy/apps/web/src/game/Game.ts
+buildWorld/loadArena):
+- Per-env sky color + distance fog; hemisphere/ambient fill so NOTHING is
+  ever pitch black (interiors dim-but-readable); one directional sun.
+- Bake shadows ONCE per map load, never per frame (ShotAnte's single biggest
+  frame-budget win); re-bake only if geometry changes.
+- Tint material families with the map accent; raise entity/world contrast.
+- Acceptance: screenshots inside a building and in the darkest street corner
+  — everything readable.
+
+Phase B — retro identity target:
+- Render 3D at 480x270 (tune vs 640x360), nearest-neighbor upscale to the
+  window; MSAA off; HUD/egui at native res on top; optional mild color
+  quantization. Chunky pixels make low-poly read as deliberate (PS1/PS2).
+- This is also the mobile performance lever.
+- Files: crates/zz-client/src/ (new retro.rs; map_render.rs lighting;
+  main.rs camera wiring). Bevy 0.19 render-target notes are in
+  crates/zz-client/README.md items 14-18.
+
+## [ ] 2. REAL zombies + survivor + weapon rigs (Phase C — user priority)
+
+Not placeholders. Zero asset files still — procedural articulated rigs:
+- Zombie: head/torso/2 arms/2 legs cuboids on joint pivots; lurching walk
+  cycle driven by interpolated movement speed with PER-ZOMBIE phase offset
+  (no lockstep horde); arms-raised windup while snapshot state==1 (attack
+  telegraph); death crumple on despawn; glowing eyes (emissive) for
+  dark-readability; silhouette-distinct kinds: walker (rotten green,
+  shamble), runner (gaunt, fast cadence), brute (1.5x bulk, heavy sway).
+- Survivor: same rig family, slot-colored, walk gait.
+- First-person: boxy rifle viewmodel bottom-right, recoil kick + muzzle
+  flash quad on own Shot events (seams::FxQueue already carries them).
+- Zombie growls: new Sfx variant + proximity trigger + synth (cap ~6).
+- Instancing/shared-mesh pass so 200 rigged zombies stay cheap (ShotAnte's
+  own comment warns per-avatar draw calls don't scale — a horde is exactly
+  that case).
+- Acceptance: the stranger test — one glance at a screenshot says "zombie
+  game with a gun"; 60 fps in-browser with 150 zombies on a mid laptop;
+  side-by-side screenshot vs ShotAnte for parity.
+
+## [ ] 3. Mobile touch experience (task "M6c" part 1)
 
 Port the ShotAnte touch scheme — reference implementation:
 `legacy/apps/web/src/game/Input.ts`.
@@ -31,7 +76,7 @@ Port the ShotAnte touch scheme — reference implementation:
   aim, shoot, throw, host and join by code. Landscape hint shown in
   portrait.
 
-## [ ] 2. Share package (task "M6c" part 2)
+## [ ] 4. Share package (task "M6c" part 2)
 
 - Generate `web/og.jpg` (1200×630): adapt `legacy/scripts/gen-brand.mjs`
   (node; pixel fonts are in `legacy/scripts/*.ttf`) for ZOMBIEZAP branding —
@@ -43,7 +88,7 @@ Port the ShotAnte touch scheme — reference implementation:
 - Later (not now): per-lobby dynamic unfurls served by zz-server when a
   crawler hits `/?join=CODE`.
 
-## [ ] 3. Visual identity (task #14 — USER PRIORITY)
+## [SUPERSEDED — split into items 1-2 above] Visual identity (task #14)
 
 Bar: PS2-level fidelity, but everything must read as what it is. Zero asset
 files — procedural meshes/textures only.
@@ -64,7 +109,7 @@ files — procedural meshes/textures only.
 - DoD: screenshot review — a stranger identifies "zombie game with a gun"
   instantly; native + browser parity; clippy zero; suites green.
 
-## [ ] 4. Environments: Mountain Town, Desert Town, Sea Town (task #11)
+## [ ] 5. Environments: Mountain Town, Desert Town, Sea Town (task #11) — fold per-env dressing (Phase D: palettes, glowing window slits, lit billboards, clouds) in here
 
 In `crates/zz-core/src/map/` (share `primitives.rs`/`builder.rs` machinery;
 see `urban.rs`):
@@ -82,7 +127,7 @@ see `urban.rs`):
 - Fuzz: extend `crates/zz-core/tests/mapgen_fuzz.rs` to all 4 envs.
 - DoD: fuzz green ×4; load each env in browser + native; env picker works.
 
-## [ ] 5. Proximity voice (task #13)
+## [ ] 6. Proximity voice (task #13)
 
 Design (ShotAnte port, one-to-N): new binary tag BIN_VOICE=2 —
 `[tag u8, speaker_slot u8, 16kHz mono i16 PCM ~120ms]`. Server
@@ -94,13 +139,16 @@ native via cpal; per-speaker jitter buffer, distance fade/pan from
 interpolated positions; mute key (M). Server relay is small — do it first
 with a bot test (two bots in range → frames relayed; out of range → dropped).
 
-## [ ] 6. Tuning + hardening (task #12, ongoing)
+## [ ] 7. Tuning + hardening (task #12, ongoing)
 
 - Difficulty curve at real latency with real players (director constants in
   `crates/zz-core/src/constants.rs`).
 - wasm size diet (5.5 MB brotli today): feature audit, `wasm-opt` flags,
   check tonemapping_luts/ktx2 weight.
 - Stress: scripted 5 bots + 200 zombies for 10 min; tick p99 < 8 ms.
+- BUG (seen in a real run): stats screen showed time_alive 42s > match
+  duration 35s, and zombies_killed 7 with player K/DMG/ACC all 0 — audit
+  MatchStats accounting in crates/zz-server/src/room/mod.rs finish().
 - Room-task panic guard (catch/log/respawn), per-IP connection caps.
 - Then: delete `legacy/` (after #2 no longer needs its scripts), and the
   temporary `#![allow(dead_code)]` in `crates/zz-client/src/seams.rs` should
