@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The four procedural map environments.
+/// Procedural / fixture map environments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvKind {
@@ -10,6 +10,8 @@ pub enum EnvKind {
     MountainTown,
     DesertTown,
     SeaTown,
+    /// Rome EUR real-place fixture (OSM-baked; see `map::rome_eur`).
+    RomeEur,
 }
 
 /// Axis-aligned box — the only collision primitive in the game.

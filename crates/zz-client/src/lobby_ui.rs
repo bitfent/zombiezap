@@ -350,6 +350,8 @@ fn env_label(env: EnvKind) -> &'static str {
         EnvKind::MountainTown => "MOUNTAIN",
         EnvKind::DesertTown => "DESERT",
         EnvKind::SeaTown => "SEA",
+        // R2b: env picker button; label only so Enum match stays exhaustive.
+        EnvKind::RomeEur => "ROME EUR",
     }
 }
 

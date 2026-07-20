@@ -123,6 +123,15 @@ pub fn env_lighting(env: EnvKind) -> EnvLighting {
             sun_illuminance: 11_500.0,
             sun_to: Vec3::new(-14.0, 26.0, 16.0).normalize(),
         },
+        // R2b owns the warm Mediterranean palette; interim = urban recipe.
+        EnvKind::RomeEur => EnvLighting {
+            sky: Color::srgb_u8(158, 201, 239),
+            ambient: Color::srgb_u8(150, 158, 168),
+            ambient_brightness: 950.0,
+            sun_color: Color::srgb_u8(255, 243, 218),
+            sun_illuminance: 11_000.0,
+            sun_to: Vec3::new(16.0, 28.0, 12.0).normalize(),
+        },
     }
 }
 

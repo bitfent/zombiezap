@@ -12,6 +12,7 @@ mod coop;
 mod desert;
 mod grid;
 mod mountain;
+mod rome_eur;
 mod sea;
 mod urban;
 

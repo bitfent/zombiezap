@@ -1,19 +1,24 @@
 //! Mapgen fuzz: co-op invariants over many seeds (the check-mapgen.mjs
 //! philosophy with 1v1 fairness rules replaced by co-op rules).
 //!
-//! Runs the full property set over ALL FOUR `EnvKind`s.
+//! Runs the full property set over every `EnvKind`, including the Rome EUR
+//! OSM fixture (geometry is seed-invariant; accent/ad slots may vary).
 
 use zz_core::constants::MAX_PLAYERS;
 use zz_core::map::{WalkGrid, generate_map};
 use zz_core::types::EnvKind;
 
 const SEEDS: usize = 200;
+/// Rome EUR is a fixed fixture — a handful of seeds is enough for determinism
+/// + walkability, and avoids 200× rasterizing a 500 m WalkGrid in CI.
+const ROME_SEEDS: usize = 8;
 
-const ALL_ENVS: [EnvKind; 4] = [
+const ALL_ENVS: [EnvKind; 5] = [
     EnvKind::Urban,
     EnvKind::MountainTown,
     EnvKind::DesertTown,
     EnvKind::SeaTown,
+    EnvKind::RomeEur,
 ];
 
 fn env_name(env: EnvKind) -> &'static str {
@@ -22,13 +27,21 @@ fn env_name(env: EnvKind) -> &'static str {
         EnvKind::MountainTown => "mountain",
         EnvKind::DesertTown => "desert",
         EnvKind::SeaTown => "sea",
+        EnvKind::RomeEur => "rome_eur",
+    }
+}
+
+fn seed_count(env: EnvKind) -> usize {
+    match env {
+        EnvKind::RomeEur => ROME_SEEDS,
+        _ => SEEDS,
     }
 }
 
 #[test]
 fn coop_map_invariants_hold_across_seeds() {
     for env in ALL_ENVS {
-        for i in 0..SEEDS {
+        for i in 0..seed_count(env) {
             let seed = format!("fuzz-{i}");
             let label = format!("{}:{seed}", env_name(env));
             let map = generate_map(env, &seed);
@@ -60,6 +73,12 @@ fn coop_map_invariants_hold_across_seeds() {
                     "{label}: degenerate wall #{wi}"
                 );
             }
+
+            // Rome EUR uses a 500 m arena; still must fit the i16 wire ±255.9 m.
+            assert!(
+                half <= 250.0 + 1e-3,
+                "{label}: arena_half {half} exceeds wire-safe 250"
+            );
 
             let grid = WalkGrid::rasterize(&map.walls, half);
 
@@ -178,6 +197,33 @@ fn urban_output_regression_known_seed() {
     );
     assert_eq!(map.spawns.len(), MAX_PLAYERS);
     assert!(map.gates.len() >= 3);
+}
+
+/// Canary: non-Rome envs keep arena_half 30 and produce walls after Rome EUR
+/// is wired into dispatch. Urban bit-identity is covered by
+/// `urban_output_regression_known_seed`.
+#[test]
+fn non_rome_env_outputs_stable_shape() {
+    for env in [
+        EnvKind::Urban,
+        EnvKind::MountainTown,
+        EnvKind::DesertTown,
+        EnvKind::SeaTown,
+    ] {
+        let map = generate_map(env, "canary-shape");
+        assert!(
+            (map.arena_half - 30.0).abs() < 1e-3,
+            "{env:?}: unexpected arena_half {}",
+            map.arena_half
+        );
+        assert!(!map.walls.is_empty(), "{env:?}: empty walls");
+        assert_eq!(map.spawns.len(), MAX_PLAYERS);
+        assert!(map.gates.len() >= 3);
+    }
+    let rome = generate_map(EnvKind::RomeEur, "canary-r");
+    assert!((rome.arena_half - 250.0).abs() < 1e-3);
+    assert!(rome.walls.len() > 500);
+    assert!(rome.walls.len() < 2000);
 }
 
 /// FNV-1a over wall f32 bits — stable across runs, independent of Vec address.
