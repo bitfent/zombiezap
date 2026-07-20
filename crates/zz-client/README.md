@@ -56,9 +56,11 @@ Curated in this crate’s `Cargo.toml` (workspace pins `bevy = "0.19"` with
 | Window / platform | `bevy_window`, `bevy_winit`, `x11`, `wayland`, `webgl2`, `default_font` |
 | Render / PBR | `bevy_render`, `bevy_core_pipeline`, `bevy_pbr`, `bevy_light`, `bevy_camera`, `bevy_mesh`, `bevy_material`, `bevy_image`, `bevy_shader`, `bevy_color`, `tonemapping_luts`, `ktx2`, `zstd_rust`, `png` |
 | UI / text | `bevy_text`, `bevy_ui`, `bevy_ui_render` |
+| Audio | `bevy_audio` (no `wav`/`vorbis`/… — procedural only) |
 
-Explicitly **not** enabled: `bevy_gltf`, `bevy_animation`, `bevy_audio` / `audio`,
-`scene`, `webgpu` (browser target is WebGL2 only).
+Explicitly **not** enabled: `bevy_gltf`, `bevy_animation`, file-format audio
+features (`wav`, `vorbis`, `mp3`, …), `scene`, `webgpu` (browser target is
+WebGL2 only).
 
 ## Bevy 0.19 API notes (vs 0.14–0.16 era)
 
@@ -156,3 +158,30 @@ work next:
     `navigator.clipboard`; works on both when the page is a secure context).
     The overlay paints `seams::LobbyView` and pushes `seams::UiIntent` only —
     never mutates `Session` or talks to `NetClient`.
+
+20. **Procedural audio (zero assets):** enable leaf feature `bevy_audio` only —
+    not the `audio` profile (that also pulls `vorbis`). Custom one-shot clips
+    implement `Decodable` + `Source` (rodio trait re-exported by `bevy::audio`)
+    and register with `app.add_audio_source::<T>()`. Bake mono `f32` samples
+    into an `Asset` once at startup; play with `AudioPlayer(handle)` +
+    `PlaybackSettings::DESPAWN.with_volume(Volume::Linear(…))`.  
+    `Source::channels` / `sample_rate` return `NonZeroU16` / `NonZeroU32` in
+    0.19 (the example still aliases these as `ChannelCount` / `SampleRate`).
+    `Volume` is an enum (`Linear` / `Decibels`), not a bare `f32`.
+
+21. **SFX seam:** `seams::SfxQueue` is drained solely by `audio.rs` every frame.
+    Concurrent voices are capped (~8); lowest priority (remote `Shoot`) is
+    skipped first when saturated. Synthesis is pure math + xorshift noise —
+    no `rand`, no wav files.
+
+19. **`FocusPolicy` is under `bevy::ui`, not always in the umbrella prelude.**  
+    Use `bevy::ui::FocusPolicy::Pass` for non-interactive full-screen overlays
+    (damage vignette, paused tint) so clicks fall through to menus/buttons.
+
+20. **Per-entity transparent FX need unique `StandardMaterial` handles.**  
+    Mutating a shared material’s alpha fades every concurrent tracer/boom.
+    Clone via `materials.add(...)` per spawn for independent lifetimes.
+
+21. **`Button` requires `Interaction` (via `#[require]`) — edge-detect clicks with**  
+    `Changed<Interaction>` + `Interaction::Pressed` and a local “was pressed”
+    flag so held clicks don’t spam `UiIntent`s every frame.

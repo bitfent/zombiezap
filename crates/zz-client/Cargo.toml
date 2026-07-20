@@ -45,6 +45,9 @@ bevy = { workspace = true, features = [
     "bevy_text",
     "bevy_ui",
     "bevy_ui_render",
+
+    # --- audio (procedural SFX via Decodable; no file-format features) ---
+    "bevy_audio",
 ] }
 
 # netcode: poll-based WebSocket, one API for native + wasm
