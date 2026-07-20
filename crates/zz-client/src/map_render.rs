@@ -18,13 +18,14 @@ use std::f32::consts::PI;
 
 use bevy::{
     asset::RenderAssetUsages,
-    image::{Image, ImageSampler},
+    image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor},
     mesh::Indices,
+    pbr::{DistanceFog, FogFalloff},
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 use zz_core::map::GameMap;
-use zz_core::types::Aabb;
+use zz_core::types::{Aabb, EnvKind};
 
 /// The map the world should currently display. Insert or overwrite to
 /// trigger a (re)build.
@@ -54,6 +55,77 @@ const ACCENT_MIX: f32 = 0.08;
 const BILLBOARD_FRAME_T: f32 = 0.08;
 const BILLBOARD_FRAME_DEPTH: f32 = 0.06;
 
+// ── Per-env light & atmosphere (ShotAnte's buildWorld recipe, per env) ─────
+
+/// Baked-shadow tuning. Factors multiply into vertex colors / the ground
+/// texture at map build time; real-time shadow maps stay off everywhere.
+const GROUND_SHADOW: f32 = 0.62;
+/// Base light a wall face gets regardless of sun exposure (interiors).
+const FACE_AMBIENT: f32 = 0.55;
+/// Hard floor for any baked factor — the "never pitch black" invariant.
+pub const MIN_LIGHT: f32 = 0.42;
+/// Ground-occlusion grid resolution (bilinearly upsampled into the texture,
+/// which also softens shadow edges).
+const OCCLUSION_RES: u32 = 256;
+/// Baked ground texture resolution (whole arena, UV 0..1 — not tiled).
+const GROUND_TEX_RES: u32 = 1024;
+
+/// Everything the atmosphere needs, per environment.
+#[derive(Clone, Copy, Debug)]
+pub struct EnvLighting {
+    /// Sky: camera clear color and fog color.
+    pub sky: Color,
+    /// Hemisphere-style fill (`GlobalAmbientLight`) — what keeps interiors
+    /// dim-but-readable instead of pitch black.
+    pub ambient: Color,
+    pub ambient_brightness: f32,
+    pub sun_color: Color,
+    pub sun_illuminance: f32,
+    /// Unit vector pointing from the world TOWARD the sun (occlusion rays
+    /// travel along this; the light itself shines along `-sun_to`).
+    pub sun_to: Vec3,
+}
+
+/// Total per-env atmosphere table. Urban is the ShotAnte reference recipe
+/// (sky 0x9ec9ef, warm 0xfff3da sun from (16, 28, 12)); the other three are
+/// distinct moods for item 5's environments.
+pub fn env_lighting(env: EnvKind) -> EnvLighting {
+    match env {
+        EnvKind::Urban => EnvLighting {
+            sky: Color::srgb_u8(158, 201, 239),
+            ambient: Color::srgb_u8(150, 158, 168),
+            ambient_brightness: 950.0,
+            sun_color: Color::srgb_u8(255, 243, 218),
+            sun_illuminance: 11_000.0,
+            sun_to: Vec3::new(16.0, 28.0, 12.0).normalize(),
+        },
+        EnvKind::MountainTown => EnvLighting {
+            sky: Color::srgb_u8(143, 190, 222),
+            ambient: Color::srgb_u8(140, 155, 170),
+            ambient_brightness: 900.0,
+            sun_color: Color::srgb_u8(255, 248, 235),
+            sun_illuminance: 12_500.0,
+            sun_to: Vec3::new(10.0, 30.0, 14.0).normalize(),
+        },
+        EnvKind::DesertTown => EnvLighting {
+            sky: Color::srgb_u8(232, 206, 158),
+            ambient: Color::srgb_u8(196, 172, 132),
+            ambient_brightness: 1_050.0,
+            sun_color: Color::srgb_u8(255, 230, 185),
+            sun_illuminance: 13_000.0,
+            sun_to: Vec3::new(20.0, 24.0, 8.0).normalize(),
+        },
+        EnvKind::SeaTown => EnvLighting {
+            sky: Color::srgb_u8(151, 197, 222),
+            ambient: Color::srgb_u8(150, 166, 178),
+            ambient_brightness: 1_000.0,
+            sun_color: Color::srgb_u8(255, 242, 214),
+            sun_illuminance: 11_500.0,
+            sun_to: Vec3::new(-14.0, 26.0, 16.0).normalize(),
+        },
+    }
+}
+
 /// Wall material family for merged draw calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WallFamily {
@@ -70,6 +142,9 @@ pub struct MeshGeom {
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    /// Baked light factors as vertex colors (empty = attribute omitted).
+    /// Filled by [`bake_face_colors`]; StandardMaterial multiplies them in.
+    pub colors: Vec<[f32; 4]>,
 }
 
 impl MeshGeom {
@@ -152,15 +227,119 @@ impl MeshGeom {
     }
 
     fn into_mesh(self) -> Mesh {
-        Mesh::new(
+        let mesh = Mesh::new(
             bevy::mesh::PrimitiveTopology::TriangleList,
             RenderAssetUsages::default(),
         )
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
-        .with_inserted_indices(Indices::U32(self.indices))
+        .with_inserted_indices(Indices::U32(self.indices));
+        if self.colors.is_empty() {
+            mesh
+        } else {
+            mesh.with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        }
     }
+}
+
+// ── Baked sun shadows (once per map build; zero per-frame cost) ────────────
+
+/// Does a ray from `origin` along `dir` hit any AABB? Slab method.
+fn ray_hits_any(origin: Vec3, dir: Vec3, boxes: &[Aabb]) -> bool {
+    let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
+    for b in boxes {
+        let t1 = (b.x0 - origin.x) * inv.x;
+        let t2 = (b.x1 - origin.x) * inv.x;
+        let t3 = (b.y0 - origin.y) * inv.y;
+        let t4 = (b.y1 - origin.y) * inv.y;
+        let t5 = (b.z0 - origin.z) * inv.z;
+        let t6 = (b.z1 - origin.z) * inv.z;
+        let tmin = t1.min(t2).max(t3.min(t4)).max(t5.min(t6));
+        let tmax = t1.max(t2).min(t3.max(t4)).min(t5.max(t6));
+        if tmax >= tmin.max(0.0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sun-occlusion factor for a ground point: 1.0 in the open, [`GROUND_SHADOW`]
+/// under a building's shadow; 4 jittered samples soften the edge.
+fn ground_light_at(x: f32, z: f32, sun_to: Vec3, walls: &[Aabb]) -> f32 {
+    const JITTER: [(f32, f32); 4] = [(-0.35, -0.35), (0.35, -0.35), (-0.35, 0.35), (0.35, 0.35)];
+    let mut lit = 0.0;
+    for (jx, jz) in JITTER {
+        let origin = Vec3::new(x + jx, 0.05, z + jz);
+        if !ray_hits_any(origin, sun_to, walls) {
+            lit += 0.25;
+        }
+    }
+    GROUND_SHADOW + (1.0 - GROUND_SHADOW) * lit
+}
+
+/// Bake the ground occlusion grid: `res`×`res` factors covering
+/// [-half, half]² (row-major, +x fastest). Each factor is in
+/// [[`GROUND_SHADOW`], 1.0].
+pub fn bake_ground_occlusion(res: u32, half: f32, sun_to: Vec3, walls: &[Aabb]) -> Vec<f32> {
+    let mut grid = Vec::with_capacity((res * res) as usize);
+    for iz in 0..res {
+        let z = ((iz as f32 + 0.5) / res as f32 - 0.5) * 2.0 * half;
+        for ix in 0..res {
+            let x = ((ix as f32 + 0.5) / res as f32 - 0.5) * 2.0 * half;
+            grid.push(ground_light_at(x, z, sun_to, walls));
+        }
+    }
+    grid
+}
+
+/// Bilinear sample of the occlusion grid at texture-space (u, v) in 0..1.
+fn sample_occlusion(grid: &[f32], res: u32, u: f32, v: f32) -> f32 {
+    let fx = (u * res as f32 - 0.5).clamp(0.0, (res - 1) as f32);
+    let fz = (v * res as f32 - 0.5).clamp(0.0, (res - 1) as f32);
+    let x0 = fx as u32;
+    let z0 = fz as u32;
+    let x1 = (x0 + 1).min(res - 1);
+    let z1 = (z0 + 1).min(res - 1);
+    let kx = fx - x0 as f32;
+    let kz = fz - z0 as f32;
+    let g = |x: u32, z: u32| grid[(z * res + x) as usize];
+    let a = g(x0, z0) * (1.0 - kx) + g(x1, z0) * kx;
+    let b = g(x0, z1) * (1.0 - kx) + g(x1, z1) * kx;
+    a * (1.0 - kz) + b * kz
+}
+
+/// Baked light factor for one wall face: ambient base + sun diffuse gated by
+/// a shadow ray from the face center. Clamped to [[`MIN_LIGHT`], 1.0] — a
+/// face under a roof comes out dim-but-readable, never black.
+pub fn face_light_factor(center: Vec3, normal: Vec3, sun_to: Vec3, walls: &[Aabb]) -> f32 {
+    let ndl = normal.dot(sun_to).max(0.0);
+    let vis = if ndl > 0.0 && !ray_hits_any(center + normal * 0.05, sun_to, walls) {
+        1.0
+    } else {
+        0.0
+    };
+    (FACE_AMBIENT + (1.0 - FACE_AMBIENT) * ndl * vis).clamp(MIN_LIGHT, 1.0)
+}
+
+/// Fill `geom.colors` with per-face baked light (faces are 4-vertex quads —
+/// exactly how [`MeshGeom::push_face`] lays them out).
+pub fn bake_face_colors(geom: &mut MeshGeom, sun_to: Vec3, walls: &[Aabb]) {
+    let faces = geom.positions.len() / 4;
+    let mut colors = Vec::with_capacity(geom.positions.len());
+    for f in 0..faces {
+        let i = f * 4;
+        let c = geom.positions[i..i + 4]
+            .iter()
+            .fold(Vec3::ZERO, |acc, p| acc + Vec3::from_array(*p))
+            / 4.0;
+        let n = Vec3::from_array(geom.normals[i]);
+        let l = face_light_factor(c, n, sun_to, walls);
+        for _ in 0..4 {
+            colors.push([l, l, l, 1.0]);
+        }
+    }
+    geom.colors = colors;
 }
 
 /// Classify an AABB into a wall material family.
@@ -287,15 +466,43 @@ fn rgba_image(width: u32, height: u32, pixels: Vec<u8>) -> Image {
     image
 }
 
-fn gen_asphalt(size: u32) -> Image {
+/// Nearest + repeat sampler for world-UV tiled textures. The plain nearest
+/// sampler clamps to edge — walls taller/wider than one UV tile smeared their
+/// last texel row before this.
+fn tiled(mut image: Image) -> Image {
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..ImageSamplerDescriptor::nearest()
+    });
+    image
+}
+
+/// Whole-arena ground texture: sun-bleached asphalt with pavement seams and
+/// the baked shadow mask multiplied in. UV 0..1 across the map (not tiled) —
+/// the retro render target hides the modest texel density.
+fn gen_ground_lit(size: u32, half: f32, occlusion: &[f32], occ_res: u32) -> Image {
     let mut px = Vec::with_capacity((size * size * 4) as usize);
+    // Pavement seams roughly every 4 m.
+    let seam_every_px = (4.0 / (2.0 * half) * size as f32).max(2.0) as u32;
     for y in 0..size {
         for x in 0..size {
             let n = hash_noise(x, y, 1);
             let speck = hash_noise(x, y, 99) > 0.97;
-            let base = 0.10 + n * 0.06;
-            let v = if speck { base + 0.12 } else { base };
-            let c = (v.clamp(0.0, 1.0) * 255.0) as u8;
+            let seam = x % seam_every_px < 1 || y % seam_every_px < 1;
+            // Legacy palette: "#8d9099" asphalt, darker seams.
+            let mut v = 0.46 + n * 0.09;
+            if speck {
+                v += 0.10;
+            }
+            if seam {
+                v -= 0.10;
+            }
+            let u = (x as f32 + 0.5) / size as f32;
+            let w = (y as f32 + 0.5) / size as f32;
+            let light = sample_occlusion(occlusion, occ_res, u, w);
+            v = (v * light).clamp(0.0, 1.0);
+            let c = (v * 255.0) as u8;
             px.extend_from_slice(&[c, c, (c as f32 * 0.95) as u8, 255]);
         }
     }
@@ -304,13 +511,15 @@ fn gen_asphalt(size: u32) -> Image {
 
 fn gen_concrete(size: u32, dark: bool) -> Image {
     let mut px = Vec::with_capacity((size * size * 4) as usize);
-    let base0 = if dark { 0.28 } else { 0.42 };
+    // Bright bases (legacy building textures are near-white; hue comes from
+    // the material base_color multiplied on top).
+    let base0 = if dark { 0.58 } else { 0.76 };
     for y in 0..size {
         for x in 0..size {
             let n = hash_noise(x, y, if dark { 3 } else { 2 });
             // Faint horizontal darker bands every ~32 px.
             let band = if (y % 32) < 2 { 0.08 } else { 0.0 };
-            let v = (base0 + n * 0.08 - band).clamp(0.0, 1.0);
+            let v = (base0 + n * 0.09 - band).clamp(0.0, 1.0);
             let c = (v * 255.0) as u8;
             px.extend_from_slice(&[c, c, c, 255]);
         }
@@ -326,10 +535,10 @@ fn gen_cover(size: u32) -> Image {
             let n = hash_noise(x, y, 4);
             let edge = x < border || y < border || x >= size - border || y >= size - border;
             let (r, g, b) = if edge {
-                (0.22, 0.14, 0.08)
+                (0.34, 0.23, 0.13)
             } else {
-                let v = 0.40 + n * 0.10;
-                (v, v * 0.72, v * 0.42)
+                let v = 0.64 + n * 0.14;
+                (v, v * 0.76, v * 0.48)
             };
             px.extend_from_slice(&[(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255]);
         }
@@ -342,7 +551,7 @@ fn gen_roof(size: u32) -> Image {
     for y in 0..size {
         for x in 0..size {
             let n = hash_noise(x, y, 5);
-            let v = 0.06 + n * 0.05;
+            let v = 0.52 + n * 0.12;
             let c = (v.clamp(0.0, 1.0) * 255.0) as u8;
             px.extend_from_slice(&[c, c, c, 255]);
         }
@@ -421,10 +630,12 @@ fn rebuild_map_system(
     current: Option<Res<CurrentMap>>,
     roots: Query<Entity, With<MapRoot>>,
     placeholders: Query<Entity, With<Placeholder>>,
+    cameras: Query<Entity, With<Camera3d>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut ambient: ResMut<GlobalAmbientLight>,
+    mut clear_color: ResMut<ClearColor>,
 ) {
     let Some(current) = current else {
         return;
@@ -444,16 +655,38 @@ fn rebuild_map_system(
     let map = &current.0;
     let accent = accent_color(map.accent);
 
-    // Soft ambient fill for the map build.
-    ambient.color = Color::srgb(0.55, 0.58, 0.62);
-    ambient.brightness = 120.0;
+    // ── Atmosphere: sky, fog, hemisphere-style fill (per env) ──────────────
+    let light = env_lighting(map.env);
+    clear_color.0 = light.sky;
+    ambient.color = light.ambient;
+    ambient.brightness = light.ambient_brightness;
+    // Fog scales with the arena: streets stay crisp, horizon hazes.
+    for cam in cameras.iter() {
+        commands.entity(cam).insert(DistanceFog {
+            color: light.sky,
+            falloff: FogFalloff::Linear {
+                start: map.arena_half * 1.4,
+                end: map.arena_half * 4.0,
+            },
+            ..default()
+        });
+    }
 
-    // Procedural textures (small, nearest-filtered).
-    let tex_asphalt = images.add(gen_asphalt(128));
-    let tex_concrete = images.add(gen_concrete(128, false));
-    let tex_perimeter = images.add(gen_concrete(128, true));
-    let tex_cover = images.add(gen_cover(128));
-    let tex_roof = images.add(gen_roof(128));
+    // ── Baked sun shadows (once, here; nothing shadow-related per frame) ───
+    let ground_occlusion =
+        bake_ground_occlusion(OCCLUSION_RES, map.arena_half, light.sun_to, &map.walls);
+
+    // Procedural textures (small, nearest-filtered; wall textures tile).
+    let tex_ground = images.add(gen_ground_lit(
+        GROUND_TEX_RES,
+        map.arena_half,
+        &ground_occlusion,
+        OCCLUSION_RES,
+    ));
+    let tex_concrete = images.add(tiled(gen_concrete(128, false)));
+    let tex_perimeter = images.add(tiled(gen_concrete(128, true)));
+    let tex_cover = images.add(tiled(gen_cover(128)));
+    let tex_roof = images.add(tiled(gen_roof(128)));
     let ad_handles: [Handle<Image>; 4] = [
         images.add(gen_ad(0, 256, 128)),
         images.add(gen_ad(1, 256, 128)),
@@ -461,32 +694,35 @@ fn rebuild_map_system(
         images.add(gen_ad(3, 256, 128)),
     ];
 
+    // Legacy pastel-city palette: near-white textures carry the detail, the
+    // base colors carry the hue, the accent tints the whole family.
     let family_mats: [Handle<StandardMaterial>; 4] = [
         materials.add(wall_material(
-            tinted(Color::srgb(0.35, 0.35, 0.36), accent),
+            tinted(Color::srgb(0.62, 0.65, 0.71), accent),
             Some(tex_perimeter.clone()),
             0.92,
         )),
         materials.add(wall_material(
-            tinted(Color::srgb(0.48, 0.34, 0.22), accent),
+            tinted(Color::srgb(0.80, 0.66, 0.46), accent),
             Some(tex_cover.clone()),
             0.90,
         )),
         materials.add(wall_material(
-            tinted(Color::srgb(0.50, 0.50, 0.52), accent),
+            tinted(Color::srgb(0.88, 0.82, 0.70), accent),
             Some(tex_concrete.clone()),
             0.88,
         )),
         materials.add(wall_material(
-            tinted(Color::srgb(0.18, 0.18, 0.20), accent),
+            tinted(Color::srgb(0.38, 0.42, 0.50), accent),
             Some(tex_roof.clone()),
             0.95,
         )),
     ];
 
+    // Tone lives in the texture (shadow mask baked in): keep base white.
     let ground_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.14, 0.14, 0.15),
-        base_color_texture: Some(tex_asphalt),
+        base_color: Color::WHITE,
+        base_color_texture: Some(tex_ground),
         perceptual_roughness: 0.95,
         metallic: 0.0,
         ..default()
@@ -527,11 +763,13 @@ fn rebuild_map_system(
                 Name::new("Ground"),
             ));
 
-            // Merged wall families (one entity each, skip empty).
-            for (fam, geom) in family_geoms {
+            // Merged wall families (one entity each, skip empty) with baked
+            // per-face sun light in the vertex colors.
+            for (fam, mut geom) in family_geoms {
                 if geom.is_empty() {
                     continue;
                 }
+                bake_face_colors(&mut geom, light.sun_to, &map.walls);
                 let mat = family_mats[family_index(fam)].clone();
                 let mesh = meshes.add(geom.into_mesh());
                 root.spawn((
@@ -581,19 +819,17 @@ fn rebuild_map_system(
                 ));
             }
 
-            // Map-owned sun: shadows OFF. Skeleton light is left alone (not Placeholder).
+            // Map-owned sun (the skeleton backdrop light is a Placeholder and
+            // is gone by now). Real-time shadow maps stay OFF — shadows were
+            // baked above, once, at map build.
             root.spawn((
                 DirectionalLight {
-                    illuminance: 10_000.0,
+                    color: light.sun_color,
+                    illuminance: light.sun_illuminance,
                     shadow_maps_enabled: false,
                     ..default()
                 },
-                Transform::from_rotation(Quat::from_euler(
-                    EulerRot::XYZ,
-                    -PI * 0.35,
-                    PI * 0.2,
-                    0.0,
-                )),
+                Transform::IDENTITY.looking_to(-light.sun_to, Vec3::Y),
                 Name::new("MapSun"),
             ));
         });
@@ -751,7 +987,8 @@ mod tests {
         }
 
         // Procedural textures must not panic.
-        let _ = gen_asphalt(16);
+        let occ = bake_ground_occlusion(8, map.arena_half, Vec3::new(0.4, 0.8, 0.3), &map.walls);
+        let _ = gen_ground_lit(16, map.arena_half, &occ, 8);
         let _ = gen_concrete(16, false);
         let _ = gen_concrete(16, true);
         let _ = gen_cover(16);
@@ -768,6 +1005,92 @@ mod tests {
             total_verts,
             map.accent
         );
+    }
+
+    #[test]
+    fn env_lighting_is_total_and_distinct() {
+        let envs = [
+            EnvKind::Urban,
+            EnvKind::MountainTown,
+            EnvKind::DesertTown,
+            EnvKind::SeaTown,
+        ];
+        let all: Vec<EnvLighting> = envs.iter().map(|e| env_lighting(*e)).collect();
+        for (i, a) in all.iter().enumerate() {
+            assert!(a.ambient_brightness > 0.0);
+            assert!(a.sun_illuminance > 0.0);
+            assert!((a.sun_to.length() - 1.0).abs() < 1e-5, "sun_to normalized");
+            assert!(a.sun_to.y > 0.0, "sun above the horizon");
+            for (j, b) in all.iter().enumerate().skip(i + 1) {
+                let ca = a.sky.to_srgba();
+                let cb = b.sky.to_srgba();
+                let d = (ca.red - cb.red).abs() + (ca.green - cb.green).abs()
+                    + (ca.blue - cb.blue).abs();
+                assert!(d > 0.02, "skies of env {i} and {j} indistinguishable");
+            }
+        }
+    }
+
+    #[test]
+    fn sun_occlusion_open_vs_blocked() {
+        let sun_to = Vec3::new(0.5, 0.8, 0.3).normalize();
+        // Tall wall to the sun side of the probe point.
+        let wall = box_at(2.0, 0.0, -4.0, 4.0, 8.0, 4.0);
+        let walls = [wall];
+
+        // Open ground far from the wall, away from the sun: fully lit.
+        assert!((ground_light_at(-20.0, 0.0, sun_to, &walls) - 1.0).abs() < 1e-5);
+        // Right behind the wall relative to the sun: fully shadowed.
+        let shadowed = ground_light_at(0.5, 0.0, sun_to, &walls);
+        assert!((shadowed - GROUND_SHADOW).abs() < 1e-5, "{shadowed}");
+        // The invariant: factors never fall below the shadow floor.
+        const {
+            assert!(GROUND_SHADOW >= MIN_LIGHT);
+        }
+    }
+
+    #[test]
+    fn face_light_never_pitch_black() {
+        let sun_to = Vec3::new(0.5, 0.8, 0.3).normalize();
+        let building = box_at(-5.0, 0.0, -5.0, 5.0, 4.0, 5.0);
+        // A face pointing straight away from the sun, fully enclosed.
+        let f = face_light_factor(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(-0.5, -0.8, -0.3).normalize(),
+            sun_to,
+            &[building],
+        );
+        assert!((MIN_LIGHT..1.0).contains(&f), "{f}");
+        // A sunlit face in the open reaches full brightness.
+        let lit = face_light_factor(Vec3::new(50.0, 1.0, 50.0), sun_to, sun_to, &[building]);
+        assert!(lit > 0.95, "{lit}");
+    }
+
+    #[test]
+    fn baked_face_colors_cover_every_vertex() {
+        let boxes = [
+            box_at(0.0, 0.0, 0.0, 2.0, 3.0, 2.0),
+            box_at(5.0, 0.0, 5.0, 6.0, 1.0, 6.0),
+        ];
+        let mut geom = build_merged_boxes(&boxes);
+        bake_face_colors(&mut geom, Vec3::new(0.4, 0.8, 0.2).normalize(), &boxes);
+        assert_eq!(geom.colors.len(), geom.positions.len());
+        for c in &geom.colors {
+            assert!(c[0] >= MIN_LIGHT && c[0] <= 1.0, "{c:?}");
+            assert_eq!(c[3], 1.0);
+        }
+    }
+
+    #[test]
+    fn ground_occlusion_grid_shape_and_bounds() {
+        let walls = [box_at(-2.0, 0.0, -2.0, 2.0, 6.0, 2.0)];
+        let sun_to = Vec3::new(0.6, 0.7, 0.2).normalize();
+        let grid = bake_ground_occlusion(16, 20.0, sun_to, &walls);
+        assert_eq!(grid.len(), 16 * 16);
+        assert!(grid.iter().all(|f| (GROUND_SHADOW..=1.0).contains(f)));
+        // The box must shadow SOMETHING and leave open ground lit.
+        assert!(grid.iter().any(|f| *f < 1.0));
+        assert!(grid.iter().any(|f| (*f - 1.0).abs() < 1e-5));
     }
 
     #[test]

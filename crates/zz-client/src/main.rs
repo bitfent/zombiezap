@@ -10,14 +10,18 @@ mod lobby_ui;
 mod map_render;
 mod net;
 mod platform;
+mod retro;
 mod seams;
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{
+    camera::RenderTarget,
     diagnostic::{Diagnostic, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     input::mouse::AccumulatedMouseMotion,
+    pbr::{DistanceFog, FogFalloff},
     prelude::*,
+    render::view::Msaa,
     text::FontSize,
     window::{CursorGrabMode, CursorOptions, WindowResolution},
 };
@@ -54,6 +58,7 @@ fn main() {
                 ..default()
             }),
             FrameTimeDiagnosticsPlugin::default(),
+            retro::RetroRenderPlugin,
             map_render::MapRenderPlugin,
             game::GamePlugin,
             lobby_ui::LobbyUiPlugin,
@@ -78,10 +83,15 @@ fn main() {
 }
 
 /// Ground plane + ~30 colored AABB cubes + fly camera + light.
+///
+/// Everything except the camera is tagged [`map_render::Placeholder`]: the
+/// first real map build despawns the whole backdrop, lights included — the
+/// map owns its lighting (per-env sun/ambient/fog, shadows baked at build).
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    retro_target: Res<retro::RetroTarget>,
 ) {
     // ~80×80 m ground (dark procedural-ish slate).
     let ground = meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(40.0)));
@@ -92,6 +102,7 @@ fn setup_scene(
         ..default()
     });
     commands.spawn((
+        map_render::Placeholder,
         Mesh3d(ground),
         MeshMaterial3d(ground_mat),
         Transform::IDENTITY,
@@ -124,6 +135,7 @@ fn setup_scene(
                 ..default()
             });
             commands.spawn((
+                map_render::Placeholder,
                 Mesh3d(unit_cube.clone()),
                 MeshMaterial3d(mat),
                 Transform::from_xyz(x, h * 0.5, z).with_scale(Vec3::new(3.0, h, 3.0)),
@@ -132,19 +144,44 @@ fn setup_scene(
         }
     }
 
-    // Directional sun + slight ambient fill via a dim point light.
+    // Backdrop sun. Real-time shadow maps stay OFF everywhere: map shadows
+    // are baked once per map build (ShotAnte's frame-budget lesson).
     commands.spawn((
+        map_render::Placeholder,
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -PI * 0.35, PI * 0.2, 0.0)),
     ));
 
+    // The one 3D camera: renders the world at RETRO_W×RETRO_H into the retro
+    // target (nearest-upscaled to the window by RetroRenderPlugin). MSAA off —
+    // chunky pixels are the point. Fog is retuned per env on every map build.
+    //
+    // Bevy 0.19: `RenderTarget` is a required *component* on the camera entity
+    // (not a field of `Camera`). Default is the primary window; override with
+    // `RenderTarget::Image(ImageRenderTarget)` for offscreen passes.
     commands.spawn((
         FlyCamera,
         Camera3d::default(),
+        Camera {
+            // Present camera (order 1) blits the retro frame on top of letterbox bars.
+            order: 0,
+            clear_color: ClearColorConfig::Default,
+            ..default()
+        },
+        RenderTarget::Image(retro_target.image.clone().into()),
+        Msaa::Off,
+        DistanceFog {
+            color: Color::srgb_u8(158, 201, 239),
+            falloff: FogFalloff::Linear {
+                start: 60.0,
+                end: 220.0,
+            },
+            ..default()
+        },
         Transform::from_xyz(0.0, 4.0, 18.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
     ));
 }

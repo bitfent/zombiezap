@@ -186,6 +186,39 @@ work next:
     `Changed<Interaction>` + `Interaction::Pressed` and a local “was pressed”
     flag so held clicks don’t spam `UiIntent`s every frame.
 
+25. **`RenderTarget` is a component, not a `Camera` field.**  
+    In 0.19, `Camera` requires a `RenderTarget` component (default:
+    primary window). Offscreen passes spawn  
+    `RenderTarget::Image(image_handle.into())` as a sibling of `Camera3d` /
+    `Camera { .. }` — there is no `Camera.target` field.  
+    `From<Handle<Image>> for ImageRenderTarget` sets `scale_factor: 1.0`.
+
+26. **Offscreen target images:**  
+    `Image::new_target_texture(w, h, format, view_format)` (in `bevy_image`)
+    zeros the buffer and sets `TEXTURE_BINDING | COPY_DST | RENDER_ATTACHMENT`.
+    Match Bevy’s `render_to_texture` example: storage
+    `TextureFormat::Rgba8Unorm` + view `Some(Rgba8UnormSrgb)` for SDR PBR.
+    Then set `image.sampler = ImageSampler::nearest()` for chunky upscale
+    (item 15).
+
+27. **Distance fog is a camera component:**  
+    `bevy::pbr::DistanceFog` + `FogFalloff::Linear { start, end }` (or
+    Exponential / Atmospheric). Color should match sky / `ClearColor` so the
+    horizon dissolves instead of cutting to a different hue. Insert/replace
+    on the 3D camera when the map (env) changes.
+
+28. **Per-camera MSAA:**  
+    `Msaa` (`bevy::render::view::Msaa`, also a component) can be set per
+    camera entity — use `Msaa::Off` on the low-res 3D camera so nearest
+    upscale stays crisp. Default is `Sample4`.
+
+29. **bevy_egui primary context must not land on the retro camera:**  
+    Set `EguiGlobalSettings::auto_create_primary_context = false` in
+    PreStartup, then put `PrimaryEguiContext` on the native-res present
+    camera (with `IsDefaultUiCamera`) so menus/HUD stay full resolution.
+    Present the 480×270 frame via a full-window `ImageNode` +
+    `NodeImageMode::Stretch` letterboxed under HUD (`GlobalZIndex` negative).
+
 ## M6a — browser platform seam + Trunk release
 
 `platform.rs` is the only place that branches on `cfg(target_arch = "wasm32")`
@@ -215,27 +248,27 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
 
 ### Wasm-specific API notes (M6a)
 
-25. **Same-origin WebSocket only in the browser.** There is no hardcoded host:
+30. **Same-origin WebSocket only in the browser.** There is no hardcoded host:
     `window.location.protocol` / `.host` drive the scheme. A static host that
     is not the API origin needs a reverse proxy (serve `dist/` and `/ws` from
     one host) or a future config seam — do not special-case hosts in client code.
 
-26. **`web-sys` features are minimal:** `Window`, `Location`, `Storage`. No
+31. **`web-sys` features are minimal:** `Window`, `Location`, `Storage`. No
     `Url` / `UrlSearchParams` — query parsing is a tiny split on
     `location.search` so the wasm dep graph stays small.
 
-27. **Trunk loader UI is plain HTML/CSS.** `#zz-loading` sits over the canvas
+32. **Trunk loader UI is plain HTML/CSS.** `#zz-loading` sits over the canvas
     until `canvas.width/height > 0` (Bevy WebGL surface ready). Trunk itself
     does not inject a loading chrome; keep the hide script in `web/index.html`.
 
-28. **`data-wasm-opt="z"` needs binaryen (`wasm-opt`) on PATH.** Without it,
+33. **`data-wasm-opt="z"` needs binaryen (`wasm-opt`) on PATH.** Without it,
     Trunk fails the release link step — install via package manager or
     temporarily set `data-wasm-opt="0"` for local iteration. Rust ≥1.82
     emits bulk-memory / nontrapping float-to-int ops; pass
     `data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"`
     or wasm-opt validation fails with `memory.copy` / `memory.fill` errors.
 
-29. **`NetClient` needs `unsafe impl Send + Sync` on wasm32.** ewebsock’s
+34. **`NetClient` needs `unsafe impl Send + Sync` on wasm32.** ewebsock’s
     browser `WsSender` wraps `Rc<WebSocket>` (`!Send`/`!Sync`), but Bevy’s
     `Resource` trait still demands both bounds. The client is single-threaded
     on wasm (main browser thread only), so the impl is sound in practice.

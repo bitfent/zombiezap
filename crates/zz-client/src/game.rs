@@ -221,17 +221,26 @@ fn net_poll(
             Color::srgb(0.65, 0.40, 0.90),
             Color::srgb(0.35, 0.90, 0.75),
         ];
+        // Small emissive floor so remote players / zombies separate from baked
+        // architecture in shadow (Phase A: entity-vs-world contrast).
+        let entity_mat = |c: Color| StandardMaterial {
+            base_color: c,
+            emissive: c.to_linear() * 0.12,
+            perceptual_roughness: 0.75,
+            metallic: 0.0,
+            ..default()
+        };
         commands.insert_resource(RemoteAssets {
             player_mesh: meshes.add(Capsule3d::new(PLAYER_RADIUS, 1.0)),
             player_mats: palette
                 .iter()
-                .map(|c| materials.add(StandardMaterial::from_color(*c)))
+                .map(|c| materials.add(entity_mat(*c)))
                 .collect(),
             zombie_mesh: meshes.add(Cuboid::new(0.7, 1.8, 0.7)),
             zombie_mats: [
-                materials.add(StandardMaterial::from_color(Color::srgb(0.35, 0.55, 0.30))),
-                materials.add(StandardMaterial::from_color(Color::srgb(0.55, 0.65, 0.25))),
-                materials.add(StandardMaterial::from_color(Color::srgb(0.30, 0.40, 0.25))),
+                materials.add(entity_mat(Color::srgb(0.35, 0.55, 0.30))),
+                materials.add(entity_mat(Color::srgb(0.55, 0.65, 0.25))),
+                materials.add(entity_mat(Color::srgb(0.30, 0.40, 0.25))),
             ],
         });
         return; // assets visible next frame; nothing else depends on this tick
