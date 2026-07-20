@@ -2,6 +2,10 @@
 //! state transitions) and the presentation modules (lobby_ui, hud, fx, audio
 //! — which ONLY read these resources and push intents). Plain VecDeque queues
 //! instead of Bevy events keep the contract engine-version-proof.
+//!
+//! The dead_code allow covers the window between defining this contract and
+//! the worker branches that consume it — remove once hud/lobby_ui/audio land.
+#![allow(dead_code)]
 
 use bevy::prelude::*;
 use std::collections::VecDeque;

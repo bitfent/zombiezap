@@ -107,6 +107,7 @@ pub fn menu_active(session: Res<Session>) -> bool {
 }
 
 /// The lobby/menu overlay is interactive (cursor must stay free).
+#[allow(dead_code)] // consumed by the lobby_ui worker branch
 pub fn ui_active(session: Res<Session>) -> bool {
     matches!(
         *session,

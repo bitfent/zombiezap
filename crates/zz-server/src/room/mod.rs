@@ -21,6 +21,8 @@ use zz_core::snapshot::{
 };
 use zz_core::types::{Body, EnvKind, PlayerInput};
 
+use crate::lobby::LobbyCmd;
+
 pub enum RoomCmd {
     Join {
         conn_id: u64,
@@ -124,11 +126,24 @@ pub struct Room {
     zombies_killed: u32,
     peak_zombies: u32,
     encoder: SnapshotEncoder,
+    lobby_code: String,
+    lobby_tx: mpsc::Sender<LobbyCmd>,
+    /// wire tick at which the match ended; the room drains and exits shortly
+    /// after so clients can catch the stats broadcast.
+    ended_at: Option<u32>,
+    saw_players: bool,
 }
 
 impl Room {
-    pub fn spawn(env: EnvKind, map_seed: String) -> mpsc::Sender<RoomCmd> {
+    pub fn spawn(
+        env: EnvKind,
+        map_seed: String,
+        lobby_code: String,
+        lobby_tx: mpsc::Sender<LobbyCmd>,
+    ) -> mpsc::Sender<RoomCmd> {
         let (tx, rx) = mpsc::channel(256);
+        // MAP_SEED pins maps for tests/ops (ShotAnte trick)
+        let map_seed = std::env::var("MAP_SEED").unwrap_or(map_seed);
         let map = generate_map(env, &map_seed);
         let grid = WalkGrid::rasterize(&map.walls, map.arena_half);
         let loot_rng = zz_core::rng::Mulberry32::from_seed(&format!("{map_seed}|loot"));
@@ -156,6 +171,10 @@ impl Room {
             zombies_killed: 0,
             peak_zombies: 0,
             encoder: SnapshotEncoder::new(),
+            lobby_code,
+            lobby_tx,
+            ended_at: None,
+            saw_players: false,
         };
         tokio::spawn(room.run());
         tx
@@ -170,6 +189,20 @@ impl Room {
             ticker.tick().await;
             self.drain_cmds();
             self.step();
+            // exit: match over and stats had ~5 s to flush, or everyone left
+            let grace_over = self
+                .ended_at
+                .is_some_and(|t| self.wire_tick.saturating_sub(t) > TICK_RATE * 5);
+            let abandoned = self.saw_players && self.players.is_empty();
+            if grace_over || abandoned {
+                if self.ended_at.is_none() {
+                    // abandoned mid-match: still free the lobby for a rematch
+                    let _ = self.lobby_tx.try_send(LobbyCmd::MatchEnded {
+                        code: self.lobby_code.clone(),
+                    });
+                }
+                break;
+            }
         }
     }
 
@@ -249,6 +282,7 @@ impl Room {
             death_sim_tick: None,
         };
         self.players.push(player);
+        self.saw_players = true;
 
         let roster: Vec<RosterPlayer> = self
             .players
@@ -607,6 +641,10 @@ impl Room {
 
     fn finish(&mut self, now: u32) {
         self.ended = true;
+        self.ended_at = Some(self.wire_tick);
+        let _ = self.lobby_tx.try_send(LobbyCmd::MatchEnded {
+            code: self.lobby_code.clone(),
+        });
         let stats = MatchStats {
             duration_ms: now as u64 * 1000 / TICK_RATE as u64,
             zombies_killed: self.zombies_killed,
