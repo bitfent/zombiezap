@@ -247,7 +247,7 @@ fn quantization_helpers_round_trip_within_precision() {
         let q = quant_pos(v);
         assert!((dequant_pos(q) - v).abs() <= 0.5 / POS_SCALE + 1e-6);
     }
-    for yaw in [0.0f32, 1.0, 3.14, 6.28, -2.5, 12.0] {
+    for yaw in [0.0f32, 1.0, 3.1, 6.4, -2.5, 12.0] {
         let q = quant_yaw16(yaw);
         let back = dequant_yaw16(q);
         let diff = (back - yaw.rem_euclid(core::f32::consts::TAU)).abs();
