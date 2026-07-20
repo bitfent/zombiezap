@@ -6,6 +6,7 @@ use zz_core::protocol::{ClientMsg, ServerMsg};
 use zz_core::snapshot::{Snapshot, SnapshotDecoder};
 
 /// What a frame's worth of polling yields.
+#[allow(dead_code)] // consumed by the M3 session wiring
 pub enum NetEvent {
     Connected,
     Msg(ServerMsg),
@@ -22,6 +23,7 @@ pub struct NetClient {
     connected: bool,
 }
 
+#[allow(dead_code)] // consumed by the M3 session wiring
 impl NetClient {
     pub fn disconnected() -> Self {
         NetClient {

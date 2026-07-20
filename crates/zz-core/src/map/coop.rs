@@ -91,24 +91,24 @@ fn spawn_cluster(arena: &Arena64, grid: &WalkGrid) -> Vec<Spawn> {
     let (ax, az, yaw) = (anchor.x as f32, anchor.z as f32, anchor.yaw as f32);
     let mut spawns: Vec<Spawn> = vec![Spawn { x: ax, z: az, yaw }];
 
+    // 8 compass directions without trig: unit offsets, fixed scan order
+    const D: f32 = core::f32::consts::FRAC_1_SQRT_2;
+    const DIRS: [(f32, f32); 8] = [
+        (1.0, 0.0),
+        (D, D),
+        (0.0, 1.0),
+        (-D, D),
+        (-1.0, 0.0),
+        (-D, -D),
+        (0.0, -1.0),
+        (D, -D),
+    ];
     // ring offsets in fixed order, nearest first
     'outer: for radius in [1.5f32, 2.5, 3.5, 4.5, 6.0] {
-        for step in 0..8 {
+        for &(dx, dz) in DIRS.iter() {
             if spawns.len() >= MAX_PLAYERS {
                 break 'outer;
             }
-            // 8 compass directions without trig: unit offsets
-            const DIRS: [(f32, f32); 8] = [
-                (1.0, 0.0),
-                (0.7071, 0.7071),
-                (0.0, 1.0),
-                (-0.7071, 0.7071),
-                (-1.0, 0.0),
-                (-0.7071, -0.7071),
-                (0.0, -1.0),
-                (0.7071, -0.7071),
-            ];
-            let (dx, dz) = DIRS[step];
             let (x, z) = (ax + dx * radius, az + dz * radius);
             if !grid.walkable_at(x, z) {
                 continue;

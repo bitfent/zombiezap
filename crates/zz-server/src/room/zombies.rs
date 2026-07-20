@@ -9,6 +9,7 @@ use zz_core::types::{Aabb, Body, PlayerInput};
 /// Wire states (snapshot `state` byte drives client anims).
 pub const ZS_WALK: u8 = 0;
 pub const ZS_ATTACK: u8 = 1;
+#[allow(dead_code)] // wire state reserved for hit-stagger (client anims)
 pub const ZS_STAGGER: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub struct Zombie {
     /// Cooldown ticks until the next attack may start.
     pub cooldown_left: u32,
     /// Slot of the player being attacked when the windup ends.
+    #[allow(dead_code)] // read by the M4 client half (attack telegraphs)
     pub target_slot: u8,
 }
 

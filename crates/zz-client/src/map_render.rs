@@ -20,14 +20,17 @@ use zz_core::map::GameMap;
 /// The map the world should currently display. Insert or overwrite to
 /// trigger a (re)build.
 #[derive(Resource)]
+#[allow(dead_code)] // constructed by the M3 session wiring
 pub struct CurrentMap(pub GameMap);
 
 /// Root entity of the spawned map (despawn = whole map gone).
 #[derive(Component)]
+#[allow(dead_code)] // constructed by the renderer implementation
 pub struct MapRoot;
 
 /// Skeleton-scene entities that any real map replaces.
 #[derive(Component)]
+#[allow(dead_code)] // tags skeleton-scene entities; queried by the renderer
 pub struct Placeholder;
 
 pub struct MapRenderPlugin;
