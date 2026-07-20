@@ -9,7 +9,10 @@
 //! use `crate::constants::ARENA_HALF` (the co-op 40.0 value).
 
 mod coop;
+mod desert;
 mod grid;
+mod mountain;
+mod sea;
 mod urban;
 
 pub use coop::{Billboard, GameMap, Gate, generate_map};
