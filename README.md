@@ -26,24 +26,26 @@ Open the page. Type a name. **HOST A GAME** → share the code or the
 ### Local dev
 
 ```bash
-# terminal 1 — the authoritative server (ws://localhost:8080)
-cargo run -p zz-server
+# optional: browser client (Trunk → web/dist), then served by zz-server at /
+cargo install trunk --locked
+cd web && trunk build --release && cd ..
 
-# terminal 2..n — one window per player
+# terminal 1 — server on :8080 (healthz, /ws, and static client at /)
+cargo run -p zz-server
+# open http://localhost:8080  if web/dist exists
+
+# terminal 2..n — native windows (optional; same server)
 cargo run -p zz-client
 ```
+
+Override the static root with `ZZ_WEB_DIST` (default `web/dist`, relative to
+the process cwd). Missing dist does not crash the server — only static routes
+404; `/healthz` and `/ws` still work.
 
 **Desktop controls:** WASD move · mouse aim (click to lock) · LMB fire ·
 Space jump · G grenade · P pause · Esc release cursor.
 **Mobile:** left half of the screen is a virtual stick, right half drags your
 aim; FIRE / JUMP / GRENADE buttons on screen.
-
-**Browser build:**
-
-```bash
-cargo install trunk --locked
-cd web && trunk build --release     # → web/dist, served by zz-server at /
-```
 
 ## The game
 
@@ -128,12 +130,15 @@ stats screen, and a pause that must freeze every zombie mid-lurch.
 
 ## Deployment (Render)
 
-One web service serves everything — the wasm client, the WebSocket, health:
+One web service serves everything on the same origin — the Trunk wasm client
+at `/`, the WebSocket at `/ws`, health at `/healthz`. Invite links and the
+game URL share that origin (`PUBLIC_URL`).
 
 ```bash
 # render.yaml is in the repo root; Blueprint deploy picks it up.
+# Build: wasm32 + trunk release (→ web/dist) + cargo release zz-server.
 # Set one env var:
-PUBLIC_URL=https://zombiezap.com    # invite-link base = the game's own URL
+PUBLIC_URL=https://zombiezap.com    # invite-link base AND the game URL
 ```
 
 Health check: `/healthz`. WebSockets work out of the box; TLS is Render's

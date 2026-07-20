@@ -1,18 +1,26 @@
 # Render blueprint: the ZombieZap game server as a single Web Service.
 # WebSockets work on Render web services out of the box; the server binds
-# $PORT (Render-provided) and serves /healthz + /ws on one port.
+# $PORT (Render-provided) and serves the browser client at /, /healthz, and
+# /ws on one port.
+# The client is served from the same origin, so PUBLIC_URL is the invite-link
+# base AND the game URL (open it in a browser; wasm + WS share the host).
 # NOTE: native (desktop) clients connect with ZZ_SERVER=wss://<service>.onrender.com/ws.
-# The browser build (M6) will be served as static files and use the same /ws.
 services:
   - type: web
     name: zombiezap-server
     runtime: rust
     plan: starter # free tier sleeps — a cold start kills a lobby (ShotAnte lesson)
     region: frankfurt # near EU players; latency is gameplay
-    buildCommand: cargo build --release -p zz-server
+    # Two artifacts: Trunk wasm client → web/dist, then the native zz-server binary.
+    # `cargo install trunk --locked` builds trunk from source when not cached
+    # (~minutes on cold builds). Prefer reusing Render's build cache; cargo-binstall
+    # is faster if you switch to a Docker runtime that can install prebuilt bins.
+    # Requires binaryen (wasm-opt) on PATH for data-wasm-opt="z" in web/index.html —
+    # install it in the build if Render's image lacks it, or the trunk step fails.
+    buildCommand: rustup target add wasm32-unknown-unknown && cargo install trunk --locked && (cd web && trunk build --release) && cargo build --release -p zz-server
     startCommand: ./target/release/zz-server
     healthCheckPath: /healthz
     envVars:
-      # public origin used to build invite links (?join=CODE)
+      # public origin used to build invite links (?join=CODE) — same origin as the game
       - key: PUBLIC_URL
         sync: false
