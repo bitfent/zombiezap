@@ -7,6 +7,7 @@ description = "ZombieZap authoritative WebSocket game server: lobbies, 30 TPS ro
 
 [dependencies]
 zz-core = { workspace = true }
+libm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

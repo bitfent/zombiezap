@@ -50,6 +50,12 @@ pub async fn handle_socket(mut ws: WebSocket, room: mpsc::Sender<RoomCmd>) {
                                 let _ = room.send(RoomCmd::Join { conn_id, name, tx: out_tx.clone() }).await;
                             }
                             Some(ClientMsg::Pong { .. }) => {} // traffic already counted
+                            Some(ClientMsg::Pause) if joined => {
+                                let _ = room.try_send(RoomCmd::Pause { conn_id });
+                            }
+                            Some(ClientMsg::Resume) if joined => {
+                                let _ = room.try_send(RoomCmd::Resume { conn_id });
+                            }
                             Some(_) | None => {} // lobby control lands in M5; garbage drops
                         }
                     }

@@ -16,9 +16,8 @@ struct AppState {
 }
 
 pub fn app() -> axum::Router {
-    let (walls, arena_half) = room::test_map();
-    let seed = std::env::var("MAP_SEED").unwrap_or_else(|_| "m2-test".into());
-    let room = room::Room::spawn(seed, walls, arena_half);
+    let seed = std::env::var("MAP_SEED").unwrap_or_else(|_| "m4-dev".into());
+    let room = room::Room::spawn(zz_core::types::EnvKind::Urban, seed);
     axum::Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_upgrade))

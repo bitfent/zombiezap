@@ -37,9 +37,12 @@ pub const MAX_HEALTH: u8 = 100;
 /// Hitbox = stacked spheres approximating the visible avatar (y offset, radius).
 /// The hitbox must match what the player SEES (ShotAnte lesson).
 pub const PLAYER_HITBOX: [(f32, f32); 3] = [(0.55, 0.5), (1.0, 0.55), (1.6, 0.4)];
-/// Zombie hit spheres: body + head; head hits deal double damage.
-pub const ZOMBIE_BODY_SPHERE: (f32, f32) = (0.9, 0.55);
-pub const ZOMBIE_HEAD_SPHERE: (f32, f32) = (1.6, 0.35);
+/// Zombie hit spheres: body + head; head hits deal double damage. The head
+/// sphere (1.58..1.98) sits entirely ABOVE the eye line (1.55) while the body
+/// sphere (0.33..1.57) covers it — flat shots are body hits; headshots take
+/// deliberate upward aim at the small head.
+pub const ZOMBIE_BODY_SPHERE: (f32, f32) = (0.95, 0.62);
+pub const ZOMBIE_HEAD_SPHERE: (f32, f32) = (1.78, 0.2);
 pub const HEADSHOT_MULTIPLIER: f32 = 2.0;
 
 // ── firearm ────────────────────────────────────────────────────────────────
