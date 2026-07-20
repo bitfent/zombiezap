@@ -58,14 +58,12 @@ fn setup_target(
     // may be the 480x270 3D camera.
     egui_settings.auto_create_primary_context = false;
 
-    // Storage format is linear; sRGB view format matches PBR camera output
-    // (same pair as Bevy's `render_to_texture` example).
-    let mut image = Image::new_target_texture(
-        RETRO_W,
-        RETRO_H,
-        TextureFormat::Rgba8Unorm,
-        Some(TextureFormat::Rgba8UnormSrgb),
-    );
+    // Plain sRGB storage, NO reinterpreting view format: WebGL2 (wgpu GL
+    // backend) does not support texture view formats — a linear texture with
+    // an sRGB view kills the whole render world in the browser (transparent
+    // canvas, no camera output) while working fine on native Metal.
+    let mut image =
+        Image::new_target_texture(RETRO_W, RETRO_H, TextureFormat::Rgba8UnormSrgb, None);
     // Nearest sampling is what makes the upscale chunky instead of blurry.
     image.sampler = ImageSampler::nearest();
     commands.insert_resource(RetroTarget {

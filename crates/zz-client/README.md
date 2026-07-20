@@ -273,3 +273,19 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     `Resource` trait still demands both bounds. The client is single-threaded
     on wasm (main browser thread only), so the impl is sound in practice.
     See `net.rs`.
+
+35. **WebGL2 forbids texture view-format reinterpretation.** A render-target
+    `Image` created with linear storage + an sRGB *view* format
+    (`new_target_texture(w, h, Rgba8Unorm, Some(Rgba8UnormSrgb))`) works on
+    native Metal but on the wgpu GL backend silently kills the entire render
+    world: transparent canvas, no camera ever presents, endless
+    "CommandQueue has un-applied commands" console spam. Use plain
+    `Rgba8UnormSrgb` storage with `None` view format for the retro target.
+
+36. **Browser-automation verification quirks** (Claude/CDP browser pane):
+    synthesized DOM `KeyboardEvent`s and CDP key taps never reach winit —
+    only real mouse input works. egui buttons may eat a same-frame
+    click; a 1 px `left_click_drag` press-releases across frames and lands
+    reliably. Keyboard turn keys (Q/X, `game.rs`) exist partly so future
+    touch-mode automation (`?touch=1`, item 3) can drive the player with
+    clicks alone.

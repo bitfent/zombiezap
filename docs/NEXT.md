@@ -10,7 +10,15 @@ map). All workspace tests green, clippy zero. PR #1 tracks `rust-rewrite`.
 
 ---
 
-## [x] 1. Light & atmosphere + retro target (USER-APPROVED PLAN, Phase A+B) — DONE (zz-client M7a, commit 40a1cce; browser screenshot pass pending)
+## [x] 1. Light & atmosphere + retro target (USER-APPROVED PLAN, Phase A+B) — DONE (zz-client M7a + WebGL2 fix)
+
+Browser-verified 2026-07-20: menu → host → lobby → urban match, chunky
+480×270 upscale, bright per-env sky/fog, sun-bleached palette, HUD/egui
+native-res, letterbox on portrait, 130-300 fps (debug wasm). Critical fix
+found in verification: the retro target must be plain Rgba8UnormSrgb with
+NO view format — WebGL2 can't reinterpret texture views (README item 35).
+Deferred to item 3 (needs `?touch=1` clickable controls for automation):
+building-interior close-up screenshot. New: Q/X keyboard turn keys.
 
 User bar, verbatim: "lightweight but nice. It's ok if we have ps2 graphics
 but it must look like a game." Real failure observed live: building
@@ -179,6 +187,10 @@ with a bot test (two bots in range → frames relayed; out of range → dropped)
 - BUG (seen in a real run): stats screen showed time_alive 42s > match
   duration 35s, and zombies_killed 7 with player K/DMG/ACC all 0 — audit
   MatchStats accounting in crates/zz-server/src/room/mod.rs finish().
+- BUG (browser verification 2026-07-20): the Ended/stats overlay tanks
+  client FPS (2-9 fps observed vs 130-300 in-match; also a odd dark
+  vertical band on the right of the frozen frame) — profile the Ended
+  state (vignette/tint overlay? frozen-world interpolation?).
 - Room-task panic guard (catch/log/respawn), per-IP connection caps.
 - Then: delete `legacy/` (after #2 no longer needs its scripts), and the
   temporary `#![allow(dead_code)]` in `crates/zz-client/src/seams.rs` should

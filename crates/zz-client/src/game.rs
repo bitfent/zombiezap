@@ -629,6 +629,17 @@ fn fps_controller(
         predicted.pitch = (predicted.pitch - delta.y * SENS).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
+    // Keyboard turn (Q left / X right; E is taken by interact): mouse-free
+    // aiming for accessibility and for driving the client from automation
+    // (browser verification runs).
+    const KEY_TURN_RATE: f32 = 2.2; // rad/s
+    if keys.pressed(KeyCode::KeyQ) {
+        predicted.yaw += KEY_TURN_RATE * time.delta_secs();
+    }
+    if keys.pressed(KeyCode::KeyX) {
+        predicted.yaw -= KEY_TURN_RATE * time.delta_secs();
+    }
+
     if !predicted.synced {
         return; // first snapshot seeds the body; don't predict from (0,0)
     }
