@@ -329,42 +329,44 @@ impl MeshGeom {
 
         // Six faces: +Y, -Y, +X, -X, +Z, -Z. Each: 4 verts, 2 tris.
         // UV axes track the two spanning world axes of the face.
-        // +Y (top) — U along X, V along Z
+        // Corner order is CCW when the attribute normal points toward the
+        // viewer so cross(P1−P0, P2−P0) matches the vertex normal (Back cull).
+        // +Y (top) — U along ±X, V along ±Z; cross(+X,−Z)=+Y
         self.push_face(
-            [[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]],
+            [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]],
             [0.0, 1.0, 0.0],
             sx,
             sz,
         );
-        // -Y (bottom) — U along X, V along Z (winding flipped for outward normal)
+        // -Y (bottom) — U along ±X, V along ±Z; cross(+X,+Z)=−Y
         self.push_face(
-            [[x0, y0, z1], [x1, y0, z1], [x1, y0, z0], [x0, y0, z0]],
+            [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
             [0.0, -1.0, 0.0],
             sx,
             sz,
         );
-        // +X — U along Z, V along Y
+        // +X — U along ±Z, V along ±Y; cross(−Z,+Y)=+X
         self.push_face(
-            [[x1, y0, z0], [x1, y0, z1], [x1, y1, z1], [x1, y1, z0]],
+            [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
             [1.0, 0.0, 0.0],
             sz,
             sy,
         );
-        // -X
+        // -X — U along ±Z, V along ±Y; cross(+Z,+Y)=−X
         self.push_face(
-            [[x0, y0, z1], [x0, y0, z0], [x0, y1, z0], [x0, y1, z1]],
+            [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
             [-1.0, 0.0, 0.0],
             sz,
             sy,
         );
-        // +Z — U along X, V along Y
+        // +Z — U along X, V along Y; cross(+X,+Y)=+Z
         self.push_face(
             [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
             [0.0, 0.0, 1.0],
             sx,
             sy,
         );
-        // -Z
+        // -Z — U along −X, V along Y; cross(−X,+Y)=−Z
         self.push_face(
             [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
             [0.0, 0.0, -1.0],
@@ -373,7 +375,8 @@ impl MeshGeom {
         );
     }
 
-    /// Quad with CCW winding when viewed along the outward normal.
+    /// Quad with CCW winding when the outward normal points toward the viewer
+    /// (geometric normal from indices matches `normal`).
     fn push_face(&mut self, corners: [[f32; 3]; 4], normal: [f32; 3], u_size: f32, v_size: f32) {
         let base = self.positions.len() as u32;
         let u_max = u_size * UV_PER_M;
@@ -834,12 +837,14 @@ pub fn build_window_mesh(slits: &[WindowSlit]) -> MeshGeom {
         let c = Vec3::from_array(s.center);
         let hw = s.half_w;
         let hh = s.half_h;
-        // CCW when viewed along outward normal.
+        // CCW when outward normal points toward the viewer.
+        // `right = n × Y`, so U along −right, V along +Y yields cross = n
+        // (U along +right would invert and get culled from the street).
         let corners = [
-            (c - right * hw - up * hh).to_array(),
             (c + right * hw - up * hh).to_array(),
-            (c + right * hw + up * hh).to_array(),
+            (c - right * hw - up * hh).to_array(),
             (c - right * hw + up * hh).to_array(),
+            (c + right * hw + up * hh).to_array(),
         ];
         geom.push_face(corners, s.normal, s.half_w * 2.0, s.half_h * 2.0);
     }
@@ -1634,6 +1639,117 @@ mod tests {
             z0,
             z1,
         }
+    }
+
+    /// Every triangle's geometric normal (from index winding) must agree with
+    /// its attribute normals. Back-face culling depends on this.
+    fn assert_winding_matches_attribute_normals(geom: &MeshGeom, label: &str) {
+        assert!(
+            !geom.indices.is_empty(),
+            "{label}: expected non-empty mesh"
+        );
+        assert_eq!(
+            geom.indices.len() % 3,
+            0,
+            "{label}: index count not multiple of 3"
+        );
+        for (ti, tri) in geom.indices.chunks_exact(3).enumerate() {
+            let i0 = tri[0] as usize;
+            let i1 = tri[1] as usize;
+            let i2 = tri[2] as usize;
+            let p0 = Vec3::from_array(geom.positions[i0]);
+            let p1 = Vec3::from_array(geom.positions[i1]);
+            let p2 = Vec3::from_array(geom.positions[i2]);
+            let geometric = (p1 - p0).cross(p2 - p0);
+            assert!(
+                geometric.length_squared() > 1e-12,
+                "{label} tri {ti}: degenerate triangle"
+            );
+            for &vi in &[i0, i1, i2] {
+                let attr = Vec3::from_array(geom.normals[vi]);
+                let d = geometric.dot(attr);
+                assert!(
+                    d > 0.0,
+                    "{label} tri {ti} vert {vi}: geometric {geometric:?} · attr {attr:?} = {d} (must be > 0)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn append_box_winding_matches_outward_normals() {
+        let mut geom = MeshGeom::default();
+        geom.append_box(&box_at(0.0, 0.0, 0.0, 1.0, 1.0, 1.0));
+        assert_eq!(geom.positions.len(), 24);
+        assert_eq!(geom.indices.len(), 36);
+        assert_winding_matches_attribute_normals(&geom, "unit box");
+        // Non-unit extents (anisotropic faces) too.
+        let mut tall = MeshGeom::default();
+        tall.append_box(&box_at(-1.0, 0.0, -2.0, 3.0, 4.0, 1.0));
+        assert_winding_matches_attribute_normals(&tall, "aniso box");
+    }
+
+    #[test]
+    fn billboard_quad_winding_matches_outward_normals() {
+        let q = build_billboard_quad(2.0, 1.0);
+        assert_eq!(q.positions.len(), 4);
+        assert_winding_matches_attribute_normals(&q, "billboard");
+    }
+
+    #[test]
+    fn window_mesh_winding_matches_outward_normals() {
+        // One slit on each cardinal so every normal axis is exercised.
+        let slits = [
+            WindowSlit {
+                center: [0.0, 1.0, 2.0],
+                normal: [0.0, 0.0, 1.0],
+                half_w: 0.35,
+                half_h: 0.45,
+            },
+            WindowSlit {
+                center: [0.0, 1.0, -2.0],
+                normal: [0.0, 0.0, -1.0],
+                half_w: 0.35,
+                half_h: 0.45,
+            },
+            WindowSlit {
+                center: [2.0, 1.0, 0.0],
+                normal: [1.0, 0.0, 0.0],
+                half_w: 0.35,
+                half_h: 0.45,
+            },
+            WindowSlit {
+                center: [-2.0, 1.0, 0.0],
+                normal: [-1.0, 0.0, 0.0],
+                half_w: 0.35,
+                half_h: 0.45,
+            },
+        ];
+        let geom = build_window_mesh(&slits);
+        assert_eq!(geom.positions.len(), slits.len() * 4);
+        assert_winding_matches_attribute_normals(&geom, "window mesh");
+    }
+
+    #[test]
+    fn bake_face_colors_maps_to_correct_face_normals() {
+        // Face order is still +Y,−Y,+X,−X,+Z,−Z; baking keys off attribute
+        // normals + face centres, so a sun along +Y must light the top face
+        // brighter than the bottom.
+        let boxes = [box_at(0.0, 0.0, 0.0, 2.0, 2.0, 2.0)];
+        let mut geom = build_merged_boxes(&boxes);
+        let sun = Vec3::Y;
+        bake_face_colors(&mut geom, sun, &boxes);
+        // 4 verts per face; face 0 = +Y, face 1 = −Y.
+        let top = geom.colors[0][0];
+        let bottom = geom.colors[4][0];
+        assert!(
+            top > bottom,
+            "top face ({top}) should be brighter than bottom ({bottom}) under +Y sun"
+        );
+        // +Z (face 4) and −Z (face 5) are both edge-on to +Y sun → equal ambient-ish.
+        let pz = geom.colors[16][0];
+        let nz = geom.colors[20][0];
+        assert!((pz - nz).abs() < 1e-5, "+Z/{pz} vs −Z/{nz}");
     }
 
     #[test]
