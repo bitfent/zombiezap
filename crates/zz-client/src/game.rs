@@ -77,6 +77,7 @@ impl Plugin for GamePlugin {
                     // In-match only (not Ended): freeze the world on OVERRUN so
                     // we don't keep interpolating/animating a huge horde at 3 fps.
                     fps_controller.run_if(playing),
+                    local_combat_feedback.run_if(playing),
                     apply_camera.run_if(in_match),
                     interpolate_remotes.run_if(playing),
                     animate_rigs.run_if(playing),
@@ -144,6 +145,8 @@ struct PrevSelf {
     health: u8,
     ammo_reserve: u8,
     grenades: u8,
+    reload_ticks_left: u8,
+    ammo_mag: u8,
 }
 
 pub fn in_match(session: Res<Session>) -> bool {
@@ -262,6 +265,8 @@ impl RemoteZombie {
 #[derive(Resource, Default)]
 struct ViewmodelKick {
     pending: u32,
+    /// Local melee jabs queued for the viewmodel (F / touch MELEE / dry-fire auto).
+    melee_pending: u32,
 }
 
 /// Tiny camera kick when own hits land (decays each frame).
@@ -549,6 +554,9 @@ fn net_poll(
                     seams.prev_self.health = me.health;
                     seams.prev_self.ammo_reserve = me.ammo_reserve;
                     seams.prev_self.grenades = me.grenades;
+                    seams.prev_self.ammo_mag = me.ammo_mag;
+                    // Reload edges drive clack SFX (viewmodel syncs in tick_viewmodel_sys).
+                    seams.prev_self.reload_ticks_left = me.reload_ticks_left;
                 }
 
                 // ── self: adopt server truth, replay unacked inputs ────────
@@ -889,6 +897,10 @@ fn fps_controller(
     predicted.send_accum += time.delta_secs();
     while predicted.send_accum >= TICK_DT {
         predicted.send_accum -= TICK_DT;
+        let fire =
+            (locked && buttons.pressed(MouseButton::Left) && !touch.enabled) || touch.fire;
+        let melee = keys.pressed(KeyCode::KeyF) || touch.melee;
+        let reload = keys.pressed(KeyCode::KeyR) || touch.reload;
         let input = PlayerInput {
             seq: predicted.next_seq,
             forward: keys.pressed(KeyCode::KeyW)
@@ -906,9 +918,12 @@ fn fps_controller(
             jump,
             // Desktop: fire while locked + LMB. Touch: FIRE button only
             // (right-side taps/drags never fire — aim is drag-only).
-            fire: (locked && buttons.pressed(MouseButton::Left) && !touch.enabled) || touch.fire,
+            fire,
             grenade: keys.pressed(KeyCode::KeyG) || touch.grenade,
             interact: keys.pressed(KeyCode::KeyE),
+            // R = reload, F = melee (E interact, G grenade, P pause, Q/X turn).
+            melee,
+            reload,
             yaw: predicted.yaw,
             pitch: predicted.pitch,
         };
@@ -1282,9 +1297,13 @@ fn ensure_viewmodel(
     models::spawn_viewmodel(&mut commands, camera, &assets, &mut materials);
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy system params
 fn tick_viewmodel_sys(
     time: Res<Time>,
     mut kick: ResMut<ViewmodelKick>,
+    session: Res<Session>,
+    latest: Res<crate::seams::LatestSnapshot>,
+    mut sfx: ResMut<crate::seams::SfxQueue>,
     mut vm_q: Query<(&mut Viewmodel, &mut Transform)>,
     mut vis_q: Query<&mut Visibility, Without<Viewmodel>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -1295,6 +1314,20 @@ fn tick_viewmodel_sys(
     while kick.pending > 0 {
         models::viewmodel_on_shot(&mut vm);
         kick.pending -= 1;
+    }
+    while kick.melee_pending > 0 {
+        models::viewmodel_on_melee(&mut vm);
+        kick.melee_pending -= 1;
+    }
+    // Authoritative reload presentation + clack SFX on start/end.
+    if let Some(slot) = session.my_slot()
+        && let Some(snap) = latest.0.as_ref()
+        && let Some(me) = snap.players.iter().find(|p| p.slot == slot)
+    {
+        let (started, finished) = models::viewmodel_sync_reload(&mut vm, me.reload_ticks_left);
+        if started || finished {
+            sfx.0.push_back(crate::seams::Sfx::ReloadClack);
+        }
     }
     let flash_vis = vis_q.get_mut(vm.flash_entity).ok();
     let flash_mat = materials.get_mut(&vm.flash_mat);
@@ -1324,6 +1357,91 @@ fn tick_viewmodel_sys(
         (None, None) => {
             models::tick_viewmodel(&mut vm, &mut tf, None, None, time.delta_secs());
         }
+    }
+}
+
+/// Local melee / dry-fire presentation (viewmodel + SFX). Server remains authority.
+#[allow(clippy::too_many_arguments)] // Bevy system params
+fn local_combat_feedback(
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    touch: Res<TouchIntent>,
+    windows: Query<&bevy::window::CursorOptions>,
+    session: Res<Session>,
+    latest: Res<crate::seams::LatestSnapshot>,
+    predicted: Res<Predicted>,
+    mut kick: ResMut<ViewmodelKick>,
+    mut sfx: ResMut<crate::seams::SfxQueue>,
+    mut prev: Local<(bool, bool, bool)>, // melee, reload, fire held last frame
+    mut dry_flash: ResMut<crate::hud::AmmoFlash>,
+) {
+    let locked = windows
+        .iter()
+        .next()
+        .is_some_and(|c| c.grab_mode != bevy::window::CursorGrabMode::None);
+    let fire = (locked && buttons.pressed(MouseButton::Left) && !touch.enabled) || touch.fire;
+    let melee = keys.pressed(KeyCode::KeyF) || touch.melee;
+    let (prev_melee, _prev_reload, prev_fire) = *prev;
+    *prev = (melee, keys.pressed(KeyCode::KeyR) || touch.reload, fire);
+
+    let Some(slot) = session.my_slot() else {
+        return;
+    };
+    let Some(snap) = latest.0.as_ref() else {
+        return;
+    };
+    let Some(me) = snap.players.iter().find(|p| p.slot == slot) else {
+        return;
+    };
+
+    let melee_edge = melee && !prev_melee;
+    let fire_edge = fire && !prev_fire;
+    let dry = me.ammo_mag == 0 && me.ammo_reserve == 0 && me.reload_ticks_left == 0;
+    let auto_melee = fire_edge && dry;
+    if melee_edge || auto_melee {
+        kick.melee_pending = kick.melee_pending.saturating_add(1);
+        sfx.0.push_back(crate::seams::Sfx::MeleeSwing);
+        // Optimistic thunk if a zombie is in melee range ahead of us.
+        let mx = predicted.body.x;
+        let mz = predicted.body.z;
+        let yaw = predicted.yaw;
+        let range2 = zz_core::constants::MELEE_RANGE * zz_core::constants::MELEE_RANGE;
+        let mut any = false;
+        for z in &snap.zombies {
+            let dx = dequant_pos(z.pos[0]) - mx;
+            let dz = dequant_pos(z.pos[2]) - mz;
+            let d2 = dx * dx + dz * dz;
+            if d2 > range2 {
+                continue;
+            }
+            if d2 >= 1e-8 {
+                let bearing = (-dx).atan2(-dz);
+                let mut ang = bearing - yaw;
+                let pi = std::f32::consts::PI;
+                while ang > pi {
+                    ang -= 2.0 * pi;
+                }
+                while ang < -pi {
+                    ang += 2.0 * pi;
+                }
+                if ang.abs() > zz_core::constants::MELEE_HALF_ANGLE_RAD {
+                    continue;
+                }
+            }
+            any = true;
+            break;
+        }
+        if any {
+            sfx.0.push_back(crate::seams::Sfx::MeleeHit);
+        }
+    }
+
+    // Dry-fire flash when firing empty with no reserve (and not mid-reload).
+    if fire_edge && me.ammo_mag == 0 && me.ammo_reserve == 0 {
+        dry_flash.0 = 0.18;
+        sfx.0.push_back(crate::seams::Sfx::DryClick);
+    } else if fire_edge && me.ammo_mag == 0 && me.ammo_reserve > 0 && me.reload_ticks_left == 0 {
+        // Auto-reload path — no dry click (reload clack will fire from snap).
     }
 }
 

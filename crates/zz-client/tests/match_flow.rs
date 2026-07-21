@@ -278,6 +278,7 @@ fn game_start_snapshot_syncs_and_queues_input() {
             kills: 0,
             alive: true,
             last_acked_seq: 0,
+            reload_ticks_left: 0,
         }],
         zombies: vec![],
         loot: vec![],
@@ -395,6 +396,7 @@ fn prediction_waits_for_walls_then_matches_server() {
             kills: 0,
             alive: true,
             last_acked_seq: 0,
+            reload_ticks_left: 0,
         }],
         zombies: vec![],
         loot: vec![],
@@ -552,6 +554,7 @@ fn horde_lod_transitions_bounded_and_entity_count_stable() {
             kills: 0,
             alive: true,
             last_acked_seq: 0,
+            reload_ticks_left: 0,
         }],
         zombies: zeds.to_vec(),
         loot: vec![],
@@ -648,4 +651,112 @@ fn horde_lod_transitions_bounded_and_entity_count_stable() {
 
 fn dequant_approx(q: i16) -> f32 {
     zz_core::snapshot::dequant_pos(q)
+}
+
+/// Seed Playing + first snap so fps_controller emits inputs.
+fn enter_playing_with_snap(app: &mut App, seed: &str) -> u8 {
+    let slot = 0u8;
+    let spawn = generate_map(EnvKind::Urban, seed).spawns[0];
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Msg(ServerMsg::GameStart {
+            map_seed: seed.into(),
+            env: EnvKind::Urban,
+            your_slot: slot,
+            players: vec![RosterPlayer {
+                slot,
+                id: "c1".into(),
+                name: "m21".into(),
+            }],
+        }));
+    }
+    tick(app);
+    let snap = Snapshot {
+        tick: 1,
+        game_time_ms: 33,
+        difficulty: 0,
+        paused: false,
+        players: vec![WirePlayer {
+            slot,
+            pos: quant_pos3(spawn.x, 0.0, spawn.z),
+            yaw: quant_yaw16(spawn.yaw),
+            pitch: 0,
+            health: MAX_HEALTH,
+            ammo_mag: MAG_SIZE,
+            ammo_reserve: START_RESERVE_AMMO,
+            grenades: START_GRENADES,
+            kills: 0,
+            alive: true,
+            last_acked_seq: 0,
+            reload_ticks_left: 0,
+        }],
+        zombies: vec![],
+        loot: vec![],
+        grenades: vec![],
+        shots: vec![],
+        booms: vec![],
+    };
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Snap(snap));
+    }
+    tick(app);
+    // Clear any idle frames from the sync tick.
+    let _ = app.world_mut().resource_mut::<NetClient>().take_outbound_bin();
+    slot
+}
+
+/// M21: R / F keys set reload / melee bits on the 15-byte input frame.
+#[test]
+fn keyboard_r_and_f_set_reload_and_melee_bits() {
+    use zz_core::protocol::{INPUT_FRAME_LEN, decode_input};
+
+    let mut app = headless_app();
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    tick(&mut app);
+    enter_playing_with_snap(&mut app, "m21-keys");
+
+    {
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.press(KeyCode::KeyR);
+        keys.press(KeyCode::KeyF);
+    }
+    for _ in 0..3 {
+        tick(&mut app);
+    }
+    let out = app.world_mut().resource_mut::<NetClient>().take_outbound_bin();
+    assert!(!out.is_empty(), "expected outbound input while R+F held");
+    let frame = &out[0];
+    assert_eq!(frame.len(), INPUT_FRAME_LEN, "M21 input frame is 15 bytes");
+    let input = decode_input(frame).expect("decode");
+    assert!(input.reload, "R must set reload bit");
+    assert!(input.melee, "F must set melee bit");
+}
+
+/// M21: touch RELOAD / MELEE chips OR into the same input bits as keys.
+#[test]
+fn touch_reload_and_melee_chips_set_bits() {
+    use zz_core::protocol::{INPUT_FRAME_LEN, decode_input};
+
+    let mut app = headless_app();
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    tick(&mut app);
+    enter_playing_with_snap(&mut app, "m21-touch");
+
+    {
+        let mut touch = app.world_mut().resource_mut::<TouchIntent>();
+        touch.enabled = true;
+        touch.reload = true;
+        touch.melee = true;
+    }
+    for _ in 0..3 {
+        tick(&mut app);
+    }
+    let out = app.world_mut().resource_mut::<NetClient>().take_outbound_bin();
+    assert!(!out.is_empty(), "expected outbound input with touch melee/reload");
+    let frame = &out[0];
+    assert_eq!(frame.len(), INPUT_FRAME_LEN);
+    let input = decode_input(frame).expect("decode");
+    assert!(input.reload, "touch.reload must set reload bit");
+    assert!(input.melee, "touch.melee must set melee bit");
 }

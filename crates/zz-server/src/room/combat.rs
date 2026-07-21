@@ -16,6 +16,49 @@ pub struct HitResult {
     pub end: (f32, f32, f32),
 }
 
+/// Nearest live zombie within [`MELEE_RANGE`] whose bearing from the player is
+/// within [`MELEE_HALF_ANGLE_RAD`] of `yaw`. Bearing uses the same convention
+/// as movement: yaw 0 faces −Z (`atan2(-dx, -dz)`). No wall check (melee is a
+/// short cone, not a ray). Returns the index into `zombies`.
+pub fn find_melee_target(
+    px: f32,
+    pz: f32,
+    yaw: f32,
+    zombies: &[Zombie],
+) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    let range2 = MELEE_RANGE * MELEE_RANGE;
+    let pi = core::f32::consts::PI;
+    for (zi, z) in zombies.iter().enumerate() {
+        if z.health <= 0.0 {
+            continue;
+        }
+        let dx = z.body.x - px;
+        let dz = z.body.z - pz;
+        let d2 = dx * dx + dz * dz;
+        if d2 > range2 {
+            continue;
+        }
+        if d2 >= 1e-8 {
+            let bearing = libm::atan2f(-dx, -dz);
+            let mut ang = bearing - yaw;
+            while ang > pi {
+                ang -= 2.0 * pi;
+            }
+            while ang < -pi {
+                ang += 2.0 * pi;
+            }
+            if ang.abs() > MELEE_HALF_ANGLE_RAD {
+                continue;
+            }
+        }
+        if best.is_none_or(|(_, bd2)| d2 < bd2) {
+            best = Some((zi, d2));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 /// Fire one hitscan ray from a player's eye. Zombies are tested as two
 /// spheres (body + head); the nearest sphere hit in front of the first wall
 /// wins; headshots deal double.
@@ -208,6 +251,40 @@ mod tests {
         assert_eq!(r.zombie_index, Some(0));
         assert!(r.headshot);
         assert_eq!(r.damage, GUN_DAMAGE * HEADSHOT_MULTIPLIER);
+    }
+
+    #[test]
+    fn melee_hits_in_range_and_cone() {
+        // yaw 0 faces -Z; zombie 1.5 m ahead is in range + cone.
+        let z = zombie_at(0.0, -1.5);
+        assert_eq!(find_melee_target(0.0, 0.0, 0.0, &[z]), Some(0));
+        // Walker dies in exactly 2 melee hits.
+        assert_eq!(ZOMBIE_WALKER.1 / MELEE_DAMAGE as f32, 2.0);
+    }
+
+    #[test]
+    fn melee_misses_beyond_range() {
+        let z = zombie_at(0.0, -(MELEE_RANGE + 0.5));
+        assert_eq!(find_melee_target(0.0, 0.0, 0.0, &[z]), None);
+    }
+
+    #[test]
+    fn melee_misses_outside_cone() {
+        // Zombie to the right (+X); yaw 0 faces -Z → ~90° off axis.
+        let z = zombie_at(1.5, 0.0);
+        assert_eq!(find_melee_target(0.0, 0.0, 0.0, std::slice::from_ref(&z)), None);
+        // Face +X (yaw = -π/2 in this convention: forward = (-sin yaw, -cos yaw)
+        // → yaw=-π/2 → (1, 0)).
+        let yaw_right = -core::f32::consts::FRAC_PI_2;
+        assert_eq!(find_melee_target(0.0, 0.0, yaw_right, std::slice::from_ref(&z)), Some(0));
+    }
+
+    #[test]
+    fn melee_picks_nearest_in_cone() {
+        let near = zombie_at(0.0, -1.0);
+        let mut far = zombie_at(0.0, -2.0);
+        far.id = 2;
+        assert_eq!(find_melee_target(0.0, 0.0, 0.0, &[far, near]), Some(1));
     }
 
     #[test]

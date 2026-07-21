@@ -7,7 +7,7 @@ mod combat;
 mod director;
 mod zombies;
 
-use combat::{Grenade, explosion_damage, fire_hitscan};
+use combat::{Grenade, explosion_damage, find_melee_target, fire_hitscan};
 use director::Director;
 use tokio::sync::mpsc;
 use zombies::{FlowField, SpatialHash, Zombie};
@@ -101,7 +101,11 @@ struct RoomPlayer {
     grenades: u8,
     fire_cooldown_left: u32,
     reload_left: u32,
+    melee_cooldown_left: u32,
     prev_grenade_held: bool,
+    prev_reload_held: bool,
+    prev_melee_held: bool,
+    prev_fire_held: bool,
     // input queue: sequence-gated, each accepted input simulated exactly once
     pending: std::collections::VecDeque<PlayerInput>,
     last_seq: u32,
@@ -308,7 +312,11 @@ impl Room {
             grenades: START_GRENADES,
             fire_cooldown_left: 0,
             reload_left: 0,
+            melee_cooldown_left: 0,
             prev_grenade_held: false,
+            prev_reload_held: false,
+            prev_melee_held: false,
+            prev_fire_held: false,
             pending: std::collections::VecDeque::new(),
             last_seq: 0,
             shots_fired: 0,
@@ -415,6 +423,9 @@ impl Room {
             if p.fire_cooldown_left > 0 {
                 p.fire_cooldown_left -= 1;
             }
+            if p.melee_cooldown_left > 0 {
+                p.melee_cooldown_left -= 1;
+            }
             if p.reload_left > 0 {
                 p.reload_left -= 1;
                 if p.reload_left == 0 {
@@ -424,6 +435,8 @@ impl Room {
                 }
             }
             if !p.alive {
+                // Death cancels an in-progress reload and drops the input queue.
+                p.reload_left = 0;
                 p.pending.clear();
                 continue;
             }
@@ -576,7 +589,24 @@ impl Room {
                 .push(Grenade::thrown(id, slot, eye, yaw, pitch));
         }
 
-        // fire
+        // Reload: edge on reload bit (partial mag OK), or fire held on empty mag
+        // with reserve (auto-reload QoL — level, so continuous fire keeps shooting
+        // across reloads without needing a release).
+        {
+            let p = &mut self.players[i];
+            let reload_edge = input.reload && !p.prev_reload_held;
+            p.prev_reload_held = input.reload;
+            let auto = input.fire && p.ammo_mag == 0 && p.ammo_reserve > 0;
+            let want_reload = (reload_edge || auto)
+                && p.ammo_mag < MAG_SIZE
+                && p.ammo_reserve > 0
+                && p.reload_left == 0;
+            if want_reload {
+                p.reload_left = RELOAD_TICKS;
+            }
+        }
+
+        // Fire (disabled while reloading).
         let can_fire = {
             let p = &self.players[i];
             input.fire && p.fire_cooldown_left == 0 && p.reload_left == 0 && p.ammo_mag > 0
@@ -615,12 +645,48 @@ impl Room {
             });
         }
 
-        // auto-reload on empty (reserve permitting)
-        {
+        // Melee: edge on melee bit, or fire when totally dry (mag+reserve empty).
+        // Also explicit melee while reloading is allowed (rifle-butt); fire is not.
+        let do_melee = {
             let p = &mut self.players[i];
-            if p.ammo_mag == 0 && p.reload_left == 0 && p.ammo_reserve > 0 {
-                p.reload_left = RELOAD_TICKS;
-            }
+            let melee_edge = input.melee && !p.prev_melee_held;
+            p.prev_melee_held = input.melee;
+            let fire_edge = input.fire && !p.prev_fire_held;
+            let auto_from_fire =
+                fire_edge && p.ammo_mag == 0 && p.ammo_reserve == 0 && p.reload_left == 0;
+            (melee_edge || auto_from_fire) && p.melee_cooldown_left == 0
+        };
+        if do_melee {
+            self.perform_melee(i);
+        }
+
+        self.players[i].prev_fire_held = input.fire;
+    }
+
+    /// Rifle-butt swing: nearest live zombie in MELEE_RANGE whose bearing is
+    /// within MELEE_HALF_ANGLE_RAD of player yaw. Damage through kill pipeline;
+    /// no headshot bonus. Nothing blocks the tick.
+    fn perform_melee(&mut self, i: usize) {
+        let (px, pz, yaw, slot) = {
+            let p = &mut self.players[i];
+            p.melee_cooldown_left = MELEE_COOLDOWN_TICKS;
+            (p.body.x, p.body.z, p.yaw, p.slot)
+        };
+
+        let Some(zi) = find_melee_target(px, pz, yaw, &self.zombies) else {
+            return;
+        };
+
+        let dmg = MELEE_DAMAGE as f32;
+        self.players[i].hits += 1;
+        self.players[i].damage_dealt += dmg;
+        let died = {
+            let z = &mut self.zombies[zi];
+            z.health -= dmg;
+            z.health <= 0.0
+        };
+        if died {
+            self.kill_zombie(zi, slot);
         }
     }
 
@@ -711,6 +777,7 @@ impl Room {
                 p.health = 0.0;
                 p.alive = false;
                 p.death_sim_tick = Some(now);
+                p.reload_left = 0; // death cancels reload
             }
         }
     }
@@ -787,6 +854,7 @@ impl Room {
                     kills: p.kills,
                     alive: p.alive,
                     last_acked_seq: p.last_seq,
+                    reload_ticks_left: p.reload_left.min(u8::MAX as u32) as u8,
                 })
                 .collect(),
             zombies: self

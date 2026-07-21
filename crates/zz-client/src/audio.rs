@@ -23,14 +23,17 @@ fn sfx_priority(sfx: &Sfx) -> u8 {
     match sfx {
         Sfx::Shoot { from_me: false } => 0,
         Sfx::Growl { .. } => 1,
-        Sfx::Click => 2,
-        Sfx::Shoot { from_me: true } => 3,
-        Sfx::HitConfirm => 4,
-        Sfx::Pickup => 5,
-        Sfx::Hurt => 6,
-        Sfx::KillConfirm { .. } => 7,
-        Sfx::Explosion { .. } => 8,
-        Sfx::TeamWipe => 9,
+        Sfx::Click | Sfx::DryClick => 2,
+        Sfx::ReloadClack => 3,
+        Sfx::MeleeSwing => 3,
+        Sfx::Shoot { from_me: true } => 4,
+        Sfx::MeleeHit => 4,
+        Sfx::HitConfirm => 5,
+        Sfx::Pickup => 6,
+        Sfx::Hurt => 7,
+        Sfx::KillConfirm { .. } => 8,
+        Sfx::Explosion { .. } => 9,
+        Sfx::TeamWipe => 10,
     }
 }
 
@@ -120,6 +123,10 @@ struct SfxBank {
     pickup: Handle<SynthClip>,
     team_wipe: Handle<SynthClip>,
     click: Handle<SynthClip>,
+    dry_click: Handle<SynthClip>,
+    melee_swing: Handle<SynthClip>,
+    melee_hit: Handle<SynthClip>,
+    reload_clack: Handle<SynthClip>,
     growl: Handle<SynthClip>,
 }
 
@@ -169,6 +176,18 @@ fn setup_sfx_bank(mut commands: Commands, mut clips: ResMut<Assets<SynthClip>>) 
         }),
         click: clips.add(SynthClip {
             samples: Arc::from(synth_click()),
+        }),
+        dry_click: clips.add(SynthClip {
+            samples: Arc::from(synth_dry_click()),
+        }),
+        melee_swing: clips.add(SynthClip {
+            samples: Arc::from(synth_melee_whoosh()),
+        }),
+        melee_hit: clips.add(SynthClip {
+            samples: Arc::from(synth_melee_thunk()),
+        }),
+        reload_clack: clips.add(SynthClip {
+            samples: Arc::from(synth_reload_clack()),
         }),
         growl: clips.add(SynthClip {
             samples: Arc::from(synth_growl()),
@@ -228,6 +247,10 @@ fn drain_sfx_queue(
             Sfx::Pickup => (bank.pickup.clone(), 1.0),
             Sfx::TeamWipe => (bank.team_wipe.clone(), 1.0),
             Sfx::Click => (bank.click.clone(), 0.7),
+            Sfx::DryClick => (bank.dry_click.clone(), 0.85),
+            Sfx::MeleeSwing => (bank.melee_swing.clone(), 0.9),
+            Sfx::MeleeHit => (bank.melee_hit.clone(), 1.0),
+            Sfx::ReloadClack => (bank.reload_clack.clone(), 0.85),
             Sfx::Growl { volume } => (bank.growl.clone(), volume.clamp(0.05, 0.85)),
         };
 
@@ -472,6 +495,69 @@ pub(crate) fn synth_click() -> Vec<f32> {
         let u = i as f32 / n as f32;
         let env = (1.0 - u).powf(3.0);
         *s = sine(t * 1800.0) * 0.35 * env + noise.next_f32() * 0.15 * env;
+    }
+    finalize(buf)
+}
+
+/// Short metallic dry-fire click (empty chamber).
+pub(crate) fn synth_dry_click() -> Vec<f32> {
+    let n = samples_for_ms(35.0);
+    let mut buf = vec![0.0; n];
+    let mut noise = XorShift32::new(0x0D41_F14E);
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let u = i as f32 / n as f32;
+        let env = (1.0 - u).powf(4.0);
+        *s = sine(t * 2400.0) * 0.4 * env + noise.next_f32() * 0.25 * env;
+    }
+    finalize(buf)
+}
+
+/// Melee whoosh: filtered noise sweep ~90 ms.
+pub(crate) fn synth_melee_whoosh() -> Vec<f32> {
+    let n = samples_for_ms(90.0);
+    let mut buf = vec![0.0; n];
+    let mut noise = XorShift32::new(0x0E1E_E400);
+    let mut lp = 0.0_f32;
+    for (i, s) in buf.iter_mut().enumerate() {
+        let u = i as f32 / n as f32;
+        let env = if u < 0.2 {
+            u / 0.2
+        } else {
+            (1.0 - (u - 0.2) / 0.8).max(0.0).powf(1.6)
+        };
+        let alpha = 0.04 + 0.2 * u; // brighten through the swing
+        let white = noise.next_f32();
+        lp += alpha * (white - lp);
+        *s = lp * 0.85 * env;
+    }
+    finalize(buf)
+}
+
+/// Melee impact thunk: low sine + grit ~70 ms.
+pub(crate) fn synth_melee_thunk() -> Vec<f32> {
+    let n = samples_for_ms(70.0);
+    let mut buf = vec![0.0; n];
+    let mut noise = XorShift32::new(0x07B4_C001);
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let u = i as f32 / n as f32;
+        let env = (1.0 - u).powf(2.2);
+        *s = sine(t * 90.0) * 0.75 * env + noise.next_f32() * 0.2 * env;
+    }
+    finalize(buf)
+}
+
+/// Reload magazine clack: short mid click ~40 ms.
+pub(crate) fn synth_reload_clack() -> Vec<f32> {
+    let n = samples_for_ms(40.0);
+    let mut buf = vec![0.0; n];
+    let mut noise = XorShift32::new(0x00E1_0AD0);
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let u = i as f32 / n as f32;
+        let env = (1.0 - u).powf(2.5);
+        *s = sine(t * 900.0) * 0.45 * env + square(t * 600.0) * 0.2 * env + noise.next_f32() * 0.1 * env;
     }
     finalize(buf)
 }

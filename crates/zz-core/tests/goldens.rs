@@ -168,6 +168,8 @@ fn movement_matches_legacy_ts() {
             fire: false,
             grenade: false,
             interact: false,
+            melee: false,
+            reload: false,
             yaw: i as f32 * 0.037,
             pitch: 0.0,
         };

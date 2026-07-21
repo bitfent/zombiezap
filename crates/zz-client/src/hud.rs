@@ -49,10 +49,12 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<HudLocal>().add_systems(
-            Startup,
-            (setup_fx_assets, setup_hud_ui, setup_fx_root).chain(),
-        );
+        app.init_resource::<HudLocal>()
+            .init_resource::<AmmoFlash>()
+            .add_systems(
+                Startup,
+                (setup_fx_assets, setup_hud_ui, setup_fx_root).chain(),
+            );
         app.add_systems(
             Update,
             (
@@ -80,6 +82,10 @@ impl Plugin for HudPlugin {
         );
     }
 }
+
+/// Seconds remaining for dry-fire ammo-counter flash (written by game.rs).
+#[derive(Resource, Default)]
+pub struct AmmoFlash(pub f32);
 
 fn playing(session: Res<Session>) -> bool {
     matches!(*session, Session::Playing { .. })
@@ -220,6 +226,15 @@ struct MicChipText;
 
 #[derive(Component)]
 struct AmmoText;
+
+#[derive(Component)]
+struct ReloadBarFill;
+
+#[derive(Component)]
+struct ReloadBarRoot;
+
+#[derive(Component)]
+struct ReloadLabel;
 
 #[derive(Component)]
 struct GrenadePips;
@@ -460,6 +475,37 @@ fn setup_hud_ui(mut commands: Commands) {
             Visibility::Hidden,
         ))
         .with_children(|p| {
+            p.spawn((
+                ReloadLabel,
+                Text::new(""),
+                mono(12.0),
+                TextColor(Color::srgb(0.55, 0.85, 0.95)),
+                Visibility::Hidden,
+            ));
+            // Reload progress bar under the ammo line.
+            p.spawn((
+                ReloadBarRoot,
+                Node {
+                    width: px(120.0),
+                    height: px(6.0),
+                    border: UiRect::all(px(1.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.08, 0.1, 0.12, 0.85)),
+                BorderColor::all(Color::srgba(0.3, 0.45, 0.55, 0.7)),
+                Visibility::Hidden,
+            ))
+            .with_children(|bar| {
+                bar.spawn((
+                    ReloadBarFill,
+                    Node {
+                        width: px(0.0),
+                        height: percent(100),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.35, 0.8, 0.95)),
+                ));
+            });
             p.spawn((
                 AmmoText,
                 Text::new("0 / 0"),
@@ -846,12 +892,53 @@ fn update_crosshair(
 }
 
 fn update_vitals(
+    time: Res<Time>,
     session: Res<Session>,
     latest: Res<LatestSnapshot>,
-    mut fill: Query<&mut Node, With<HealthFill>>,
-    mut num: Query<&mut Text, (With<HealthNum>, Without<AmmoText>, Without<GrenadePips>)>,
-    mut ammo: Query<&mut Text, (With<AmmoText>, Without<HealthNum>, Without<GrenadePips>)>,
-    mut pips: Query<&mut Text, (With<GrenadePips>, Without<HealthNum>, Without<AmmoText>)>,
+    mut dry_flash: ResMut<AmmoFlash>,
+    mut fill: Query<&mut Node, (With<HealthFill>, Without<ReloadBarFill>)>,
+    mut num: Query<
+        &mut Text,
+        (
+            With<HealthNum>,
+            Without<AmmoText>,
+            Without<GrenadePips>,
+            Without<ReloadLabel>,
+        ),
+    >,
+    mut ammo: Query<
+        (&mut Text, &mut TextColor),
+        (
+            With<AmmoText>,
+            Without<HealthNum>,
+            Without<GrenadePips>,
+            Without<ReloadLabel>,
+        ),
+    >,
+    mut pips: Query<
+        &mut Text,
+        (
+            With<GrenadePips>,
+            Without<HealthNum>,
+            Without<AmmoText>,
+            Without<ReloadLabel>,
+        ),
+    >,
+    mut reload_label: Query<
+        (&mut Text, &mut Visibility),
+        (
+            With<ReloadLabel>,
+            Without<AmmoText>,
+            Without<HealthNum>,
+            Without<GrenadePips>,
+            Without<ReloadBarRoot>,
+        ),
+    >,
+    mut reload_root: Query<
+        &mut Visibility,
+        (With<ReloadBarRoot>, Without<ReloadLabel>, Without<AmmoText>),
+    >,
+    mut reload_fill: Query<&mut Node, (With<ReloadBarFill>, Without<HealthFill>)>,
 ) {
     let Some(my_slot) = session_slot(&session) else {
         return;
@@ -870,11 +957,49 @@ fn update_vitals(
     for mut t in &mut num {
         **t = format!("{}", me.health);
     }
-    for mut t in &mut ammo {
+
+    if dry_flash.0 > 0.0 {
+        dry_flash.0 = (dry_flash.0 - time.delta_secs()).max(0.0);
+    }
+    let ammo_color = if dry_flash.0 > 0.0 {
+        Color::srgb(1.0, 0.35, 0.25)
+    } else {
+        Color::srgb(0.95, 0.9, 0.55)
+    };
+    for (mut t, mut c) in &mut ammo {
         **t = format!("{} / {}", me.ammo_mag, me.ammo_reserve);
+        *c = TextColor(ammo_color);
     }
     for mut t in &mut pips {
         **t = "●".repeat(me.grenades as usize);
+    }
+
+    // RELOADING + progress bar over ammo while reload_ticks_left > 0.
+    let reloading = me.reload_ticks_left > 0;
+    for (mut t, mut vis) in &mut reload_label {
+        if reloading {
+            **t = "RELOADING".into();
+            *vis = Visibility::Visible;
+        } else {
+            **t = "".into();
+            *vis = Visibility::Hidden;
+        }
+    }
+    for mut vis in &mut reload_root {
+        *vis = if reloading {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if reloading {
+        // progress: 0 at start (ticks_left high) → 1 at end. We don't know total
+        // if mid-stream; use RELOAD_TICKS as the nominal span.
+        let total = zz_core::constants::RELOAD_TICKS.max(1) as f32;
+        let progress = (1.0 - (me.reload_ticks_left as f32 / total)).clamp(0.0, 1.0);
+        for mut node in &mut reload_fill {
+            node.width = px(118.0 * progress);
+        }
     }
 }
 
@@ -1878,6 +2003,7 @@ mod tests {
                 kills: 0,
                 alive: true,
                 last_acked_seq: 0,
+                reload_ticks_left: 0,
             }],
             ..Default::default()
         };

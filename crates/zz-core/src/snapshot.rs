@@ -39,6 +39,8 @@ const PM_GRENADES: u16 = 1 << 8;
 const PM_KILLS: u16 = 1 << 9;
 const PM_ALIVE: u16 = 1 << 10;
 const PM_ACK: u16 = 1 << 11;
+/// Reload countdown remaining (0 = not reloading). M21.
+const PM_RELOAD: u16 = 1 << 12;
 
 // Zombie delta mask bits (u8).
 const ZM_POS_I8: u8 = 1 << 0; // dx,dy,dz as i8 (1/128 m units)
@@ -107,6 +109,9 @@ pub struct WirePlayer {
     /// Highest input sequence the server has applied for THIS player —
     /// drives client-side reconciliation (drop acked, replay the rest).
     pub last_acked_seq: u32,
+    /// Ticks remaining on an in-progress reload (0 = not reloading).
+    /// Wire as u8; server clamps `reload_left` into this range.
+    pub reload_ticks_left: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +384,7 @@ impl SnapshotEncoder {
         w.u16(p.kills);
         w.u8(p.alive as u8);
         w.u32(p.last_acked_seq);
+        w.u8(p.reload_ticks_left);
     }
 
     fn write_player_delta(w: &mut Writer, p: &WirePlayer, b: &WirePlayer) {
@@ -419,6 +425,9 @@ impl SnapshotEncoder {
         if p.last_acked_seq != b.last_acked_seq {
             mask |= PM_ACK;
         }
+        if p.reload_ticks_left != b.reload_ticks_left {
+            mask |= PM_RELOAD;
+        }
         w.u16(mask);
         if mask & PM_X != 0 {
             w.i16(p.pos[0]);
@@ -455,6 +464,9 @@ impl SnapshotEncoder {
         }
         if mask & PM_ACK != 0 {
             w.u32(p.last_acked_seq);
+        }
+        if mask & PM_RELOAD != 0 {
+            w.u8(p.reload_ticks_left);
         }
     }
 
@@ -696,6 +708,7 @@ impl SnapshotDecoder {
             kills: r.u16()?,
             alive: r.u8()? != 0,
             last_acked_seq: r.u32()?,
+            reload_ticks_left: r.u8()?,
         })
     }
 
@@ -736,6 +749,9 @@ impl SnapshotDecoder {
         }
         if mask & PM_ACK != 0 {
             p.last_acked_seq = r.u32()?;
+        }
+        if mask & PM_RELOAD != 0 {
+            p.reload_ticks_left = r.u8()?;
         }
         Ok(())
     }

@@ -371,6 +371,14 @@ pub struct CrumpleFx {
 #[derive(Component)]
 pub struct Viewmodel {
     pub recoil: f32,
+    /// Melee jab timer (seconds remaining of 0.3 s rifle-butt swing).
+    pub melee_t: f32,
+    /// Last seen reload_ticks_left from self snapshot (for start/end edges).
+    pub reload_prev: u8,
+    /// Active reload presentation: total ticks when the reload began (0 = idle).
+    pub reload_total: u8,
+    /// Current server reload countdown (0 = not reloading).
+    pub reload_left: u8,
     pub flash_age: f32,
     pub flash_entity: Entity,
     pub flash_mat: Handle<StandardMaterial>,
@@ -906,6 +914,10 @@ pub fn spawn_viewmodel(
 
     commands.entity(vm).insert(Viewmodel {
         recoil: 0.0,
+        melee_t: 0.0,
+        reload_prev: 0,
+        reload_total: 0,
+        reload_left: 0,
         flash_age: 99.0, // start hidden
         flash_entity,
         flash_mat: flash_mat_h,
@@ -921,7 +933,31 @@ pub fn viewmodel_on_shot(vm: &mut Viewmodel) {
     vm.flash_age = 0.0;
 }
 
-/// Decay recoil and flash; update transforms/visibility/alpha.
+/// Start a 0.3 s rifle-butt jab (forward lunge + rotate).
+pub fn viewmodel_on_melee(vm: &mut Viewmodel) {
+    vm.melee_t = MELEE_ANIM_S;
+}
+
+/// Duration of the melee viewmodel jab (seconds).
+pub const MELEE_ANIM_S: f32 = 0.3;
+
+/// Sync reload presentation from authoritative `reload_ticks_left`.
+/// Returns `(reload_started, reload_finished)` edges for SFX.
+pub fn viewmodel_sync_reload(vm: &mut Viewmodel, reload_ticks_left: u8) -> (bool, bool) {
+    let started = reload_ticks_left > 0 && vm.reload_prev == 0;
+    let finished = reload_ticks_left == 0 && vm.reload_prev > 0;
+    if started {
+        vm.reload_total = reload_ticks_left;
+    }
+    if reload_ticks_left == 0 {
+        vm.reload_total = 0;
+    }
+    vm.reload_left = reload_ticks_left;
+    vm.reload_prev = reload_ticks_left;
+    (started, finished)
+}
+
+/// Decay recoil/melee and drive reload dip; update transforms/visibility/alpha.
 pub fn tick_viewmodel(
     vm: &mut Viewmodel,
     vm_tf: &mut Transform,
@@ -930,12 +966,47 @@ pub fn tick_viewmodel(
     dt: f32,
 ) {
     vm.recoil = (vm.recoil - dt * 10.0).max(0.0);
+    vm.melee_t = (vm.melee_t - dt).max(0.0);
     vm.flash_age += dt;
 
     // Recoil: kick back (+Z toward camera) and up slightly.
     let kick = vm.recoil;
-    vm_tf.translation = vm.rest_translation + Vec3::new(0.0, kick * 0.04, kick * 0.08);
-    vm_tf.rotation = Quat::from_euler(EulerRot::YXZ, 0.05, -kick * 0.12, kick * 0.04);
+    let mut offset = Vec3::new(0.0, kick * 0.04, kick * 0.08);
+    let mut yaw = 0.05_f32;
+    let mut pitch = -kick * 0.12;
+    let mut roll = kick * 0.04;
+
+    // Melee: 0.3 s forward lunge + rotate, then settle.
+    if vm.melee_t > 0.0 {
+        let u = 1.0 - (vm.melee_t / MELEE_ANIM_S); // 0 → 1
+        // Ease out: peak jab around mid, settle at end.
+        let jab = if u < 0.45 {
+            (u / 0.45).sin() // 0 → 1
+        } else {
+            ((1.0 - u) / 0.55).clamp(0.0, 1.0).sin() // 1 → 0
+        };
+        offset += Vec3::new(0.02 * jab, -0.01 * jab, -0.14 * jab); // lunge forward (−Z)
+        yaw += 0.35 * jab;
+        pitch += 0.25 * jab;
+        roll -= 0.4 * jab;
+    }
+
+    // Reload: two-phase dip/rise spanning reload_ticks_left / reload_total.
+    if vm.reload_left > 0 && vm.reload_total > 0 {
+        let progress = 1.0 - (vm.reload_left as f32 / vm.reload_total as f32);
+        // Phase 1 (0..0.5): dip down; phase 2 (0.5..1): rise.
+        let dip = if progress < 0.5 {
+            (progress / 0.5).sin() // 0 → 1
+        } else {
+            ((1.0 - progress) / 0.5).sin() // 1 → 0
+        };
+        offset += Vec3::new(0.0, -0.12 * dip, 0.04 * dip);
+        pitch += 0.35 * dip;
+        roll += 0.15 * dip;
+    }
+
+    vm_tf.translation = vm.rest_translation + offset;
+    vm_tf.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll);
 
     const FLASH_LIFE: f32 = 0.06;
     let flashing = vm.flash_age < FLASH_LIFE;

@@ -50,8 +50,19 @@ pub const GUN_DAMAGE: f32 = 34.0; // 3 body shots for a walker
 pub const FIRE_COOLDOWN_TICKS: u32 = 5; // ≈180 ms at 30 TPS (tick-counted, not wall clock)
 pub const MAG_SIZE: u8 = 12;
 pub const START_RESERVE_AMMO: u8 = 48;
-pub const RELOAD_TICKS: u32 = 42; // 1.4 s
+/// Manual / auto-reload duration (~1.5 s at 30 TPS).
+pub const RELOAD_TICKS: u32 = 45;
 pub const SHOT_RANGE: f32 = 90.0;
+
+// ── melee ──────────────────────────────────────────────────────────────────
+/// Horizontal reach for rifle-butt melee (metres).
+pub const MELEE_RANGE: f32 = 2.2;
+/// Half-angle of the forward melee cone (radians, ≈51.5°).
+pub const MELEE_HALF_ANGLE_RAD: f32 = 0.9;
+/// Damage per swing. Walker health is 100 → dies in exactly 2 hits.
+pub const MELEE_DAMAGE: u8 = 50;
+/// Cooldown between melee swings (~0.7 s at 30 TPS).
+pub const MELEE_COOLDOWN_TICKS: u32 = 21;
 
 // ── grenades ───────────────────────────────────────────────────────────────
 pub const START_GRENADES: u8 = 2;

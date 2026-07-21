@@ -16,7 +16,12 @@ pub const BIN_SNAPSHOT: u8 = 1;
 pub const BIN_VOICE: u8 = 2;
 
 /// Length of a `BIN_INPUT` frame in bytes.
-pub const INPUT_FRAME_LEN: usize = 14;
+///
+/// Layout (M21+): `[0]=tag`, `[1..5]=seq u32 LE`, `[5]=buttons`, `[6]=flags2`
+/// (bit0 melee, bit1 reload; bits 2–7 reserved 0), `[7..11]=yaw f32 LE`,
+/// `[11..15]=pitch f32 LE`. Pre-M21 14-byte frames decode to `None` — acceptable
+/// pre-release (no wire-compat commitment yet).
+pub const INPUT_FRAME_LEN: usize = 15;
 
 /// Max PCM payload for a `BIN_VOICE` frame: 16 kHz × 0.120 s × 2 bytes/sample.
 pub const MAX_VOICE_PAYLOAD: usize = 3840;
@@ -156,20 +161,38 @@ fn unpack_buttons(b: u8) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
     )
 }
 
-/// Encode a `PlayerInput` as the 14-byte `BIN_INPUT` frame:
+/// Second flags byte: bit0 melee, bit1 reload; bits 2–7 reserved zero.
+fn pack_flags2(input: &PlayerInput) -> u8 {
+    let mut b = 0u8;
+    if input.melee {
+        b |= 1 << 0;
+    }
+    if input.reload {
+        b |= 1 << 1;
+    }
+    b
+}
+
+fn unpack_flags2(b: u8) -> (bool, bool) {
+    ((b & (1 << 0)) != 0, (b & (1 << 1)) != 0)
+}
+
+/// Encode a `PlayerInput` as the 15-byte `BIN_INPUT` frame:
 /// `[0]=BIN_INPUT` tag, `[1..5]=seq u32 LE`, `[5]=buttons bitfield`,
-/// `[6..10]=yaw f32 LE`, `[10..14]=pitch f32 LE`.
+/// `[6]=flags2 (melee|reload)`, `[7..11]=yaw f32 LE`, `[11..15]=pitch f32 LE`.
 pub fn encode_input(input: &PlayerInput) -> [u8; INPUT_FRAME_LEN] {
     let mut frame = [0u8; INPUT_FRAME_LEN];
     frame[0] = BIN_INPUT;
     frame[1..5].copy_from_slice(&input.seq.to_le_bytes());
     frame[5] = pack_buttons(input);
-    frame[6..10].copy_from_slice(&input.yaw.to_le_bytes());
-    frame[10..14].copy_from_slice(&input.pitch.to_le_bytes());
+    frame[6] = pack_flags2(input);
+    frame[7..11].copy_from_slice(&input.yaw.to_le_bytes());
+    frame[11..15].copy_from_slice(&input.pitch.to_le_bytes());
     frame
 }
 
 /// Decode a `BIN_INPUT` frame. `None` on wrong length or wrong tag. Never panics.
+/// Pre-M21 14-byte frames are rejected (length mismatch).
 pub fn decode_input(frame: &[u8]) -> Option<PlayerInput> {
     if frame.len() != INPUT_FRAME_LEN {
         return None;
@@ -179,8 +202,9 @@ pub fn decode_input(frame: &[u8]) -> Option<PlayerInput> {
     }
     let seq = u32::from_le_bytes(frame[1..5].try_into().ok()?);
     let (forward, backward, left, right, jump, fire, grenade, interact) = unpack_buttons(frame[5]);
-    let yaw = f32::from_le_bytes(frame[6..10].try_into().ok()?);
-    let pitch = f32::from_le_bytes(frame[10..14].try_into().ok()?);
+    let (melee, reload) = unpack_flags2(frame[6]);
+    let yaw = f32::from_le_bytes(frame[7..11].try_into().ok()?);
+    let pitch = f32::from_le_bytes(frame[11..15].try_into().ok()?);
     Some(PlayerInput {
         seq,
         forward,
@@ -191,6 +215,8 @@ pub fn decode_input(frame: &[u8]) -> Option<PlayerInput> {
         fire,
         grenade,
         interact,
+        melee,
+        reload,
         yaw,
         pitch,
     })
@@ -370,10 +396,13 @@ mod tests {
             fire: false,
             grenade: false,
             interact: false,
+            melee: false,
+            reload: false,
             yaw: 0.0,
             pitch: 0.0,
         };
         assert_eq!(decode_input(&encode_input(&all_false)), Some(all_false));
+        assert_eq!(encode_input(&all_false).len(), INPUT_FRAME_LEN);
 
         let all_true = PlayerInput {
             seq: 1,
@@ -385,10 +414,16 @@ mod tests {
             fire: true,
             grenade: true,
             interact: true,
+            melee: true,
+            reload: true,
             yaw: 1.5,
             pitch: -0.25,
         };
-        assert_eq!(decode_input(&encode_input(&all_true)), Some(all_true));
+        let enc = encode_input(&all_true);
+        assert_eq!(enc.len(), 15);
+        assert_eq!(enc[6] & 0b11, 0b11, "melee|reload bits set");
+        assert_eq!(enc[6] & !0b11, 0, "reserved flags2 bits zero");
+        assert_eq!(decode_input(&enc), Some(all_true));
 
         let mixed = PlayerInput {
             seq: u32::MAX,
@@ -400,17 +435,30 @@ mod tests {
             fire: true,
             grenade: false,
             interact: true,
+            melee: true,
+            reload: false,
             yaw: -3.1,
             pitch: 0.77,
         };
         assert_eq!(decode_input(&encode_input(&mixed)), Some(mixed));
+
+        let only_reload = PlayerInput {
+            seq: 9,
+            reload: true,
+            yaw: 0.5,
+            ..Default::default()
+        };
+        let back = decode_input(&encode_input(&only_reload)).unwrap();
+        assert!(back.reload && !back.melee);
     }
 
     #[test]
     fn decode_input_rejects_bad_frames() {
         assert_eq!(decode_input(&[]), None);
         assert_eq!(decode_input(&[0u8; 13]), None);
-        assert_eq!(decode_input(&[0u8; 15]), None);
+        // Pre-M21 14-byte frames are no longer accepted.
+        assert_eq!(decode_input(&[0u8; 14]), None);
+        assert_eq!(decode_input(&[0u8; 16]), None);
 
         let mut good = encode_input(&PlayerInput::default());
         good[0] = BIN_SNAPSHOT; // wrong tag

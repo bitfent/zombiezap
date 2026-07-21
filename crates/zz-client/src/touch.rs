@@ -48,6 +48,12 @@ pub const STICK_ANCHOR: (f32, f32) = (0.18, 0.72);
 pub const FIRE_INSET: (f32, f32) = (56.0, 72.0);
 pub const JUMP_INSET: (f32, f32) = (168.0, 150.0);
 pub const GRENADE_INSET: (f32, f32) = (168.0, 72.0);
+/// MELEE in the bottom-right cluster (does not overlap FIRE/JUMP/NADE).
+/// Centre at 1280×720: (1280-250, 720-150) = (1030, 570).
+pub const MELEE_INSET: (f32, f32) = (250.0, 150.0);
+/// RELOAD chip near the ammo counter (bottom-right HUD), not the fire cluster.
+/// Centre at 1280×720: (1280-100, 720-220) = (1180, 500).
+pub const RELOAD_INSET: (f32, f32) = (100.0, 220.0);
 
 // ── public intent ──────────────────────────────────────────────────────────
 
@@ -64,6 +70,8 @@ pub struct TouchIntent {
     pub jump: bool,
     pub fire: bool,
     pub grenade: bool,
+    pub melee: bool,
+    pub reload: bool,
     /// Radians added to yaw/pitch this frame (already scaled; do not × dt).
     pub aim_yaw: f32,
     pub aim_pitch: f32,
@@ -146,6 +154,8 @@ enum TouchBtn {
     Fire,
     Jump,
     Grenade,
+    Melee,
+    Reload,
 }
 
 // ── pure logic (unit-tested) ───────────────────────────────────────────────
@@ -263,6 +273,26 @@ fn setup_touch_ui(mut commands: Commands, intent: Res<TouchIntent>) {
         Color::srgba(0.18, 0.22, 0.10, 0.55),
         Color::srgba(0.55, 0.85, 0.30, 0.95),
         GRENADE_INSET,
+        root_vis,
+    );
+    spawn_btn(
+        &mut commands,
+        TouchBtn::Melee,
+        "MELEE",
+        SIDE_BTN.max(BTN_MIN),
+        Color::srgba(0.28, 0.14, 0.10, 0.55),
+        Color::srgba(0.95, 0.55, 0.30, 0.95),
+        MELEE_INSET,
+        root_vis,
+    );
+    spawn_btn(
+        &mut commands,
+        TouchBtn::Reload,
+        "RELOAD",
+        SIDE_BTN.max(BTN_MIN),
+        Color::srgba(0.12, 0.16, 0.28, 0.55),
+        Color::srgba(0.45, 0.75, 0.95, 0.95),
+        RELOAD_INSET,
         root_vis,
     );
 }
@@ -398,6 +428,8 @@ fn process_pointers(
                 TouchBtn::Fire => (FIRE_INSET.0, FIRE_INSET.1, FIRE_SIZE),
                 TouchBtn::Jump => (JUMP_INSET.0, JUMP_INSET.1, SIDE_BTN.max(BTN_MIN)),
                 TouchBtn::Grenade => (GRENADE_INSET.0, GRENADE_INSET.1, SIDE_BTN.max(BTN_MIN)),
+                TouchBtn::Melee => (MELEE_INSET.0, MELEE_INSET.1, SIDE_BTN.max(BTN_MIN)),
+                TouchBtn::Reload => (RELOAD_INSET.0, RELOAD_INSET.1, SIDE_BTN.max(BTN_MIN)),
             };
             let centre = Vec2::new(win.x - inset_r, win.y - inset_b);
             if (pos - centre).length() <= size * 0.55 {
@@ -578,12 +610,16 @@ fn sample_buttons(
     intent.fire = false;
     intent.jump = false;
     intent.grenade = false;
+    intent.melee = false;
+    intent.reload = false;
     for (kind, interaction) in &q {
         if *interaction == Interaction::Pressed {
             match kind {
                 TouchBtn::Fire => intent.fire = true,
                 TouchBtn::Jump => intent.jump = true,
                 TouchBtn::Grenade => intent.grenade = true,
+                TouchBtn::Melee => intent.melee = true,
+                TouchBtn::Reload => intent.reload = true,
             }
         }
     }

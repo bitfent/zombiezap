@@ -227,7 +227,9 @@ fn setup_ui(mut commands: Commands) {
     ));
 
     commands.spawn((
-        Text::new("Click to lock cursor · WASD move · Shift sprint · Esc release"),
+        Text::new(
+            "Click to lock · WASD move · LMB fire · R reload · F melee · G nade · Esc release",
+        ),
         TextFont {
             font_size: FontSize::Px(14.0),
             ..default()

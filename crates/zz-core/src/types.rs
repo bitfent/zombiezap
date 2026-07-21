@@ -69,6 +69,10 @@ pub struct PlayerInput {
     pub fire: bool,
     pub grenade: bool,
     pub interact: bool,
+    /// Rifle-butt melee swing (edge-triggered on the server).
+    pub melee: bool,
+    /// Manual reload (edge-triggered; also auto-started by fire on empty mag).
+    pub reload: bool,
     pub yaw: f32,
     pub pitch: f32,
 }

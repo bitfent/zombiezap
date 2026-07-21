@@ -93,6 +93,14 @@ pub enum Sfx {
     Pickup,
     TeamWipe,
     Click,
+    /// Dry-fire click (empty mag, no reserve / blocked fire).
+    DryClick,
+    /// Melee swing whoosh.
+    MeleeSwing,
+    /// Melee impact thunk.
+    MeleeHit,
+    /// Reload clack (start or end of the two-click cycle).
+    ReloadClack,
     /// Proximity zombie growl; volume already distance-scaled by game.rs.
     Growl { volume: f32 },
 }

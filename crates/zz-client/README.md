@@ -371,10 +371,13 @@ buttons use fixed insets from the bottom-right:
 | FIRE    | `(W - 56, H - 72)` — hold to shoot |
 | JUMP    | `(W - 168, H - 150)` |
 | NADE    | `(W - 168, H - 72)` |
+| MELEE   | `(W - 250, H - 150)` — ≥ 64 px, clear of FIRE/JUMP/NADE |
+| RELOAD  | `(W - 100, H - 220)` — near ammo counter |
 
 On a 1280×720 pane: stick **(230, 518)**, FIRE **(1224, 648)**, JUMP
-**(1112, 570)**, NADE **(1112, 648)**. Aim: press-drag on the right half
-(e.g. start at `(900, 360)`, drag horizontally).
+**(1112, 570)**, NADE **(1112, 648)**, MELEE **(1030, 570)**, RELOAD
+**(1180, 500)**. Aim: press-drag on the right half (e.g. start at
+`(900, 360)`, drag horizontally).
 
 42. **Rome EUR client (M11b / R2b):** `env_lighting(EnvKind::RomeEur)` is warm
     Mediterranean late-afternoon — sky `srgb_u8(168,196,230)`, golden sun

@@ -17,6 +17,7 @@ fn player(slot: u8) -> WirePlayer {
         kills: 0,
         alive: true,
         last_acked_seq: 0,
+        reload_ticks_left: 0,
     }
 }
 
@@ -253,4 +254,31 @@ fn quantization_helpers_round_trip_within_precision() {
         let diff = (back - yaw.rem_euclid(core::f32::consts::TAU)).abs();
         assert!(diff < 1e-3, "yaw {yaw} → {back}");
     }
+}
+
+#[test]
+fn reload_ticks_left_keyframe_and_delta() {
+    let mut enc = SnapshotEncoder::new();
+    let mut dec = SnapshotDecoder::new();
+    let mut snap = base_snapshot();
+    snap.players[0].reload_ticks_left = 0;
+    let out = dec.decode(&enc.encode(&snap, true)).unwrap();
+    assert_eq!(out.players[0].reload_ticks_left, 0);
+
+    snap.tick += 1;
+    snap.players[0].reload_ticks_left = 45;
+    let out = dec.decode(&enc.encode(&snap, true)).unwrap();
+    assert_eq!(out.players[0].reload_ticks_left, 45);
+    assert_eq!(out.players, snap.players);
+
+    snap.tick += 1;
+    snap.players[0].reload_ticks_left = 30;
+    let out = dec.decode(&enc.encode(&snap, true)).unwrap();
+    assert_eq!(out.players[0].reload_ticks_left, 30);
+
+    snap.tick += 1;
+    snap.players[0].reload_ticks_left = 0;
+    let out = dec.decode(&enc.encode(&snap, true)).unwrap();
+    assert_eq!(out.players[0].reload_ticks_left, 0);
+    assert_eq!(out.players, snap.players);
 }

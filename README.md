@@ -48,9 +48,9 @@ the process cwd). Missing dist does not crash the server — only static routes
 404; `/healthz` and `/ws` still work.
 
 **Desktop controls:** WASD move · mouse aim (click to lock) · LMB fire ·
-Space jump · G grenade · P pause · Esc release cursor.
+Space jump · R reload · F melee · G grenade · P pause · Esc release cursor.
 **Mobile:** left half of the screen is a virtual stick, right half drags your
-aim; FIRE / JUMP / GRENADE buttons on screen.
+aim; FIRE / JUMP / GRENADE / MELEE / RELOAD buttons on screen.
 
 ## The game
 
