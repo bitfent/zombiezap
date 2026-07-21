@@ -782,7 +782,43 @@ pub fn tick_crumple(fx: &mut CrumpleFx, body_tf: &mut Transform, dt: f32) -> boo
 // ── first-person viewmodel ─────────────────────────────────────────────────
 
 /// Local camera-space rest pose: bottom-right boxy rifle.
-const VM_REST: Vec3 = Vec3::new(0.28, -0.28, -0.55);
+pub const VM_REST: Vec3 = Vec3::new(0.28, -0.28, -0.55);
+
+/// Small rest yaw on the viewmodel root (matches spawn).
+pub const VM_REST_YAW: f32 = 0.05;
+
+/// Muzzle tip in viewmodel-local space — barrel end / flash quad translation.
+///
+/// Barrel cuboid centre z=-0.48, half-depth 0.19 → tip ≈ z=-0.67; flash sits
+/// just past the tip at z=-0.72 so tracers and the flash share one origin.
+pub const VIEWMODEL_MUZZLE_LOCAL: Vec3 = Vec3::new(0.0, 0.02, -0.72);
+
+/// Legacy remote-player muzzle drop below eye (metres) when the TP rig has no
+/// carried gun — matches ShotAnte `addTracer` `from.y - 0.12`.
+pub const REMOTE_MUZZLE_DROP: f32 = 0.12;
+
+/// Camera-space offset of the muzzle tip at rest (no recoil kick).
+///
+/// Viewmodel is a camera child: `VM_REST` + rest-yaw × local muzzle tip.
+pub fn viewmodel_muzzle_camera_offset() -> Vec3 {
+    let rest_rot = Quat::from_rotation_y(VM_REST_YAW);
+    VM_REST + rest_rot * VIEWMODEL_MUZZLE_LOCAL
+}
+
+/// World-space muzzle tip from a camera world transform and a camera-space
+/// muzzle offset (from [`viewmodel_muzzle_camera_offset`]).
+///
+/// Pure: identity camera → offset as-is; rotated camera → offset spun with
+/// the camera. Visual origin only — server hitscan stays eye-based.
+pub fn muzzle_world_from_camera(camera: &Transform, camera_space_muzzle: Vec3) -> Vec3 {
+    camera.translation + camera.rotation * camera_space_muzzle
+}
+
+/// World-space origin for a remote player's tracer when the survivor rig does
+/// not carry a gun: feet + (eye height − [`REMOTE_MUZZLE_DROP`]).
+pub fn remote_muzzle_from_feet(feet: Vec3, eye_height: f32) -> Vec3 {
+    feet + Vec3::Y * (eye_height - REMOTE_MUZZLE_DROP)
+}
 
 /// Spawn the rifle as a child of the camera entity. Returns the viewmodel entity.
 pub fn spawn_viewmodel(
@@ -809,7 +845,8 @@ pub fn spawn_viewmodel(
 
     let vm = commands
         .spawn((
-            Transform::from_translation(VM_REST).with_rotation(Quat::from_rotation_y(0.05)),
+            Transform::from_translation(VM_REST)
+                .with_rotation(Quat::from_rotation_y(VM_REST_YAW)),
             Visibility::default(),
             ChildOf(camera),
         ))
@@ -854,12 +891,12 @@ pub fn spawn_viewmodel(
                 Vec3::new(0.0, 0.07, -0.55),
                 Vec3::new(0.02, 0.05, 0.02),
             );
-            // Muzzle flash (emissive cuboid; visibility + alpha driven per shot)
+            // Muzzle flash at the barrel tip (same local as VIEWMODEL_MUZZLE_LOCAL)
             flash_entity = c
                 .spawn((
                     Mesh3d(cube),
                     MeshMaterial3d(flash_mat),
-                    Transform::from_translation(Vec3::new(0.0, 0.02, -0.72))
+                    Transform::from_translation(VIEWMODEL_MUZZLE_LOCAL)
                         .with_scale(Vec3::new(0.12, 0.12, 0.04)),
                     Visibility::Hidden,
                 ))
@@ -970,6 +1007,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn muzzle_world_identity_camera() {
+        let offset = viewmodel_muzzle_camera_offset();
+        let cam = Transform::IDENTITY;
+        let world = muzzle_world_from_camera(&cam, offset);
+        assert!(
+            (world - offset).length() < 1e-5,
+            "identity camera must leave camera-space muzzle as world: got {world:?} expected {offset:?}"
+        );
+        // Offset must sit bottom-right-forward of the eye (camera origin).
+        assert!(offset.x > 0.2, "muzzle right of eye, x={}", offset.x);
+        assert!(offset.y < -0.15, "muzzle below eye, y={}", offset.y);
+        assert!(offset.z < -1.0, "muzzle forward of eye, z={}", offset.z);
+        // Flash / tip local matches exported constant.
+        assert_eq!(VIEWMODEL_MUZZLE_LOCAL, Vec3::new(0.0, 0.02, -0.72));
+    }
+
+    #[test]
+    fn muzzle_world_rotated_camera() {
+        let offset = viewmodel_muzzle_camera_offset();
+        // +90° yaw (CCW about Y): camera forward (−Z) maps to world −X.
+        let cam = Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2))
+            .with_translation(Vec3::new(10.0, 2.0, -5.0));
+        let world = muzzle_world_from_camera(&cam, offset);
+        let expected = cam.translation + cam.rotation * offset;
+        assert!(
+            (world - expected).length() < 1e-5,
+            "rotated: got {world:?} expected {expected:?}"
+        );
+        // Forward (−Z cam) contributes to world −X after +90° yaw.
+        assert!(
+            world.x < cam.translation.x,
+            "after +90° yaw muzzle (forward of eye) should sit at smaller world X: {world:?}"
+        );
+        // Y is unchanged by pure yaw (offset.y stays below eye).
+        assert!(
+            (world.y - (cam.translation.y + offset.y)).abs() < 1e-4,
+            "yaw must not tilt the vertical muzzle offset"
+        );
+    }
+
+    #[test]
+    fn remote_muzzle_drops_below_eye() {
+        let feet = Vec3::new(1.0, 0.0, 3.0);
+        let eye_h = 1.6;
+        let m = remote_muzzle_from_feet(feet, eye_h);
+        assert!((m.x - 1.0).abs() < 1e-6);
+        assert!((m.z - 3.0).abs() < 1e-6);
+        assert!((m.y - (eye_h - REMOTE_MUZZLE_DROP)).abs() < 1e-6);
     }
 
     #[test]

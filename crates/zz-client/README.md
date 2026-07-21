@@ -317,6 +317,15 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     `FxQueue` for tracers without racing the viewmodel. Muzzle-flash uses a
     unique `StandardMaterial` handle (item 23) with alpha + visibility fade.
 
+38b. **Muzzle visual origin (M17):** own tracers start at the viewmodel muzzle
+    tip (`models::VIEWMODEL_MUZZLE_LOCAL` on the rifle child — same point as
+    the flash quad), transformed with `muzzle_world_from_camera` +
+    `viewmodel_muzzle_camera_offset` (rest pose under the camera). Remote
+    shots use `remote_muzzle_from_feet` (eye − 0.12 m, ShotAnte legacy) until
+    the TP rig carries a gun. Impact sparks spawn at the shot endpoint with a
+    unique material per spawn (note 23) and ~0.2 s TTL. Server hitscan stays
+    eye-based — this is cosmetic only.
+
 39. **Touch mode (M10):** `platform::is_touch_mode()` — wasm uses
     `navigator.maxTouchPoints` with `?touch=1` / `?touch=0` override; native
     uses `ZZ_TOUCH=1`. `touch::TouchPlugin` draws stick + FIRE/JUMP/NADE on
