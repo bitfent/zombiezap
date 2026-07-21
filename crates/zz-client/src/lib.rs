@@ -22,6 +22,7 @@ use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{
     camera::RenderTarget,
+    core_pipeline::tonemapping::Tonemapping,
     diagnostic::{Diagnostic, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     input::mouse::AccumulatedMouseMotion,
     pbr::{DistanceFog, FogFalloff},
@@ -30,6 +31,14 @@ use bevy::{
     text::FontSize,
     window::{CursorGrabMode, CursorOptions, WindowResolution},
 };
+
+/// LUT-free tonemap for the 3D camera (and present camera).
+///
+/// Bevy's default `TonyMcMapface` needs `tonemapping_luts` + ktx2 + zstd, which
+/// cost multi-MB of ship wasm. `SomewhatBoringDisplayTransform` is the same
+/// author's non-LUT cousin — neutral, mild hue shift in brights, closest
+/// match to Tony without the LUT stack (see crates/zz-client/README.md).
+const SHIP_TONEMAPPING: Tonemapping = Tonemapping::SomewhatBoringDisplayTransform;
 
 /// Marker for the fly camera entity.
 #[derive(Component)]
@@ -184,6 +193,8 @@ fn setup_scene(
             clear_color: ClearColorConfig::Custom(Color::srgb_u8(20, 24, 32)),
             ..default()
         },
+        // Override Camera3d's required default (TonyMcMapface / LUT-backed).
+        SHIP_TONEMAPPING,
         RenderTarget::Image(retro_target.image.clone().into()),
         Msaa::Off,
         DistanceFog {

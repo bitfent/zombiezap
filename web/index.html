@@ -50,7 +50,9 @@
       Release: Trunk.toml cargo_profile = "wasm-release" on --release.
       data-wasm-opt="z" → binaryen -Oz. Rust ≥1.82 emits bulk-memory /
       nontrapping-fptoint; wasm-opt needs those features enabled.
-      Use data-wasm-opt="0" for faster local iteration without binaryen.
+      --strip-debug / --strip-producers: drop residual name/producers sections
+      after rustc strip (small but free). Use data-wasm-opt="0" for faster
+      local iteration without binaryen.
     -->
     <link
       data-trunk
@@ -58,7 +60,7 @@
       href="../crates/zz-client/Cargo.toml"
       data-bin="zz-client"
       data-wasm-opt="z"
-      data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"
+      data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --strip-debug --strip-producers"
     />
   </head>
   <body>

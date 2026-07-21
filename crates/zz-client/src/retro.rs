@@ -12,12 +12,16 @@
 //!   every HUD layer (negative [`GlobalZIndex`]), letterboxed to 16:9.
 
 use bevy::{
+    core_pipeline::tonemapping::Tonemapping,
     image::{Image, ImageSampler},
     prelude::*,
     render::render_resource::TextureFormat,
     ui::FocusPolicy,
 };
 use bevy_egui::{EguiGlobalSettings, PrimaryEguiContext};
+
+/// Same LUT-free mode as the 3D camera (see `lib.rs` / ship size diet).
+const SHIP_TONEMAPPING: Tonemapping = Tonemapping::SomewhatBoringDisplayTransform;
 
 /// Internal 3D resolution. 480x270 reads as deliberate chunky pixels and is
 /// the mobile perf lever; 640x360 is the tuning alternative if it turns out
@@ -79,6 +83,8 @@ fn setup_present(mut commands: Commands, target: Res<RetroTarget>) {
             clear_color: ClearColorConfig::Custom(BAR_COLOR),
             ..default()
         },
+        // Explicit LUT-free tonemap so default TonyMcMapface never pulls LUTs.
+        SHIP_TONEMAPPING,
         IsDefaultUiCamera,
         PrimaryEguiContext,
         Name::new("PresentCamera"),
