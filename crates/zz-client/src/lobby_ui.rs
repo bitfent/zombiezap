@@ -9,6 +9,7 @@ use bevy_egui::{
 };
 use zz_core::types::EnvKind;
 
+use crate::egui_click_latch::EguiClickLatchPlugin;
 use crate::game::Session;
 use crate::platform;
 use crate::seams::{
@@ -49,6 +50,10 @@ impl Plugin for LobbyUiPlugin {
     fn build(&self, app: &mut App) {
         if !app.is_plugin_added::<EguiPlugin>() {
             app.add_plugins(EguiPlugin::default());
+        }
+        // M23: same-frame press+release must never drop menu clicks.
+        if !app.is_plugin_added::<EguiClickLatchPlugin>() {
+            app.add_plugins(EguiClickLatchPlugin);
         }
         app.init_resource::<LobbyDraft>()
             // HtmlBoot is inserted by GamePlugin (shared with headless tests).

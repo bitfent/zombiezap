@@ -6,6 +6,7 @@
 //! Browser: `cd web && trunk serve` (see README).
 
 pub mod audio;
+pub mod egui_click_latch;
 pub mod game;
 pub mod hud;
 pub mod lobby_ui;
