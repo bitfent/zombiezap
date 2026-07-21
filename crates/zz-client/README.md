@@ -288,6 +288,12 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     `get_shader_compile_status` only; no feature flag) — unblock is
     staggered pipeline warmup (camera-only Startup, skeleton cubes over
     frames 2–8, match FX/rigs during menu).
+    **M19b:** never use `std::time::Instant` on wasm32-unknown-unknown in
+    the boot path — it panics ("time not implemented") and with
+    `panic=abort` + fat LTO the engine is DCE'd (~5.8 MB ship wasm, no
+    `[zz boot]` line). Use `platform::BootStamp`. Ship canaries in
+    `scripts/ship-web.sh` (size ≥ 15 MB, `zz-boot-entry-v1`,
+    `__wbindgen_start`).
 
 33. **`data-wasm-opt="z"` needs binaryen (`wasm-opt`) on PATH.** Without it,
     Trunk fails the release link step — install via package manager or

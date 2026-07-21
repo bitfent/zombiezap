@@ -4,6 +4,72 @@
 //! game.rs / lobby_ui / touch call these only — no `cfg` elsewhere for these
 //! concerns.
 
+// ── Boot wall-clock (wasm-safe) ─────────────────────────────────────────────
+//
+// CRITICAL: never use `std::time::Instant` on `wasm32-unknown-unknown`.
+// Instant::now panics with "time not implemented on this platform". With the
+// ship profile (`panic = "abort"` + fat LTO) that makes everything after the
+// call *unreachable*, so rustc dead-code-eliminates the entire Bevy app
+// (M19 → M19b: ship wasm collapsed ~23 MB → ~5.8 MB with an empty engine).
+
+/// Link/canary string kept live whenever [`crate::run`] is reachable.
+/// `scripts/ship-web.sh` greps the ship wasm for this exact marker.
+pub const BOOT_ENTRY_CANARY: &str = "zz-boot-entry-v1";
+
+/// Monotonic-ish stamp for boot phase telemetry (native Instant / wasm Date).
+#[derive(Clone, Copy, Debug)]
+pub struct BootStamp {
+    #[cfg(not(target_arch = "wasm32"))]
+    t0: std::time::Instant,
+    #[cfg(target_arch = "wasm32")]
+    t0_ms: f64,
+}
+
+impl BootStamp {
+    #[inline]
+    pub fn now() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self {
+                t0: std::time::Instant::now(),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self {
+                t0_ms: wasm_boot_now_ms(),
+            }
+        }
+    }
+
+    /// Milliseconds since this stamp (saturating, clamped to u32::MAX).
+    #[inline]
+    pub fn elapsed_ms(self) -> u32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.t0.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let dt = wasm_boot_now_ms() - self.t0_ms;
+            if dt <= 0.0 {
+                0
+            } else if dt >= f64::from(u32::MAX) {
+                u32::MAX
+            } else {
+                dt as u32
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_boot_now_ms() -> f64 {
+    // Date.now is available without extra web-sys features; resolution is
+    // enough for boot phase lines (ms). Prefer it over Instant (unsupported).
+    js_sys::Date::now()
+}
+
 /// WebSocket URL for the game server.
 ///
 /// * Native: `ZZ_SERVER` env, else `ws://127.0.0.1:8080/ws`.
@@ -758,4 +824,24 @@ fn wasm_voice_drain_frames() -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_entry_canary_matches_ship_script() {
+        // scripts/ship-web.sh greps the ship wasm for this exact string.
+        assert_eq!(BOOT_ENTRY_CANARY, "zz-boot-entry-v1");
+        assert!(!BOOT_ENTRY_CANARY.is_empty());
+    }
+
+    #[test]
+    fn boot_stamp_elapsed_is_sane() {
+        let t0 = BootStamp::now();
+        let ms = t0.elapsed_ms();
+        // Should not jump to u32::MAX on a fresh stamp.
+        assert!(ms < 60_000, "elapsed_ms={ms} unreasonably large for fresh stamp");
+    }
 }

@@ -56,7 +56,13 @@ const MOVE_SPEED: f32 = 12.0;
 const SPRINT_MULT: f32 = 2.5;
 
 pub fn run() {
-    let boot_t0 = std::time::Instant::now();
+    // Keep the canary string live in any binary that links `run` (ship-web
+    // greps for it). Must run *before* any work that could diverge.
+    core::hint::black_box(platform::BOOT_ENTRY_CANARY);
+
+    // Wasm-safe stamp — NEVER Instant::now on wasm32-unknown-unknown (see
+    // platform::BootStamp). M19 used Instant and LTO erased the engine.
+    let boot_t0 = platform::BootStamp::now();
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
@@ -109,10 +115,10 @@ pub fn run() {
         .run();
 }
 
-/// Wall clock from `run()` for boot phase telemetry.
+/// Wall clock from `run()` for boot phase telemetry (wasm-safe BootStamp).
 #[derive(Resource)]
 struct BootClock {
-    t0: std::time::Instant,
+    t0: platform::BootStamp,
     first_frame_logged: bool,
 }
 
@@ -134,7 +140,7 @@ fn mark_engine_ready_first_frame(
     }
     clock.first_frame_logged = true;
     boot.engine_ready = true;
-    let ms = clock.t0.elapsed().as_millis() as u32;
+    let ms = clock.t0.elapsed_ms();
     platform::boot_record_phase("first_frame_ms", ms);
     // startup_ms ≈ time from wasm init done to first frame; JS already has
     // instantiate split — we report Bevy side as first_frame from run().
@@ -434,4 +440,21 @@ fn update_fps(
         **text = label.clone();
     }
     window.title = format!("ZombieZap — {fps:.0} FPS");
+}
+
+#[cfg(test)]
+mod boot_entry_tests {
+    /// Native stand-in for "boot entry is referenced": `run` must stay a
+    /// public fn item the bin (and wasm start) can call. Ship canaries in
+    /// `scripts/ship-web.sh` catch the wasm-only DCE case.
+    #[test]
+    fn run_entry_is_addressable() {
+        let entry: fn() = crate::run;
+        let canary = crate::platform::BOOT_ENTRY_CANARY;
+        // Touch both so neither is considered write-only in test builds.
+        assert_eq!(core::mem::size_of_val(&entry), core::mem::size_of::<fn()>());
+        assert!(canary.starts_with("zz-boot-entry-"));
+        core::hint::black_box(entry);
+        core::hint::black_box(canary);
+    }
 }
