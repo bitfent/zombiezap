@@ -16,6 +16,9 @@ use zz_core::constants::{MAX_HEALTH, PLAYER_EYE};
 use zz_core::snapshot::{Snapshot, WireLoot, WirePlayer, dequant_pos};
 
 use crate::game::{self, Predicted, Session};
+use crate::models::{
+    muzzle_world_from_camera, remote_muzzle_from_feet, viewmodel_muzzle_camera_offset,
+};
 use crate::seams::{FxQueue, LastStats, LatestSnapshot, Roster, UiIntent, UiQueue, VisualEvent};
 use crate::touch::TouchIntent;
 use crate::voice::VoiceState;
@@ -30,14 +33,12 @@ const VIGNETTE_DECAY_S: f32 = 0.28;
 /// Edge strip thickness as a fraction of the short viewport axis.
 const VIGNETTE_EDGE_FRAC: f32 = 0.14;
 const TRACER_LIFE_S: f32 = 0.080;
-const SPARK_LIFE_S: f32 = 0.150;
+/// Impact spark lifetime — legacy ShotAnte spark ttl ≈ 0.2 s.
+const SPARK_LIFE_S: f32 = 0.200;
 const BOOM_LIFE_S: f32 = 0.350;
 const BOOM_R0: f32 = 0.5;
 const BOOM_R1: f32 = 4.0;
 const EYE: f32 = PLAYER_EYE;
-/// Slight right+down offset from eye for own muzzle (metres, view space).
-const MUZZLE_RIGHT: f32 = 0.18;
-const MUZZLE_DOWN: f32 = 0.08;
 const HEALTH_BAR_W: f32 = 200.0;
 const HEALTH_BAR_H: f32 = 14.0;
 const TEAMMATE_BAR_W: f32 = 120.0;
@@ -105,7 +106,9 @@ struct HudLocal {
 struct FxAssets {
     unit_cube: Handle<Mesh>,
     unit_sphere: Handle<Mesh>,
-    spark_mat: Handle<StandardMaterial>,
+    /// Template colour for impact sparks — each spawn clones a unique handle
+    /// (README note 23) so concurrent sparks can fade independently.
+    spark_color: Color,
     loot_ammo: Handle<StandardMaterial>,
     loot_health: Handle<StandardMaterial>,
     loot_health_band: Handle<StandardMaterial>,
@@ -132,7 +135,7 @@ fn setup_fx_assets(
     commands.insert_resource(FxAssets {
         unit_cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
         unit_sphere: meshes.add(Sphere::new(0.5).mesh().uv(16, 8)),
-        spark_mat: materials.add(unlit(Color::srgba(1.0, 0.95, 0.55, 1.0), AlphaMode::Blend)),
+        spark_color: Color::srgba(1.0, 0.95, 0.55, 1.0),
         loot_ammo: materials.add(unlit(Color::srgb(0.95, 0.85, 0.15), AlphaMode::Opaque)),
         loot_health: materials.add(unlit(Color::srgb(0.85, 0.12, 0.12), AlphaMode::Opaque)),
         loot_health_band: materials.add(unlit(Color::srgb(0.95, 0.95, 0.95), AlphaMode::Opaque)),
@@ -286,11 +289,17 @@ struct StatsBackWasPressed(bool);
 struct TracerFx {
     age: f32,
     mat: Handle<StandardMaterial>,
+    /// World-space start (viewmodel muzzle or remote eye-drop) — unit tests assert.
+    #[allow(dead_code)]
+    from: Vec3,
+    #[allow(dead_code)]
+    to: Vec3,
 }
 
 #[derive(Component)]
 struct SparkFx {
     age: f32,
+    mat: Handle<StandardMaterial>,
 }
 
 #[derive(Component)]
@@ -1320,20 +1329,27 @@ fn drain_fx(
                 let xform = tracer_transform(muzzle, end);
                 let mat =
                     materials.add(unlit(Color::srgba(1.0, 0.92, 0.45, 0.95), AlphaMode::Blend));
+                // Unique spark material per spawn (README note 23).
+                let spark_mat = materials.add(unlit(assets.spark_color, AlphaMode::Blend));
                 commands.entity(root.0).with_children(|c| {
                     c.spawn((
                         TracerFx {
                             age: 0.0,
                             mat: mat.clone(),
+                            from: muzzle,
+                            to: end,
                         },
                         Mesh3d(assets.unit_cube.clone()),
                         MeshMaterial3d(mat),
                         xform,
                     ));
                     c.spawn((
-                        SparkFx { age: 0.0 },
+                        SparkFx {
+                            age: 0.0,
+                            mat: spark_mat.clone(),
+                        },
                         Mesh3d(assets.unit_cube.clone()),
-                        MeshMaterial3d(assets.spark_mat.clone()),
+                        MeshMaterial3d(spark_mat),
                         Transform::from_translation(end).with_scale(Vec3::splat(0.12)),
                     ));
                 });
@@ -1357,7 +1373,29 @@ fn drain_fx(
     }
 }
 
-fn muzzle_for_slot(
+/// Camera transform implied by predicted self (eye + look). Visual muzzle
+/// only — omits the short-lived reconciliation error_offset / hit-nudge.
+pub(crate) fn predicted_camera_transform(predicted: &Predicted) -> Transform {
+    let eye = Vec3::new(predicted.body.x, predicted.body.y + EYE, predicted.body.z);
+    Transform::from_translation(eye).with_rotation(Quat::from_euler(
+        EulerRot::YXZ,
+        predicted.yaw,
+        predicted.pitch,
+        0.0,
+    ))
+}
+
+/// Own-shot tracer origin: viewmodel muzzle tip in world space.
+pub(crate) fn own_muzzle_world(predicted: &Predicted) -> Vec3 {
+    muzzle_world_from_camera(
+        &predicted_camera_transform(predicted),
+        viewmodel_muzzle_camera_offset(),
+    )
+}
+
+/// Visual tracer origin for a shot. Own / local slot → viewmodel muzzle tip;
+/// remote → feet + eye − 0.12 (survivor rig has no carried gun yet).
+pub(crate) fn muzzle_for_slot(
     slot: u8,
     from_me: bool,
     my_slot: Option<u8>,
@@ -1365,18 +1403,17 @@ fn muzzle_for_slot(
     snap: Option<&Snapshot>,
 ) -> Vec3 {
     if from_me || my_slot == Some(slot) {
-        let rot = Quat::from_euler(EulerRot::YXZ, predicted.yaw, predicted.pitch, 0.0);
-        let eye = Vec3::new(predicted.body.x, predicted.body.y + EYE, predicted.body.z);
-        return eye + rot * Vec3::X * MUZZLE_RIGHT + rot * Vec3::NEG_Y * MUZZLE_DOWN;
+        return own_muzzle_world(predicted);
     }
     if let Some(snap) = snap
         && let Some(p) = snap.players.iter().find(|p| p.slot == slot)
     {
-        return Vec3::new(
+        let feet = Vec3::new(
             dequant_pos(p.pos[0]),
-            dequant_pos(p.pos[1]) + EYE,
+            dequant_pos(p.pos[1]),
             dequant_pos(p.pos[2]),
         );
+        return remote_muzzle_from_feet(feet, EYE);
     }
     Vec3::ZERO
 }
@@ -1411,6 +1448,11 @@ fn tick_fx(
         fx.age += dt;
         let t = (fx.age / SPARK_LIFE_S).clamp(0.0, 1.0);
         tf.scale = Vec3::splat((0.12 * (1.0 - t)).max(0.01));
+        if let Some(mut mat) = materials.get_mut(&fx.mat) {
+            let mut c = mat.base_color.to_srgba();
+            c.alpha = 1.0 - t;
+            mat.base_color = Color::Srgba(c);
+        }
         if fx.age >= SPARK_LIFE_S {
             commands.entity(e).despawn();
         }
@@ -1701,5 +1743,152 @@ mod tests {
         let dir = (t.rotation * Vec3::Z).normalize();
         let expected = (b - a).normalize();
         assert!((dir - expected).length() < 1e-3);
+    }
+
+    #[test]
+    fn own_muzzle_matches_models_pure_fn() {
+        use zz_core::types::Body;
+
+        let mut predicted = Predicted::default();
+        predicted.body = Body {
+            x: 3.0,
+            y: 0.0,
+            z: -1.0,
+            ..Body::at(3.0, -1.0)
+        };
+        predicted.yaw = 0.4;
+        predicted.pitch = -0.15;
+        let origin = own_muzzle_world(&predicted);
+        let cam = predicted_camera_transform(&predicted);
+        let expected = muzzle_world_from_camera(&cam, viewmodel_muzzle_camera_offset());
+        assert!(
+            (origin - expected).length() < 1e-5,
+            "own muzzle must equal models pure path: got {origin:?} expected {expected:?}"
+        );
+        // Must not be the raw eye (the old bug: tracers from eye left of the gun).
+        let eye = cam.translation;
+        assert!(
+            (origin - eye).length() > 0.5,
+            "muzzle must sit well off the eye, dist={}",
+            (origin - eye).length()
+        );
+    }
+
+    #[test]
+    fn own_shot_fx_origin_equals_muzzle_fn_and_spark_at_end() {
+        // Headless harness: drain one Shot through the real system path.
+        use std::time::Duration;
+
+        use bevy::time::TimeUpdateStrategy;
+        use zz_core::types::Body;
+
+        use crate::seams::FxQueue;
+
+        let mut predicted = Predicted::default();
+        predicted.body = Body::at(1.0, 2.0);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                16,
+            )))
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(TouchIntent::default())
+            .insert_resource(VoiceState::default())
+            .insert_resource(FxQueue::default())
+            .insert_resource(LatestSnapshot::default())
+            .insert_resource(LastStats::default())
+            .insert_resource(Roster::default())
+            .insert_resource(predicted)
+            .insert_resource(Session::Playing { my_slot: 0 })
+            .init_resource::<HudLocal>()
+            .add_systems(Startup, (setup_fx_assets, setup_fx_root).chain())
+            .add_systems(Update, drain_fx);
+
+        let end = Vec3::new(10.0, 1.5, 2.0);
+        app.world_mut()
+            .resource_mut::<FxQueue>()
+            .0
+            .push_back(VisualEvent::Shot {
+                slot: 0,
+                end,
+                hit_kind: 0,
+                from_me: true,
+            });
+
+        app.update(); // Startup
+        app.update(); // drain_fx
+
+        let expected_muzzle = {
+            let predicted = app.world().resource::<Predicted>();
+            own_muzzle_world(predicted)
+        };
+
+        let mut tracers = app.world_mut().query::<&TracerFx>();
+        let tracer = tracers
+            .iter(app.world())
+            .next()
+            .expect("one tracer spawned for own Shot");
+        assert!(
+            (tracer.from - expected_muzzle).length() < 1e-4,
+            "tracer origin {:?} != muzzle fn {:?}",
+            tracer.from,
+            expected_muzzle
+        );
+        assert!(
+            (tracer.to - end).length() < 1e-4,
+            "tracer end {:?} != shot end {:?}",
+            tracer.to,
+            end
+        );
+
+        let mut sparks = app.world_mut().query::<(&SparkFx, &Transform)>();
+        let (_spark, spark_tf) = sparks
+            .iter(app.world())
+            .next()
+            .expect("impact spark at endpoint");
+        assert!(
+            (spark_tf.translation - end).length() < 1e-4,
+            "spark at {:?} expected {:?}",
+            spark_tf.translation,
+            end
+        );
+    }
+
+    #[test]
+    fn remote_muzzle_uses_eye_drop() {
+        use zz_core::snapshot::{WirePlayer, quant_pos3, quant_yaw16};
+
+        let feet = Vec3::new(5.0, 0.0, -3.0);
+        let snap = Snapshot {
+            tick: 1,
+            players: vec![WirePlayer {
+                slot: 2,
+                pos: quant_pos3(feet.x, feet.y, feet.z),
+                yaw: quant_yaw16(0.0),
+                pitch: 0,
+                health: 100,
+                ammo_mag: 30,
+                ammo_reserve: 90,
+                grenades: 2,
+                kills: 0,
+                alive: true,
+                last_acked_seq: 0,
+            }],
+            ..Default::default()
+        };
+        let predicted = Predicted::default();
+        let m = muzzle_for_slot(2, false, Some(0), &predicted, Some(&snap));
+        let expected = remote_muzzle_from_feet(feet, EYE);
+        assert!(
+            (m - expected).length() < 0.05,
+            "remote muzzle {m:?} vs expected {expected:?}"
+        );
+        // Must be below full eye height.
+        assert!(m.y < feet.y + EYE - 0.05);
     }
 }
