@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
-use zz_client::game::{GamePlugin, Predicted, RemotePlayer, RemoteZombie, Session};
+use zz_client::game::{GamePlugin, LodMetrics, Predicted, RemotePlayer, RemoteZombie, Session};
 use zz_client::hud::{HudChrome, HudPlugin};
 use zz_client::map_render::{CurrentMap, MapRenderPlugin, MapRoot, Placeholder};
 use zz_client::net::{NetClient, NetEvent};
@@ -18,7 +18,7 @@ use zz_client::voice::{VoiceRx, VoiceState};
 use zz_core::constants::{MAG_SIZE, MAX_HEALTH, START_GRENADES, START_RESERVE_AMMO};
 use zz_core::map::generate_map;
 use zz_core::protocol::{MatchStats, PlayerStats, RosterPlayer, ServerMsg};
-use zz_core::snapshot::{Snapshot, WirePlayer, quant_pos3, quant_yaw16};
+use zz_core::snapshot::{Snapshot, WirePlayer, WireZombie, quant_pos3, quant_yaw8, quant_yaw16};
 use zz_core::types::EnvKind;
 
 /// Minimal plugin set: assets + session + map build + HUD gate, no window/GPU.
@@ -318,4 +318,151 @@ fn game_start_snapshot_syncs_and_queues_input() {
         ),
         "session Playing"
     );
+}
+
+/// M15b: horde LOD must not thrash. 150 simulated zombies, 300 frames after
+/// steady spawn — transitions/frame < 5% of horde, entity root count stable
+/// (impostors are pooled children; zero spawn/despawn in steady state).
+#[test]
+fn horde_lod_transitions_bounded_and_entity_count_stable() {
+    let mut app = headless_app();
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    app.update();
+
+    let slot = 0u8;
+    let map = generate_map(EnvKind::Urban, "lod-bench");
+    let spawn = map.spawns[0];
+    let n_zeds = 150u16;
+    // Ring of zombies at mixed distances so all three LOD bands are occupied.
+    let zombies: Vec<WireZombie> = (0..n_zeds)
+        .map(|i| {
+            let t = i as f32 / n_zeds as f32 * std::f32::consts::TAU;
+            // 15 m … 120 m so Full / Bob / Static are all represented.
+            let r = 15.0 + (i as f32 % 50.0) * 2.1;
+            let x = spawn.x + t.cos() * r;
+            let z = spawn.z + t.sin() * r;
+            WireZombie {
+                id: i + 1,
+                kind: (i % 3) as u8,
+                state: 0,
+                pos: quant_pos3(x, 0.0, z),
+                yaw: quant_yaw8(t),
+                health: 100,
+            }
+        })
+        .collect();
+
+    let make_snap = |tick: u32, zeds: &[WireZombie]| Snapshot {
+        tick,
+        game_time_ms: tick.saturating_mul(33),
+        difficulty: 0,
+        paused: false,
+        players: vec![WirePlayer {
+            slot,
+            pos: quant_pos3(spawn.x, 0.0, spawn.z),
+            yaw: quant_yaw16(spawn.yaw),
+            pitch: 0,
+            health: MAX_HEALTH,
+            ammo_mag: MAG_SIZE,
+            ammo_reserve: START_RESERVE_AMMO,
+            grenades: START_GRENADES,
+            kills: 0,
+            alive: true,
+            last_acked_seq: 0,
+        }],
+        zombies: zeds.to_vec(),
+        loot: vec![],
+        grenades: vec![],
+        shots: vec![],
+        booms: vec![],
+    };
+
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Msg(ServerMsg::GameStart {
+            map_seed: "lod-bench".into(),
+            env: EnvKind::Urban,
+            your_slot: slot,
+            players: vec![RosterPlayer {
+                slot,
+                id: "c1".into(),
+                name: "lodder".into(),
+            }],
+        }));
+    }
+    // Apply GameStart so CurrentMap / Session land before the horde snap.
+    app.update();
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Snap(make_snap(1, &zombies)));
+    }
+    app.update(); // one snap only — two snaps in one drain double-spawn (Commands-deferred)
+
+    // Warm-up past the first staggered distance refresh for every rig
+    // (LOD_DIST_PERIOD = 10) so initial Full→band settles before we measure.
+    for f in 0..20 {
+        {
+            let mut net = app.world_mut().resource_mut::<NetClient>();
+            net.inject(NetEvent::Snap(make_snap(2 + f, &zombies)));
+        }
+        app.update();
+    }
+    let roots_after_spawn = count_with::<RemoteZombie>(app.world_mut());
+    assert_eq!(
+        roots_after_spawn, n_zeds as usize,
+        "expected {n_zeds} RemoteZombie roots after inject, got {roots_after_spawn}"
+    );
+
+    // Steady state: re-inject the same horde (tiny motion) for 300 frames.
+    app.world_mut().resource_mut::<LodMetrics>().reset_counters();
+    let measure_frames = 300u32;
+    for f in 0..measure_frames {
+        // Nudge a few cm so pose systems run; ids stable → no despawn.
+        let moved: Vec<WireZombie> = zombies
+            .iter()
+            .map(|z| {
+                let mut z = *z;
+                let x = dequant_approx(z.pos[0]);
+                let zz = dequant_approx(z.pos[2]);
+                let phase = f as f32 * 0.02 + z.id as f32 * 0.1;
+                z.pos = quant_pos3(x + phase.cos() * 0.05, 0.0, zz + phase.sin() * 0.05);
+                z
+            })
+            .collect();
+        {
+            let mut net = app.world_mut().resource_mut::<NetClient>();
+            net.inject(NetEvent::Snap(make_snap(100 + f, &moved)));
+        }
+        app.update();
+    }
+
+    let roots_end = count_with::<RemoteZombie>(app.world_mut());
+    assert_eq!(
+        roots_end, roots_after_spawn,
+        "RemoteZombie root count must be stable (no spawn/despawn thrash): start={roots_after_spawn} end={roots_end}"
+    );
+
+    let m = app.world().resource::<LodMetrics>();
+    let horde = n_zeds as u32;
+    // Peak and average both under 5% of horde (M15 thrash was ~every zombie every frame).
+    let budget = ((horde as f32) * 0.05).ceil() as u32;
+    let avg = m.total_transitions as f32 / measure_frames.max(1) as f32;
+    assert!(
+        m.peak_transitions <= budget.max(2),
+        "LOD transitions/frame peak {} exceeds 5% budget {} (horde={horde}, total_trans={}, avg={avg:.2})",
+        m.peak_transitions,
+        budget,
+        m.total_transitions
+    );
+    assert!(
+        avg <= horde as f32 * 0.05,
+        "LOD transitions/frame avg {avg:.2} exceeds 5% of horde ({})",
+        horde as f32 * 0.05
+    );
+    assert!(m.frame >= measure_frames, "expected ~{measure_frames} metric frames, got {}", m.frame);
+    assert_eq!(m.zombie_roots, horde);
+}
+
+fn dequant_approx(q: i16) -> f32 {
+    zz_core::snapshot::dequant_pos(q)
 }

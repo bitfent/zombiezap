@@ -312,14 +312,19 @@ async fn pause_freezes_game_time_and_zombies() {
     }
 }
 
-/// AFK player must face a zombie within 25 s on both urban and Rome EUR.
-/// Director approach-distance + rate scale keep large maps threatening.
+/// AFK player must TAKE DAMAGE within 25 s on both urban and Rome EUR.
+///
+/// Faithful to live lobby.rs: CreateLobby + StartGame (seed = `{code}-{n}`),
+/// default ZZ_DIRECTOR_RATE=1, no MAP_SEED override. M15's 12 m "contact"
+/// assertion could pass while walkers idled in walls after approach_spawn;
+/// this asserts authoritative health drop (the live bar the dispatcher reads).
 #[tokio::test]
-async fn time_to_first_contact_under_25s_urban_and_rome() {
+async fn time_to_first_damage_under_25s_urban_and_rome() {
     // Default director rate (1.0) — not the turbo used by other tests.
+    // Clear MAP_SEED so Room::spawn uses the lobby-provided `{code}-N` seed
+    // exactly as lobby.rs does for a real match.
     unsafe {
         std::env::set_var("ZZ_DIRECTOR_RATE", "1");
-        // Clear MAP_SEED so each env uses its natural seed (room still works).
         std::env::remove_var("MAP_SEED");
     }
     let url = start_server().await;
@@ -332,8 +337,10 @@ async fn time_to_first_contact_under_25s_urban_and_rome() {
         let mut dec = SnapshotDecoder::new();
         let mut seq = 0u32;
         let start = tokio::time::Instant::now();
-        let deadline = start + Duration::from_secs(30);
-        let mut first_contact_ms: Option<u32> = None;
+        let deadline = start + Duration::from_secs(40);
+        let mut first_damage_ms: Option<u32> = None;
+        let mut first_contact12_ms: Option<u32> = None;
+        let mut peak_zeds = 0usize;
 
         while tokio::time::Instant::now() < deadline {
             seq += 1;
@@ -346,24 +353,22 @@ async fn time_to_first_contact_under_25s_urban_and_rome() {
                 .await;
             match recv_any(&mut ws, &mut dec).await {
                 Some(Incoming::Snap(s)) => {
+                    peak_zeds = peak_zeds.max(s.zombies.len());
                     let me = s.players.iter().find(|p| p.slot == slot);
                     let Some(me) = me else { continue };
+                    if me.health < 100 && first_damage_ms.is_none() {
+                        first_damage_ms = Some(s.game_time_ms);
+                        break;
+                    }
                     let px = dequant_pos(me.pos[0]);
                     let pz = dequant_pos(me.pos[2]);
                     for z in &s.zombies {
                         let zx = dequant_pos(z.pos[0]);
                         let zz = dequant_pos(z.pos[2]);
-                        // Horizontal distance only (ignore eye/feet height).
                         let d = ((zx - px).powi(2) + (zz - pz).powi(2)).sqrt();
-                        // "Contact": zombie within ~12 m (visible threat, not
-                        // necessarily melee yet).
-                        if d < 12.0 {
-                            first_contact_ms = Some(s.game_time_ms);
-                            break;
+                        if d < 12.0 && first_contact12_ms.is_none() {
+                            first_contact12_ms = Some(s.game_time_ms);
                         }
-                    }
-                    if first_contact_ms.is_some() {
-                        break;
                     }
                 }
                 Some(Incoming::Msg(ServerMsg::MatchEnd { .. })) => break,
@@ -372,16 +377,17 @@ async fn time_to_first_contact_under_25s_urban_and_rome() {
             }
         }
 
-        let ms = first_contact_ms.unwrap_or_else(|| {
-            panic!("{env:?}: no zombie within 12 m of AFK player in 30 s wall time")
+        let ms = first_damage_ms.unwrap_or_else(|| {
+            panic!(
+                "{env:?}: no damage in 40 s wall (peak_zeds={peak_zeds}, contact12={first_contact12_ms:?})"
+            )
         });
         assert!(
             ms < 25_000,
-            "{env:?}: first contact at {ms} ms, want < 25_000"
+            "{env:?}: first damage at {ms} ms, want < 25_000 (peak_zeds={peak_zeds})"
         );
         // Drop the socket so the lobby cleans up before the next env.
         drop(ws);
-        // Brief pause so the server tears down the empty room.
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

@@ -19,7 +19,7 @@ use zz_core::types::{Body, PlayerInput};
 use crate::map_render::CurrentMap;
 use crate::models::{
     self, AnimLod, CrumpleFx, HitFlash, HumanoidRig, RigAssets, Viewmodel, GROWL_RANGE,
-    HIT_FLASH_S, LOD_FULL_CAP, LOD_FULL_M,
+    HIT_FLASH_S, LOD_DIST_PERIOD, LOD_FULL_CAP, LOD_FULL_M,
 };
 use crate::net::{NetClient, NetEvent};
 use crate::platform;
@@ -60,6 +60,7 @@ impl Plugin for GamePlugin {
             .insert_resource(GrowlMemory::default())
             .insert_resource(CameraNudge::default())
             .insert_resource(PendingHitFlashes::default())
+            .insert_resource(LodMetrics::default())
             .configure_sets(Update, GameSessionSet)
             .add_systems(
                 Update,
@@ -246,6 +247,33 @@ pub struct CameraNudge {
 #[derive(Resource, Default)]
 struct PendingHitFlashes {
     ends: Vec<Vec3>,
+}
+
+/// Per-frame LOD bookkeeping for the headless horde stability harness.
+///
+/// M15b: thrash was per-frame full-sort + visibility writes on every zombie.
+/// Steady-state transitions must stay well under 5% of the horde per frame.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct LodMetrics {
+    pub frame: u32,
+    /// LOD band changes this frame (Full/Bob/Static only — not full-cap demote).
+    pub transitions_this_frame: u32,
+    /// Peak transitions seen in a single frame since last reset.
+    pub peak_transitions: u32,
+    /// Sum of transitions over all frames (for averages in tests).
+    pub total_transitions: u64,
+    /// RemoteZombie roots present at end of last animate pass.
+    pub zombie_roots: u32,
+}
+
+impl LodMetrics {
+    pub fn reset_counters(&mut self) {
+        self.frame = 0;
+        self.transitions_this_frame = 0;
+        self.peak_transitions = 0;
+        self.total_transitions = 0;
+        self.zombie_roots = 0;
+    }
 }
 
 /// Last half-second growl bucket we already fired for, so each (id, bucket)
@@ -912,15 +940,19 @@ fn angle_lerp(a: f32, b: f32, k: f32) -> f32 {
 
 /// Sync attack telegraph from snapshot state, then pose limbs from motion.
 ///
-/// Animation LOD: full limb cycle for the nearest [`LOD_FULL_CAP`] zombies
-/// within [`LOD_FULL_M`]; bob-only to 80 m; single-cuboid impostor beyond.
-/// Shared mesh/material handles stay batched (see `RigAssets`).
+/// Animation LOD (M15b): hysteretic bands + distance refresh every
+/// [`LOD_DIST_PERIOD`] frames (staggered per rig). Full limbs for the nearest
+/// [`LOD_FULL_CAP`] within [`LOD_FULL_M`]; bob mid-range; pooled impostor
+/// cuboid beyond (spawned once with the rig — visibility toggle only on
+/// band change, never per-frame spawn/despawn). Shared mesh/material handles
+/// stay batched (see `RigAssets`).
 ///
 /// Root transforms (on Remote*) and joint transforms (body/limb pivots) are
 /// disjoint via Without filters, so both queries can coexist.
 #[allow(clippy::type_complexity)]
 fn animate_rigs(
     time: Res<Time>,
+    mut metrics: ResMut<LodMetrics>,
     cam: Query<&Transform, (With<Camera3d>, Without<RemoteZombie>, Without<RemotePlayer>)>,
     mut zombies: Query<
         (Entity, &RemoteZombie, &mut Transform, &mut HumanoidRig),
@@ -947,14 +979,23 @@ fn animate_rigs(
         .map(|t| t.translation)
         .unwrap_or(Vec3::ZERO);
 
-    // Rank zombies by distance; only the nearest LOD_FULL_CAP get Full limbs.
-    let mut ranked: Vec<(Entity, f32)> = zombies
-        .iter()
-        .map(|(e, _, tf, _)| {
-            let d = tf.translation.distance(cam_pos);
-            (e, d)
-        })
-        .collect();
+    metrics.frame = metrics.frame.wrapping_add(1);
+    metrics.transitions_this_frame = 0;
+
+    // Tick distance refresh (staggered). Rank refreshers + current Full so the
+    // near-cap stays accurate without sorting the whole horde every frame.
+    let mut ranked: Vec<(Entity, f32)> = Vec::new();
+    for (e, _, tf, mut rig) in zombies.iter_mut() {
+        if rig.lod_refresh_in == 0 {
+            rig.lod_dist = tf.translation.distance(cam_pos);
+            rig.lod_refresh_in = LOD_DIST_PERIOD as u8;
+        } else {
+            rig.lod_refresh_in = rig.lod_refresh_in.saturating_sub(1);
+        }
+        if rig.lod_refresh_in == LOD_DIST_PERIOD as u8 || rig.lod == AnimLod::Full {
+            ranked.push((e, rig.lod_dist));
+        }
+    }
     ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let full_set: HashSet<Entity> = ranked
         .iter()
@@ -963,28 +1004,42 @@ fn animate_rigs(
         .map(|(e, _)| *e)
         .collect();
 
+    let mut roots = 0u32;
     for (e, rz, mut tf, mut rig) in zombies.iter_mut() {
+        roots += 1;
         rig.attacking = rz.state == 1;
-        let dist = tf.translation.distance(cam_pos);
-        let mut lod = models::anim_lod_for_distance(dist);
+        let prev_lod = rig.lod;
+        let refreshing = rig.lod_refresh_in == LOD_DIST_PERIOD as u8;
+        // Band changes only on distance refresh (hysteresis). Cap demotion is
+        // Full→Bob only and does not re-enter via hysteresis until refresh.
+        let mut lod = if refreshing {
+            models::anim_lod_hysteresis(prev_lod, rig.lod_dist)
+        } else {
+            prev_lod
+        };
         if lod == AnimLod::Full && !full_set.contains(&e) {
             lod = AnimLod::Bob;
         }
-        // Impostor swap for Static: one cuboid vs full joint tree.
-        let use_impostor = lod == AnimLod::Static;
-        if let Ok(mut v) = vis_q.get_mut(rig.detailed) {
-            *v = if use_impostor {
-                Visibility::Hidden
-            } else {
-                Visibility::Visible
-            };
-        }
-        if let Ok(mut v) = vis_q.get_mut(rig.impostor) {
-            *v = if use_impostor {
-                Visibility::Visible
-            } else {
-                Visibility::Hidden
-            };
+
+        if lod != prev_lod {
+            metrics.transitions_this_frame += 1;
+            // Impostor ↔ detailed: only on band change. Both entities are
+            // pooled children of the root (zero spawn/despawn in steady state).
+            let use_impostor = lod == AnimLod::Static;
+            if let Ok(mut v) = vis_q.get_mut(rig.detailed) {
+                *v = if use_impostor {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Visible
+                };
+            }
+            if let Ok(mut v) = vis_q.get_mut(rig.impostor) {
+                *v = if use_impostor {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+            }
         }
 
         let base_scale = models::kind_scale(rz.kind);
@@ -992,6 +1047,12 @@ fn animate_rigs(
         tf.scale = base_scale * pose.root_scale;
         apply_joint_pose(&mut joints, &rig, pose);
     }
+    metrics.zombie_roots = roots;
+    metrics.total_transitions += u64::from(metrics.transitions_this_frame);
+    metrics.peak_transitions = metrics
+        .peak_transitions
+        .max(metrics.transitions_this_frame);
+
     for (tf, mut rig) in players.iter_mut() {
         rig.attacking = false;
         let pose = models::compute_rig_pose(&mut rig, tf.translation, dt, AnimLod::Full);

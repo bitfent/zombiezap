@@ -67,13 +67,22 @@ pub const CRUMPLE_DURATION_S: f32 = 0.55;
 pub const HIT_FLASH_S: f32 = 0.09;
 
 // ── animation LOD distances (metres from camera) ───────────────────────────
-/// Full limb walk cycle within this range.
+// Hysteresis: enter and exit bands differ so zombies near a threshold don't
+// flap Full↔Bob↔Static every frame (M15 thrash: per-frame sort + visibility
+// writes invalidated batches and tanked FPS).
+/// Full limb walk cycle — enter when closer than this.
 pub const LOD_FULL_M: f32 = 40.0;
-/// Simple vertical bob only between FULL and this; beyond = static.
+/// Leave Full for Bob when farther than this.
+pub const LOD_FULL_EXIT_M: f32 = 48.0;
+/// Bob band outer enter (Static → Bob when closer than this).
 pub const LOD_BOB_M: f32 = 80.0;
+/// Leave Bob for Static when farther than this.
+pub const LOD_BOB_EXIT_M: f32 = 92.0;
 /// Soft cap: only this many nearest zombies keep full limb animation; the rest
 /// drop to bob/static even if inside FULL range (horde frame budget).
 pub const LOD_FULL_CAP: usize = 40;
+/// Recompute camera distance / rank at most every N frames (staggered by id).
+pub const LOD_DIST_PERIOD: u32 = 10;
 
 // ── pure anim math (unit-tested) ───────────────────────────────────────────
 
@@ -134,7 +143,7 @@ pub enum AnimLod {
     Static,
 }
 
-/// Distance → LOD band (before the near-cap is applied).
+/// Distance → LOD band (before the near-cap is applied). Cold start / no prior.
 pub fn anim_lod_for_distance(dist: f32) -> AnimLod {
     if dist <= LOD_FULL_M {
         AnimLod::Full
@@ -142,6 +151,38 @@ pub fn anim_lod_for_distance(dist: f32) -> AnimLod {
         AnimLod::Bob
     } else {
         AnimLod::Static
+    }
+}
+
+/// Hysteretic LOD transition so boundary zombies don't flap every frame.
+///
+/// Enter Full ≤ [`LOD_FULL_M`], exit Full > [`LOD_FULL_EXIT_M`];
+/// enter Bob from Static ≤ [`LOD_BOB_M`], exit Bob → Static > [`LOD_BOB_EXIT_M`].
+pub fn anim_lod_hysteresis(prev: AnimLod, dist: f32) -> AnimLod {
+    match prev {
+        AnimLod::Full => {
+            if dist > LOD_FULL_EXIT_M {
+                AnimLod::Bob
+            } else {
+                AnimLod::Full
+            }
+        }
+        AnimLod::Bob => {
+            if dist <= LOD_FULL_M {
+                AnimLod::Full
+            } else if dist > LOD_BOB_EXIT_M {
+                AnimLod::Static
+            } else {
+                AnimLod::Bob
+            }
+        }
+        AnimLod::Static => {
+            if dist <= LOD_BOB_M {
+                AnimLod::Bob
+            } else {
+                AnimLod::Static
+            }
+        }
     }
 }
 
@@ -303,8 +344,12 @@ pub struct HumanoidRig {
     pub is_zombie: bool,
     /// Snapshot `state == 1` attack telegraph.
     pub attacking: bool,
-    /// Current animation LOD (updated each frame from camera distance).
+    /// Current animation LOD (hysteretic; refreshed every [`LOD_DIST_PERIOD`]).
     pub lod: AnimLod,
+    /// Cached camera distance used between LOD refresh frames.
+    pub lod_dist: f32,
+    /// Frames until next distance / LOD recompute (0 = do it now).
+    pub lod_refresh_in: u8,
 }
 
 /// Brief white flash on a hit zombie — unique material handles (note 23).
@@ -542,6 +587,10 @@ pub fn attach_humanoid(
         is_zombie,
         attacking: false,
         lod: AnimLod::Full,
+        lod_dist: 0.0,
+        // Stagger first refresh by phase hash so the horde doesn't all recompute
+        // on the same frame after a mass spawn.
+        lod_refresh_in: (id_for_phase % LOD_DIST_PERIOD as u16) as u8,
     }
 }
 
@@ -978,6 +1027,28 @@ mod tests {
         assert_eq!(anim_lod_for_distance(LOD_FULL_M), AnimLod::Full);
         assert_eq!(anim_lod_for_distance(LOD_FULL_M + 1.0), AnimLod::Bob);
         assert_eq!(anim_lod_for_distance(LOD_BOB_M + 1.0), AnimLod::Static);
+
+        // Hysteresis: stay Full in the exit gap, don't flap at 40 m.
+        assert_eq!(
+            anim_lod_hysteresis(AnimLod::Full, LOD_FULL_M + 4.0),
+            AnimLod::Full
+        );
+        assert_eq!(
+            anim_lod_hysteresis(AnimLod::Full, LOD_FULL_EXIT_M + 0.1),
+            AnimLod::Bob
+        );
+        assert_eq!(
+            anim_lod_hysteresis(AnimLod::Bob, LOD_FULL_M),
+            AnimLod::Full
+        );
+        assert_eq!(
+            anim_lod_hysteresis(AnimLod::Static, LOD_BOB_M),
+            AnimLod::Bob
+        );
+        assert_eq!(
+            anim_lod_hysteresis(AnimLod::Bob, LOD_BOB_EXIT_M + 0.1),
+            AnimLod::Static
+        );
     }
 
     #[test]

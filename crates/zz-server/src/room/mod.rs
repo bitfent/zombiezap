@@ -391,18 +391,16 @@ impl Room {
             self.sim_step();
         }
 
-        // snapshot: encode once, broadcast; drop slow consumers
+        // Snapshot: encode once, broadcast. If a client's outbox is full
+        // (slow wasm tab under horde load), DROP THE FRAME — do not kick.
+        // M15 thrash filled the 64-slot channel in ~2 s at 10 fps and leave()
+        // froze the solo player with last-known 100 HP while zeds piled up.
+        // Keyframes resync decoders after dropped deltas.
         let include_entities = self.wire_tick.is_multiple_of(SNAPSHOT_ZOMBIE_EVERY);
         let snap = self.snapshot();
         let frame = self.encoder.encode(&snap, include_entities);
-        let mut dropped: Vec<u64> = Vec::new();
         for p in &self.players {
-            if p.tx.try_send(OutMsg::Bin(frame.clone())).is_err() {
-                dropped.push(p.conn_id);
-            }
-        }
-        for id in dropped {
-            self.leave(id);
+            let _ = p.tx.try_send(OutMsg::Bin(frame.clone()));
         }
         self.shots.clear();
         self.booms.clear();
@@ -458,8 +456,13 @@ impl Room {
             .iter()
             .map(|p| (p.body.x, p.body.y + PLAYER_EYE, p.body.z, p.yaw, p.alive))
             .collect();
-        self.director
-            .step(now, &self.map, &mut self.zombies, &player_views);
+        self.director.step(
+            now,
+            &self.map,
+            &self.grid,
+            &mut self.zombies,
+            &player_views,
+        );
         self.peak_zombies = self.peak_zombies.max(self.zombies.len() as u32);
 
         // Rebuild on the periodic cadence, and immediately when the field is

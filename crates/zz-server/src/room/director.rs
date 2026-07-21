@@ -37,10 +37,15 @@ impl Director {
     }
 
     /// Accrue budget and spawn while it lasts. Called once per (unpaused) tick.
+    ///
+    /// `grid` is the room's walk grid — pull-in points that land inside walls
+    /// are snapped to a walkable cell so zombies can path (M15b: bare
+    /// approach_spawn put ~4%+ of urban spawns in solid AABBs → idle horde).
     pub fn step(
         &mut self,
         tick: u32,
         map: &GameMap,
+        grid: &zz_core::map::WalkGrid,
         zombies: &mut Vec<Zombie>,
         players: &[(f32, f32, f32, f32, bool)], // (x, eye_y, z, yaw, alive)
     ) {
@@ -51,6 +56,7 @@ impl Director {
         let pulse = 1.0 + DIRECTOR_PULSE_AMPLITUDE * libm::sinf(phase);
         // Map-size scale: big arenas (Rome) get a higher budget so the horde
         // actually forms; approach-distance clamp below does first-contact.
+        // Urban arena_half≈30 → scale 1.0 (unchanged vs pre-M15 baseline).
         let size_scale = director_rate_scale(map.arena_half);
         let rate = DIRECTOR_BASE_POINTS_PER_SEC
             * (1.0 + minutes * DIRECTOR_RAMP_PER_MIN)
@@ -77,15 +83,16 @@ impl Director {
             let (gx, gz) = (gate.x + jx, gate.z + jz);
             // Pull spawn toward nearest alive player so walkers threaten in
             // ~20 s even on 500 m arenas (gates alone can be 200 m away).
-            let (x, z) = Self::approach_spawn(gx, gz, players, approach);
+            let (x, z) = Self::approach_spawn(gx, gz, players, approach, grid);
+            let (x, z) = (
+                x.clamp(-map.arena_half + 1.0, map.arena_half - 1.0),
+                z.clamp(-map.arena_half + 1.0, map.arena_half - 1.0),
+            );
             let (cx, cz) = Self::alive_centroid(players);
             zombies.push(Zombie {
                 id: self.next_id,
                 kind,
-                body: Body::at(
-                    x.clamp(-map.arena_half + 1.0, map.arena_half - 1.0),
-                    z.clamp(-map.arena_half + 1.0, map.arena_half - 1.0),
-                ),
+                body: Body::at(x, z),
                 yaw: yaw_toward(x, z, cx, cz),
                 health: kind.stats().1,
                 state: 0,
@@ -114,12 +121,14 @@ impl Director {
     }
 
     /// If the gate is farther than `approach` from every alive player, place
-    /// the spawn on the segment gate→nearest-player at distance `approach`.
+    /// the spawn on the segment gate→nearest-player at distance `approach`,
+    /// then snap to a walkable cell so the flow field can route.
     fn approach_spawn(
         gx: f32,
         gz: f32,
         players: &[(f32, f32, f32, f32, bool)],
         approach: f32,
+        grid: &zz_core::map::WalkGrid,
     ) -> (f32, f32) {
         let mut best: Option<(f32, f32, f32)> = None; // (px, pz, d2)
         for p in players.iter().filter(|p| p.4) {
@@ -135,16 +144,51 @@ impl Director {
             }
         }
         let Some((px, pz, d2)) = best else {
-            return (gx, gz);
+            return Self::snap_walkable(gx, gz, grid);
         };
         let dist = d2.sqrt();
         if dist <= approach || dist < 1e-3 {
-            return (gx, gz);
+            return Self::snap_walkable(gx, gz, grid);
         }
-        // Point on gate→player segment at `approach` metres from the player.
-        let t = approach / dist;
-        let x = px + (gx - px) * t;
-        let z = pz + (gz - pz) * t;
+        // Prefer a walkable sample on the player→gate segment at ~approach,
+        // walking outward toward the gate if the ideal point is solid.
+        for k in 0..20 {
+            let along = (approach + k as f32 * 2.0).min(dist);
+            let t = along / dist;
+            let x = px + (gx - px) * t;
+            let z = pz + (gz - pz) * t;
+            if grid.walkable_at(x, z) {
+                return (x, z);
+            }
+        }
+        Self::snap_walkable(gx, gz, grid)
+    }
+
+    /// Gate / fallback: if the point is solid, search a small ring for a
+    /// walkable neighbour so the zombie is never born inside a wall.
+    fn snap_walkable(x: f32, z: f32, grid: &zz_core::map::WalkGrid) -> (f32, f32) {
+        if grid.walkable_at(x, z) {
+            return (x, z);
+        }
+        for r in 1..=8 {
+            let rf = r as f32;
+            for (dx, dz) in [
+                (1.0, 0.0),
+                (-1.0, 0.0),
+                (0.0, 1.0),
+                (0.0, -1.0),
+                (1.0, 1.0),
+                (1.0, -1.0),
+                (-1.0, 1.0),
+                (-1.0, -1.0),
+            ] {
+                let nx = x + dx * rf;
+                let nz = z + dz * rf;
+                if grid.walkable_at(nx, nz) {
+                    return (nx, nz);
+                }
+            }
+        }
         (x, z)
     }
 
