@@ -713,3 +713,23 @@ body.touch .menu-inner {
   .btn.big { font-size: 12px; padding: 16px 10px; }
   .hint.center { font-size: 15px; }
 }
+
+/* ── ZombieZap additions (menu/lobby/HUD on top of ShotAnte's base) ─────── */
+.logo.red { color: #ff4a3d; text-shadow: 0 0 18px rgba(255, 74, 61, 0.35); }
+.field-label { font-size: 0.7rem; letter-spacing: 0.18em; color: var(--muted, #7a828e); margin: 0.9em 0 0.3em; }
+.join-row { display: flex; gap: 0.5em; }
+.join-row input { flex: 0 0 7em; text-transform: uppercase; }
+.join-row .btn { flex: 1; }
+.hint.error { color: #ff6a5e; }
+.code { font-size: 2rem; letter-spacing: 0.35em; color: var(--cyan, #35e0d4); text-align: center; margin: 0.2em 0 0.6em; }
+.roster { list-style: none; padding: 0.4em 0.6em; margin: 0 0 0.8em; background: rgba(0, 0, 0, 0.35); border: 1px solid #222831; }
+.roster li { padding: 0.25em 0.2em; letter-spacing: 0.06em; }
+.roster li.open { color: var(--muted, #565e6a); }
+#hud { position: fixed; inset: 0; pointer-events: none; font-family: inherit; }
+.hud-tl { position: absolute; top: 12px; left: 14px; font-size: 0.95rem; letter-spacing: 0.08em; }
+.hud-bl { position: absolute; bottom: 14px; left: 14px; display: flex; align-items: center; gap: 0.6em; }
+.healthwrap { width: 160px; height: 10px; background: rgba(0, 0, 0, 0.5); border: 1px solid #2a313c; }
+#zz-healthbar { height: 100%; width: 100%; background: #e33f36; transition: width 0.15s; }
+.hud-br { position: absolute; bottom: 14px; right: 16px; font-size: 1.2rem; letter-spacing: 0.1em; }
+.banner { position: fixed; top: 22%; left: 0; right: 0; text-align: center; font-size: 2.6rem; letter-spacing: 0.2em; color: #ff4a3d; text-shadow: 0 2px 0 rgba(0, 0, 0, 0.6); pointer-events: none; }
+.touch-ui { display: none; }

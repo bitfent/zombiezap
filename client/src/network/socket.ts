@@ -9,7 +9,8 @@ import {
   type ServerMessage,
 } from "@shotante/shared";
 
-const URL = (import.meta as any).env?.VITE_SERVER_URL ?? "ws://localhost:8080";
+// zz-server upgrades WebSockets on /ws (the root serves the web build).
+const URL = (import.meta as any).env?.VITE_SERVER_URL ?? "ws://localhost:8080/ws";
 
 export class GameSocket {
   private ws: WebSocket | null = null;

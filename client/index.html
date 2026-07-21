@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>ZOMBIEZAP</title>
+    <meta name="description" content="Co-op zombie survival FPS in your browser. No account, no install — host a lobby, send the link, survive the horde." />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game"></canvas>
+
+      <!-- ── menu ─────────────────────────────────────────────────────── -->
+      <div id="menu" class="overlay">
+        <div class="panel">
+          <h1 class="logo">ZOMBIE<span>ZAP</span></h1>
+          <p class="tagline">co-op horde survival — in your browser, instantly</p>
+          <label class="field-label" for="name">CALLSIGN</label>
+          <input id="name" maxlength="16" placeholder="survivor" autocomplete="off" />
+          <button id="btn-host" class="btn primary big">HOST A GAME</button>
+          <p class="hint center">— or join a friend —</p>
+          <div class="join-row">
+            <input id="code" maxlength="5" placeholder="XXXXX" autocomplete="off" />
+            <button id="btn-join" class="btn">JOIN</button>
+          </div>
+          <p id="menu-error" class="hint error hidden"></p>
+        </div>
+      </div>
+
+      <!-- ── lobby ────────────────────────────────────────────────────── -->
+      <div id="lobby" class="overlay hidden">
+        <div class="panel">
+          <p class="field-label">LOBBY CODE</p>
+          <p id="lobby-code" class="code"></p>
+          <ul id="roster" class="roster"></ul>
+          <button id="btn-start" class="btn primary big">START</button>
+          <button id="btn-leave" class="btn ghost">LEAVE</button>
+        </div>
+      </div>
+
+      <!-- ── in-match HUD ─────────────────────────────────────────────── -->
+      <div id="hud" class="hidden">
+        <div class="hud-tl">
+          <div>KILLS <span id="zz-kills">0</span></div>
+        </div>
+        <div class="hud-bl">
+          <div class="healthwrap"><div id="zz-healthbar"></div></div>
+          <div id="zz-health">100</div>
+        </div>
+        <div class="hud-br" id="zz-ammo">12 / 48</div>
+        <div id="crosshair">+</div>
+      </div>
+      <div id="zz-banner" class="banner hidden"></div>
+
+      <!-- ── end screen ───────────────────────────────────────────────── -->
+      <div id="overrun" class="overlay hidden">
+        <div class="panel">
+          <h1 class="logo red">OVERRUN</h1>
+          <p id="ov-line" class="hint center"></p>
+          <ul id="ov-players" class="roster"></ul>
+          <button id="btn-again" class="btn primary big">BACK TO LOBBY</button>
+        </div>
+      </div>
+
+      <!-- touch controls (Input.ts expects these; hidden on desktop) -->
+      <div id="stick" class="touch-ui"><div id="stick-knob"></div></div>
+      <button id="btn-fire" class="touch-ui touch-btn">FIRE</button>
+      <button id="btn-jump" class="touch-ui touch-btn">JUMP</button>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
