@@ -204,7 +204,7 @@ see `urban.rs`):
 - Fuzz: extend `crates/zz-core/tests/mapgen_fuzz.rs` to all 4 envs.
 - DoD: fuzz green ×4; load each env in browser + native; env picker works.
 
-## [ ] 6. Proximity voice (task #13) — server relay DONE (zz-server M8a, commit 9049422: BIN_VOICE=2, authoritative slot rewrite, radius fan-out, bot suite). REMAINING: client capture/playback below.
+## [x] 6. Proximity voice (task #13) — DONE both halves (server M8a 9049422; client M13 4ef3ebc: muted-by-default open mic on M, permission on first unmute, jitter buffers, 10-25 m fade + equal-power pan, HUD mic chip). HUMAN CHECKLIST: real-mic test with two browsers on the deployed server (steps in the M13 report / hud chip states MUTED/ON/LIVE/DENIED).
 
 Design (ShotAnte port, one-to-N): new binary tag BIN_VOICE=2 —
 `[tag u8, speaker_slot u8, 16kHz mono i16 PCM ~120ms]`. Server
