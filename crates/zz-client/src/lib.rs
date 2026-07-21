@@ -11,6 +11,7 @@ pub mod game;
 pub mod hud;
 pub mod lobby_ui;
 pub mod map_render;
+pub mod mountain_dressing;
 pub mod models;
 pub mod net;
 pub mod platform;

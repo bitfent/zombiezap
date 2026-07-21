@@ -18,7 +18,10 @@
 //! - edge-trim `LineList` outlines on street furniture only;
 //! - warm window slits on tall Building faces, merged into ONE emissive mesh;
 //! - voxel cloud box clusters under a single drift root (one transform
-//!   per frame for the whole layer).
+//!   per frame for the whole layer);
+//! - M28 MountainTown-only dressing (slope skirts, pines, rocks, horizon
+//!   ridge, band-tinted ground) via [`crate::mountain_dressing`] — gated on
+//!   `EnvKind`, zero sim / WalkGrid impact.
 //!
 //! **Barrels:** `GameMap` does not carry barrel indices (only walls/spawns/…);
 //! explosive-barrel meshes are skipped until zz-core exposes them.
@@ -315,7 +318,9 @@ impl MeshGeom {
         self.positions.is_empty()
     }
 
-    fn append_box(&mut self, aabb: &Aabb) {
+    /// Append a solid box (six faces, CCW outward). Used by map families and
+    /// mountain dressing rock outcrops.
+    pub fn append_box(&mut self, aabb: &Aabb) {
         let x0 = aabb.x0;
         let x1 = aabb.x1;
         let y0 = aabb.y0;
@@ -377,7 +382,13 @@ impl MeshGeom {
 
     /// Quad with CCW winding when the outward normal points toward the viewer
     /// (geometric normal from indices matches `normal`).
-    fn push_face(&mut self, corners: [[f32; 3]; 4], normal: [f32; 3], u_size: f32, v_size: f32) {
+    pub fn push_face(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        normal: [f32; 3],
+        u_size: f32,
+        v_size: f32,
+    ) {
         let base = self.positions.len() as u32;
         let u_max = u_size * UV_PER_M;
         let v_max = v_size * UV_PER_M;
@@ -978,13 +989,23 @@ fn sample_concrete_px(tile: &[u8], tile_size: u32, u: i32, v: i32) -> [u8; 3] {
 
 /// Whole-arena ground texture: ShotAnte asphalt concrete tiled at 2 m/tile,
 /// baked shadow mask multiplied in. UV 0..1 across the map (not GPU-tiled).
-fn gen_ground_lit(size: u32, half: f32, occlusion: &[f32], occ_res: u32) -> Image {
+///
+/// MountainTown: soft per-band tint (low grassy / mid scree / high frost) —
+/// zero runtime cost, baked once with the shadow mask.
+fn gen_ground_lit(
+    size: u32,
+    half: f32,
+    occlusion: &[f32],
+    occ_res: u32,
+    env: EnvKind,
+) -> Image {
     // Legacy: base #8d9099, seam #797d88, panels 4, grain 120; one tile / 2 m.
     const TILE_M: f32 = 2.0;
     const PAT: u32 = 128;
     let tile = concrete_texture_rgba(PAT, [0x8d, 0x90, 0x99], [0x79, 0x7d, 0x88], 4, 120.0);
     let mut px = Vec::with_capacity((size * size * 4) as usize);
     let diameter = 2.0 * half;
+    let mountain = env == EnvKind::MountainTown;
     for y in 0..size {
         for x in 0..size {
             let u = (x as f32 + 0.5) / size as f32;
@@ -1004,6 +1025,12 @@ fn gen_ground_lit(size: u32, half: f32, occlusion: &[f32], occ_res: u32) -> Imag
             let factor = (light * rim_dark).clamp(0.0, 1.0);
             for c in &mut rgb {
                 *c = ((*c as f32) * factor).clamp(0.0, 255.0) as u8;
+            }
+            if mountain {
+                let tint = crate::mountain_dressing::mountain_band_tint(wz);
+                rgb[0] = ((rgb[0] as f32) * tint[0]).clamp(0.0, 255.0) as u8;
+                rgb[1] = ((rgb[1] as f32) * tint[1]).clamp(0.0, 255.0) as u8;
+                rgb[2] = ((rgb[2] as f32) * tint[2]).clamp(0.0, 255.0) as u8;
             }
             px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
@@ -1313,6 +1340,7 @@ fn rebuild_map_system(
         map.arena_half,
         &ground_occlusion,
         occ_res,
+        map.env,
     ));
     let tex_building = images.add(tiled(gen_building_tex(map.env, 128)));
     let tex_perimeter = images.add(tiled(gen_perimeter_tex(map.env, 128)));
@@ -1583,6 +1611,11 @@ fn rebuild_map_system(
                     .looking_to(-light.sun_to, Vec3::Y),
                 Name::new("SunDisc"),
             ));
+
+            // ── M28 mountain identity (env-gated; zero sim impact) ─────────
+            if map.env == EnvKind::MountainTown {
+                spawn_mountain_dressing(root, map, &mut meshes, &mut materials, &mut images);
+            }
         });
 
     // Mark this seed/env as built so we don't re-bake every frame (which
@@ -1604,6 +1637,98 @@ fn wall_material(
         metallic: 0.0,
         reflectance: 0.0,
         ..default()
+    }
+}
+
+/// M28: mountain-only props under MapRoot — slope skirts, pines, rocks, ridge.
+/// A handful of merged meshes / materials (PS2 budget).
+fn spawn_mountain_dressing(
+    root: &mut ChildSpawnerCommands,
+    map: &GameMap,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) {
+    use crate::mountain_dressing::{
+        build_mountain_dressing, gen_bark_tex, gen_earth_scree_tex, gen_needle_tex, gen_stone_tex,
+    };
+
+    let dress = build_mountain_dressing(map);
+
+    let earth_tex = images.add(tiled(gen_earth_scree_tex(64)));
+    let needle_tex = images.add(tiled(gen_needle_tex(64)));
+    let bark_tex = images.add(tiled(gen_bark_tex(64)));
+    let stone_tex = images.add(tiled(gen_stone_tex(64)));
+
+    let earth_mat = materials.add(wall_material(Color::WHITE, Some(earth_tex), 0.97));
+    let needle_mat = materials.add(wall_material(Color::WHITE, Some(needle_tex), 0.95));
+    let bark_mat = materials.add(wall_material(Color::WHITE, Some(bark_tex), 0.96));
+    let stone_mat = materials.add(wall_material(Color::WHITE, Some(stone_tex), 0.97));
+    // Ridge: unlit, vertex colors carry rock/snow two-tone; fog on for distance.
+    let ridge_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        unlit: true,
+        fog_enabled: true,
+        perceptual_roughness: 1.0,
+        metallic: 0.0,
+        reflectance: 0.0,
+        cull_mode: Some(bevy::render::render_resource::Face::Back),
+        ..default()
+    });
+
+    if !dress.slopes.is_empty() {
+        let mesh = meshes.add(dress.slopes.into_mesh());
+        root.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(earth_mat),
+            Transform::IDENTITY,
+            Name::new("Mountain/Slopes"),
+        ));
+    }
+    if !dress.pine_trunks.is_empty() {
+        let mesh = meshes.add(dress.pine_trunks.into_mesh());
+        root.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(bark_mat),
+            Transform::IDENTITY,
+            Name::new("Mountain/PineTrunks"),
+        ));
+    }
+    if !dress.pine_needles.is_empty() {
+        let mesh = meshes.add(dress.pine_needles.into_mesh());
+        root.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(needle_mat.clone()),
+            Transform::IDENTITY,
+            Name::new("Mountain/PineNeedles"),
+        ));
+    }
+    if !dress.pine_far.is_empty() {
+        let mesh = meshes.add(dress.pine_far.into_mesh());
+        root.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(needle_mat),
+            Transform::IDENTITY,
+            Name::new("Mountain/PineFar"),
+        ));
+    }
+    if !dress.rocks.is_empty() {
+        let mesh = meshes.add(dress.rocks.into_mesh());
+        root.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(stone_mat),
+            Transform::IDENTITY,
+            Name::new("Mountain/Rocks"),
+        ));
+    }
+    if !dress.ridge.is_empty() {
+        let mesh = meshes.add(dress.ridge.into_mesh());
+        root.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(ridge_mat),
+            Transform::IDENTITY,
+            Name::new("Mountain/Ridge"),
+        ));
     }
 }
 
@@ -1949,7 +2074,7 @@ mod tests {
 
         // Procedural textures must not panic.
         let occ = bake_ground_occlusion(8, map.arena_half, Vec3::new(0.4, 0.8, 0.3), &map.walls);
-        let _ = gen_ground_lit(16, map.arena_half, &occ, 8);
+        let _ = gen_ground_lit(16, map.arena_half, &occ, 8, EnvKind::Urban);
         let tint = env_texture_tint(EnvKind::Urban);
         let _ = gen_cover(16, tint);
         let _ = gen_building_tex(EnvKind::Urban, 16);
@@ -2055,7 +2180,7 @@ mod tests {
         let occ_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        let _tex = gen_ground_lit(ground_r, map.arena_half, &occ, occ_r);
+        let _tex = gen_ground_lit(ground_r, map.arena_half, &occ, occ_r, EnvKind::RomeEur);
         let ground_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
