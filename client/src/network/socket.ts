@@ -10,7 +10,14 @@ import {
 } from "@shotante/shared";
 
 // zz-server upgrades WebSockets on /ws (the root serves the web build).
-const URL = (import.meta as any).env?.VITE_SERVER_URL ?? "ws://localhost:8080/ws";
+// Same-origin by default so the built client works wherever it's served
+// (localhost, LAN phone, deployed); the Vite dev server (port 5174) isn't
+// the game server, so dev falls back to localhost:8080.
+const URL =
+  (import.meta as any).env?.VITE_SERVER_URL ??
+  (location.port === "5174"
+    ? "ws://localhost:8080/ws"
+    : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
 
 export class GameSocket {
   private ws: WebSocket | null = null;

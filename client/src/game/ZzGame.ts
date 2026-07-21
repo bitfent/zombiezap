@@ -111,6 +111,7 @@ export class ZzGame {
     this.input = new Input(canvas);
     this.buildWorld();
     this.loadArena(generateArena(seed));
+    if ((import.meta as any).env?.DEV) (window as any).__zz = this;
   }
 
   // ── world (ShotAnte recipe) ──────────────────────────────────────────────
