@@ -51,7 +51,7 @@ impl Plugin for LobbyUiPlugin {
         if !app.is_plugin_added::<EguiPlugin>() {
             app.add_plugins(EguiPlugin::default());
         }
-        // M23: same-frame press+release must never drop menu clicks.
+        // M23b: same-frame move+press / press+release must never drop menu clicks.
         if !app.is_plugin_added::<EguiClickLatchPlugin>() {
             app.add_plugins(EguiClickLatchPlugin);
         }

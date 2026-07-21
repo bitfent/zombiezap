@@ -318,7 +318,7 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
 
 36. **Browser-automation verification quirks** (Claude/CDP browser pane):
     synthesized DOM `KeyboardEvent`s and CDP key taps never reach winit —
-    only real mouse input works. **M23 fixed same-frame egui clicks**
+    only real mouse input works. **M23b fixed teleport / same-frame egui clicks**
     (`egui_click_latch.rs`): a plain `left_click` on HOST / JOIN / START /
     LEAVE / env / BACK is enough — no 1 px drag workaround. Keyboard turn
     keys (Q/X, `game.rs`) still help touch-mode automation (`?touch=1`)
@@ -454,7 +454,7 @@ row sits near the lower-middle of the card. Approximate click centres:
 | SEA        | **(720, 455)** |
 | ROME EUR   | **(800, 455)** — wraps to next line if tight: **(520, 485)** |
 
-Plain `left_click` is enough (M23 latch); 1 px drag is no longer required.
+Plain `left_click` is enough (M23b latch); 1 px drag is no longer required.
 
 43. **Proximity voice (M13 client):** open-mic once unmuted, **muted by
     default** (privacy). **M** toggles mute in-match. Mic permission is
@@ -501,14 +501,17 @@ Plain `left_click` is enough (M23 latch); 1 px drag is no longer required.
     — only camera + crumple cleanup + stats overlay. A stale horde + full
     interp was the 3–5 fps OVERRUN collapse.
 
-46. **egui same-frame click (M23 fixed):** bevy_egui multipass could drop a
-    press+release that lands in one frame (trackpads + automation). Fixed by
+46. **egui same-frame click (M23b fixed):** bevy_egui multipass could drop a
+    press+release that lands in one frame (trackpads + automation), and a
+    plain automation teleport click (CursorMoved+press+release in one winit
+    batch) could still miss because press ran against stale hover. Fixed by
     `egui_click_latch::EguiClickLatchPlugin` — after
-    `EguiPreUpdateSet::ProcessInput`, same-frame pointer releases are
-    deferred one frame so every egui widget sees press then release across
-    two passes. Bevy UI buttons (stats BACK) still edge-detect without
-    `Changed<Interaction>`. Transient garbled egui glyphs ("n ob") remain an
-    upstream atlas quirk — clear on the next full repaint; not client-owned.
+    `EguiPreUpdateSet::ProcessInput`, co-batched move+press and press+release
+    are re-staged across frames (move → press → release) so every egui widget
+    sees them in order; already-spanned human input is not delayed. Bevy UI
+    buttons (stats BACK) still edge-detect without `Changed<Interaction>`.
+    Transient garbled egui glyphs ("n ob") remain an upstream atlas quirk —
+    clear on the next full repaint; not client-owned.
 
 47. **Space jump + prediction (M20):** browser Space is captured in
     `web/index.html` (capture-phase `keydown`/`keyup` → `window.__zzKeys.space`
