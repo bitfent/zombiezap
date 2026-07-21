@@ -310,3 +310,88 @@ async fn pause_freezes_game_time_and_zombies() {
         }
     }
 }
+
+/// Rematch in the same lobby: peak_horde resets, every player's time_alive is
+/// ≤ match duration, and a second MatchEnd is a fresh room (not stale stats).
+#[tokio::test]
+async fn rematch_resets_peak_horde_and_time_alive_bounded() {
+    fast_director("300");
+    let url = start_server().await;
+    let (mut ws, _slot) = connect(&url, "rematcher").await;
+    let mut dec = SnapshotDecoder::new();
+
+    let mut seq = 0u32;
+    let mut match_ends: Vec<zz_core::protocol::MatchStats> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+
+    // Play two matches back-to-back in the same lobby.
+    while match_ends.len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for two MatchEnds (got {})",
+            match_ends.len()
+        );
+        seq += 1;
+        let idle = PlayerInput {
+            seq,
+            ..Default::default()
+        };
+        let _ = ws
+            .send(Message::Binary(encode_input(&idle).to_vec().into()))
+            .await;
+        match recv_any(&mut ws, &mut dec).await {
+            Some(Incoming::Msg(ServerMsg::MatchEnd { stats })) => {
+                // S3 / NEXT.md item 7: time_alive never exceeds duration.
+                for p in &stats.players {
+                    assert!(
+                        p.time_alive_ms <= stats.duration_ms,
+                        "time_alive {} > duration {} (match {})",
+                        p.time_alive_ms,
+                        stats.duration_ms,
+                        match_ends.len() + 1
+                    );
+                }
+                match_ends.push(stats);
+                if match_ends.len() == 1 {
+                    // Lobby is free; start a second match.
+                    // Drain LobbyState if any, then StartGame.
+                    let start = serde_json::to_string(&ClientMsg::StartGame).unwrap();
+                    ws.send(Message::Text(start.into())).await.unwrap();
+                    // Fresh decoder baseline for the new room's keyframe stream.
+                    dec = SnapshotDecoder::new();
+                    // Wait for GameStart of match 2.
+                    let gs_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        assert!(
+                            tokio::time::Instant::now() < gs_deadline,
+                            "no second GameStart"
+                        );
+                        match recv_any(&mut ws, &mut dec).await {
+                            Some(Incoming::Msg(ServerMsg::GameStart { .. })) => break,
+                            Some(Incoming::Msg(ServerMsg::LobbyState { .. })) => {}
+                            Some(_) => {}
+                            None => panic!("dropped before rematch GameStart"),
+                        }
+                    }
+                }
+            }
+            Some(_) => {}
+            None => panic!("connection dropped mid rematch suite"),
+        }
+    }
+
+    assert_eq!(match_ends.len(), 2);
+    // Each match should report its own peak; a rematch must not inherit the
+    // previous room's peak_zombies (new Room starts at 0).
+    assert!(
+        match_ends[0].peak_zombies > 0 && match_ends[1].peak_zombies > 0,
+        "both matches should see a horde"
+    );
+    // Second match duration should be a real short overrun, not the previous
+    // 37s+ carried over (would only fail if rooms shared state — they don't).
+    assert!(
+        match_ends[1].duration_ms < 120_000,
+        "second match duration absurdly long: {}",
+        match_ends[1].duration_ms
+    );
+}

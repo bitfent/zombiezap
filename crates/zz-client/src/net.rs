@@ -70,6 +70,13 @@ impl NetClient {
         }
     }
 
+    /// Reset the snapshot decoder baseline. Call on every `GameStart` so a
+    /// rematch's keyframe is not applied against the previous room's state
+    /// (rooms each own a fresh encoder; the client must match).
+    pub fn reset_decoder(&mut self) {
+        self.decoder = SnapshotDecoder::new();
+    }
+
     /// Drain everything that arrived since last frame. Call once per frame.
     pub fn drain(&mut self) -> Vec<NetEvent> {
         let mut out = Vec::new();

@@ -51,9 +51,12 @@ impl Plugin for HudPlugin {
         app.add_systems(
             Update,
             (
-                gate_visibility,
+                // After session so a same-frame GameStart → Playing makes chrome
+                // Visible immediately (no one-frame blank HUD).
+                gate_visibility.after(game::GameSessionSet),
+                reset_hud_on_match_start.after(game::GameSessionSet),
                 lift_hud_for_thumbs,
-                pause_key.run_if(game::in_match),
+                pause_key.run_if(game::playing),
                 (
                     update_crosshair,
                     update_vitals,
@@ -66,7 +69,8 @@ impl Plugin for HudPlugin {
                 )
                     .run_if(playing),
                 (update_stats_overlay, stats_back_button).run_if(ended),
-                (drain_fx, tick_fx, sync_loot, sync_flight_grenades).run_if(game::in_match),
+                // FX only while playing — Ended freezes the world (S7).
+                (drain_fx, tick_fx, sync_loot, sync_flight_grenades).run_if(playing),
             ),
         );
     }
@@ -187,8 +191,9 @@ fn lift_hud_for_thumbs(
 }
 
 /// Standard in-match HUD chrome (hidden unless Session::Playing).
+/// Public so headless match-flow tests can assert visibility.
 #[derive(Component)]
-struct HudChrome;
+pub struct HudChrome;
 
 #[derive(Component)]
 struct CrosshairArm;
@@ -647,6 +652,17 @@ fn setup_hud_ui(mut commands: Commands) {
 
 // ── visibility gate ────────────────────────────────────────────────────────
 
+/// Clear vignette / crosshair flash when a new match begins so rematch never
+/// inherits a full-screen red wash from the previous wipe.
+fn reset_hud_on_match_start(session: Res<Session>, mut local: ResMut<HudLocal>) {
+    if !session.is_changed() {
+        return;
+    }
+    if matches!(*session, Session::Playing { .. }) {
+        *local = HudLocal::default();
+    }
+}
+
 fn gate_visibility(
     session: Res<Session>,
     mut sets: ParamSet<(
@@ -661,7 +677,8 @@ fn gate_visibility(
 ) {
     let is_playing = matches!(*session, Session::Playing { .. });
     let is_ended = matches!(*session, Session::Ended { .. });
-    let in_match = is_playing || is_ended;
+    // FX root only while actively playing — freeze combat visuals on OVERRUN.
+    let fx_live = is_playing;
 
     let chrome_vis = if is_playing {
         Visibility::Visible
@@ -682,7 +699,7 @@ fn gate_visibility(
     for mut vis in sets.p2().iter_mut() {
         *vis = stats_vis;
     }
-    let fx_vis = if in_match {
+    let fx_vis = if fx_live {
         Visibility::Visible
     } else {
         Visibility::Hidden
@@ -1072,11 +1089,15 @@ fn update_stats_overlay(
     roster: Res<Roster>,
     mut match_line: Query<&mut Text, With<StatsMatchLine>>,
     list_q: Query<Entity, With<StatsPlayerList>>,
-    rows: Query<(Entity, &StatsPlayerRow)>,
+    mut rows: Query<(Entity, &StatsPlayerRow, &mut Text), Without<StatsMatchLine>>,
 ) {
     let Some(stats) = last.0.as_ref() else {
         for mut t in &mut match_line {
             **t = "…".into();
+        }
+        // Drop stale rows when last_stats is cleared (GameStart / BackToLobby).
+        for (e, _, _) in rows.iter() {
+            commands.entity(e).despawn();
         }
         return;
     };
@@ -1096,17 +1117,22 @@ fn update_stats_overlay(
     };
 
     let wanted_slots: HashSet<u8> = stats.players.iter().map(|p| p.slot).collect();
-    for (e, row) in rows.iter() {
-        if !wanted_slots.contains(&row.slot) {
-            commands.entity(e).despawn();
-        }
+    let to_despawn: Vec<Entity> = rows
+        .iter()
+        .filter(|(_, row, _)| !wanted_slots.contains(&row.slot))
+        .map(|(e, _, _)| e)
+        .collect();
+    for e in to_despawn {
+        commands.entity(e).despawn();
     }
-    let existing: HashSet<u8> = rows.iter().map(|(_, r)| r.slot).collect();
 
+    // Snapshot existing slots first (no simultaneous mut borrow).
+    let existing: HashMap<u8, Entity> = rows.iter().map(|(e, r, _)| (r.slot, e)).collect();
+
+    // Per-player lines — always rewrite text so rematch never keeps the
+    // previous match's survivor numbers under a fresh header.
+    let mut spawn_lines: Vec<(u8, String)> = Vec::new();
     for p in &stats.players {
-        if existing.contains(&p.slot) {
-            continue;
-        }
         let name = if p.name.is_empty() {
             roster
                 .0
@@ -1124,9 +1150,18 @@ fn update_stats_overlay(
             k = p.kills,
             d = p.damage_dealt,
         );
+        if let Some(&e) = existing.get(&p.slot) {
+            if let Ok((_, _, mut text)) = rows.get_mut(e) {
+                **text = line;
+            }
+        } else {
+            spawn_lines.push((p.slot, line));
+        }
+    }
+    for (slot, line) in spawn_lines {
         commands.entity(list).with_children(|c| {
             c.spawn((
-                StatsPlayerRow { slot: p.slot },
+                StatsPlayerRow { slot },
                 Text::new(line),
                 mono(14.0),
                 TextColor(Color::srgb(0.88, 0.9, 0.82)),
@@ -1136,9 +1171,12 @@ fn update_stats_overlay(
 }
 
 fn stats_back_button(
+    // Do not require `Changed<Interaction>`: same-frame press+release (egui /
+    // trackpad / automation) can leave Interaction never observed as Pressed
+    // across two frames. Edge-detect with our own was-pressed flag instead.
     mut q: Query<
         (&Interaction, &mut StatsBackWasPressed, &mut BackgroundColor),
-        (With<StatsBackButton>, Changed<Interaction>),
+        With<StatsBackButton>,
     >,
     mut ui: ResMut<UiQueue>,
 ) {

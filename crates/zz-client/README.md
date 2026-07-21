@@ -412,3 +412,28 @@ Prefer a 1 px `left_click_drag` (item 36) so egui registers the press.
     - Nothing blocks a frame; capture/play queues drop oldest on overflow.
     - Unit tests cover jitter OOO, fade/pan bounds, and fake-capture
       encode→decode→jitter round-trip (no real mic required in CI).
+
+44. **Match-flow / rematch (M14):** first-match map build uses a durable
+    `BuiltMapKey` (seed+env) rather than only `Res::is_changed`, so a
+    `CurrentMap` inserted after the rebuild system in the same frame still
+    builds on the next tick (and recovers if `MapRoot` is missing). Rebuild
+    runs in `Update` **after** `GameSessionSet`. Rematch: client resets the
+    snapshot decoder on every `GameStart`, clears `LatestSnapshot` /
+    `LastStats` / `FxQueue`, and despawns remotes; server **stops snapshot
+    broadcast after `MatchEnd`** so the old room cannot corrupt the next
+    room's stream on the shared `OutMsg` channel. `MatchStats.time_alive_ms`
+    is clamped to `duration_ms`. Headless coverage:
+    `crates/zz-client/tests/match_flow.rs` +
+    `bot_horde::rematch_resets_peak_horde_and_time_alive_bounded`.
+
+45. **Ended-state perf (M14 / S7):** while `Session::Ended`, do **not** run
+    remote interpolation, rig animation, growls, FX drain, or FPS controller
+    — only camera + crumple cleanup + stats overlay. A stale horde + full
+    interp was the 3–5 fps OVERRUN collapse.
+
+46. **egui same-frame click (item 36 still applies):** bevy_egui multipass can
+    drop a press+release that lands in one frame (trackpads + automation).
+    Prefer 1 px `left_click_drag`. Bevy UI buttons (stats BACK) edge-detect
+    without requiring `Changed<Interaction>` so same-frame presses still fire.
+    Transient garbled egui glyphs ("n ob") are an upstream atlas quirk —
+    they clear on the next full repaint; not client-owned.

@@ -103,13 +103,30 @@ fn setup_present(mut commands: Commands, target: Res<RetroTarget>) {
 
 /// Keep the blit node letterboxed to the window (runs cheaply: writes only
 /// when the window size actually changed).
+///
+/// Uses `Query` (not `Single`) so a missing window / blit during startup
+/// cannot silently skip the system forever if the param set is unsatisfied
+/// on the first frames. Re-fits whenever the logical size changes — including
+/// when the `#zz-map-attrib` footer resizes the canvas parent after first paint
+/// (a common source of top-band / right-band retro corruption).
 fn fit_blit_node(
-    window: Single<&Window>,
+    windows: Query<&Window>,
     mut last: Local<Vec2>,
-    mut node: Single<&mut Node, With<RetroBlit>>,
+    mut nodes: Query<&mut Node, With<RetroBlit>>,
 ) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Ok(mut node) = nodes.single_mut() else {
+        return;
+    };
     let size = Vec2::new(window.width(), window.height());
-    if size == *last || size.x <= 0.0 || size.y <= 0.0 {
+    // Ignore zero-size (pre-layout wasm canvas); do not cache it as `last` or
+    // we would never re-fit once the canvas becomes real.
+    if size.x <= 1.0 || size.y <= 1.0 {
+        return;
+    }
+    if size == *last {
         return;
     }
     *last = size;

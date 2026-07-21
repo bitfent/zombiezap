@@ -33,6 +33,11 @@ const PENDING_CAP: usize = 64;
 
 pub struct GamePlugin;
 
+/// Session / net systems. Map rebuild and HUD gate run after this set so a
+/// same-frame `GameStart` → `CurrentMap` insert is visible before rebuild.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GameSessionSet;
+
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Session::default())
@@ -52,6 +57,7 @@ impl Plugin for GamePlugin {
             .insert_resource(PrevSelf::default())
             .insert_resource(ViewmodelKick::default())
             .insert_resource(GrowlMemory::default())
+            .configure_sets(Update, GameSessionSet)
             .add_systems(
                 Update,
                 (
@@ -59,24 +65,27 @@ impl Plugin for GamePlugin {
                     net_poll,
                     process_intents,
                     sync_cursor,
-                    fps_controller.run_if(in_match),
+                    // In-match only (not Ended): freeze the world on OVERRUN so
+                    // we don't keep interpolating/animating a huge horde at 3 fps.
+                    fps_controller.run_if(playing),
                     apply_camera.run_if(in_match),
-                    interpolate_remotes.run_if(in_match),
-                    animate_rigs.run_if(in_match),
+                    interpolate_remotes.run_if(playing),
+                    animate_rigs.run_if(playing),
                     tick_crumples.run_if(in_match),
                     ensure_viewmodel.run_if(in_match),
-                    tick_viewmodel_sys.run_if(in_match),
-                    proximity_growls.run_if(in_match),
+                    tick_viewmodel_sys.run_if(playing),
+                    proximity_growls.run_if(playing),
                     cleanup_match_visuals,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(GameSessionSet),
             );
     }
 }
 
 // ── session state ──────────────────────────────────────────────────────────
 
-#[derive(Resource, Default, PartialEq)]
+#[derive(Resource, Debug, Default, PartialEq, Eq, Clone)]
 pub enum Session {
     #[default]
     Boot,
@@ -117,6 +126,11 @@ struct PrevSelf {
 
 pub fn in_match(session: Res<Session>) -> bool {
     session.my_slot().is_some()
+}
+
+/// True only while actively playing (not the OVERRUN / stats screen).
+pub fn playing(session: Res<Session>) -> bool {
+    matches!(*session, Session::Playing { .. })
 }
 
 /// True while the skeleton fly-camera should still fly (menu/boot states).
@@ -170,6 +184,16 @@ pub struct RemotePlayer {
     buf: VecDeque<(f64, Vec3, f32)>, // (recv time, feet pos, yaw)
 }
 
+impl RemotePlayer {
+    /// Empty interpolation buffer (tests / spawn before first sample).
+    pub fn new(slot: u8) -> Self {
+        Self {
+            slot,
+            buf: VecDeque::new(),
+        }
+    }
+}
+
 #[derive(Component)]
 pub struct RemoteZombie {
     pub id: u16,
@@ -177,6 +201,18 @@ pub struct RemoteZombie {
     /// Snapshot attack state (1 = telegraph / windup).
     pub state: u8,
     buf: VecDeque<(f64, Vec3, f32)>,
+}
+
+impl RemoteZombie {
+    /// Empty interpolation buffer (tests / spawn before first sample).
+    pub fn new(id: u16, kind: u8) -> Self {
+        Self {
+            id,
+            kind,
+            state: 0,
+            buf: VecDeque::new(),
+        }
+    }
 }
 
 /// Tracks own-shot recoil kicks so the viewmodel can react without racing hud's Fx drain.
@@ -286,6 +322,9 @@ fn net_poll(
                 players,
             }) => {
                 info!("game_start: slot {your_slot}, env {env:?}, seed {map_seed}");
+                // Fresh snapshot baseline — previous room's encoder state must
+                // not bleed into this match's keyframe stream.
+                net.reset_decoder();
                 // Clear leftover remotes / crumples from a previous match.
                 for (e, _, _, _) in zombies.iter() {
                     commands.entity(e).despawn();
@@ -293,11 +332,15 @@ fn net_poll(
                 for (e, _) in remotes.iter() {
                     commands.entity(e).despawn();
                 }
+                // Wipe stale HUD/world seams so rematch never paints last
+                // match's OVERRUN numbers or horde for a frame.
+                seams.latest.0 = None;
+                seams.last_stats.0 = None;
+                seams.fx.0.clear();
                 commands.insert_resource(CurrentMap(generate_map(env, &map_seed)));
                 *session = Session::Playing { my_slot: your_slot };
                 *predicted = Predicted::default();
                 *seams.prev_self = PrevSelf::default();
-                seams.last_stats.0 = None;
                 seams.roster.0 = players
                     .iter()
                     .map(|p| (p.slot, p.name.clone(), p.slot == your_slot))
@@ -305,6 +348,12 @@ fn net_poll(
                 vm_kick.pending = 0;
             }
             NetEvent::Msg(ServerMsg::MatchEnd { stats }) => {
+                // Only honour MatchEnd while we're actually in a match. A late
+                // frame from a previous room (before the server stop-on-end
+                // fix) must not yank a rematch back to OVERRUN with stale stats.
+                if !matches!(*session, Session::Playing { .. }) {
+                    continue;
+                }
                 info!(
                     "TEAM WIPED — {} zombies killed, survived {} s",
                     stats.zombies_killed,
@@ -446,13 +495,10 @@ fn net_poll(
                     {
                         push_sample(&mut rp.buf, now, pos, yaw);
                     } else {
-                        let mut buf = VecDeque::new();
-                        push_sample(&mut buf, now, pos, yaw);
+                        let mut rp = RemotePlayer::new(p.slot);
+                        push_sample(&mut rp.buf, now, pos, yaw);
                         let mut ent = commands.spawn((
-                            RemotePlayer {
-                                slot: p.slot,
-                                buf,
-                            },
+                            rp,
                             Transform::from_translation(pos),
                             Visibility::default(),
                         ));
@@ -490,15 +536,11 @@ fn net_poll(
                         push_sample(&mut rz.buf, now, pos, yaw);
                     } else {
                         let scale = models::kind_scale(kind);
-                        let mut buf = VecDeque::new();
-                        push_sample(&mut buf, now, pos, yaw);
+                        let mut rz = RemoteZombie::new(z.id, kind);
+                        rz.state = z.state;
+                        push_sample(&mut rz.buf, now, pos, yaw);
                         let mut ent = commands.spawn((
-                            RemoteZombie {
-                                id: z.id,
-                                kind,
-                                state: z.state,
-                                buf,
-                            },
+                            rz,
                             Transform::from_translation(pos).with_scale(scale),
                             Visibility::default(),
                         ));
@@ -572,7 +614,7 @@ fn process_intents(
             }
             UiIntent::BackToLobby => {
                 // the server already returned the roster to the lobby; we just
-                // dismiss the stats overlay
+                // dismiss the stats overlay and drop the frozen match mirror
                 *session = Session::InLobby;
             }
             UiIntent::PauseToggle => {
@@ -974,9 +1016,13 @@ fn proximity_growls(
 }
 
 /// Despawn match-only visuals when leaving Playing/Ended.
+#[allow(clippy::too_many_arguments)] // Bevy system params
 fn cleanup_match_visuals(
     session: Res<Session>,
     mut commands: Commands,
+    mut latest: ResMut<crate::seams::LatestSnapshot>,
+    mut last_stats: ResMut<crate::seams::LastStats>,
+    mut fx: ResMut<crate::seams::FxQueue>,
     players: Query<Entity, With<RemotePlayer>>,
     zombies: Query<Entity, With<RemoteZombie>>,
     crumples: Query<Entity, With<CrumpleFx>>,
@@ -992,6 +1038,9 @@ fn cleanup_match_visuals(
     if keep {
         return;
     }
+    // Left the match (lobby / menu / disconnect): drop every remote entity
+    // and the seam mirrors so a rematch never inherits a stale horde or
+    // OVERRUN numbers.
     for e in players
         .iter()
         .chain(zombies.iter())
@@ -1000,4 +1049,7 @@ fn cleanup_match_visuals(
     {
         commands.entity(e).despawn();
     }
+    latest.0 = None;
+    last_stats.0 = None;
+    fx.0.clear();
 }

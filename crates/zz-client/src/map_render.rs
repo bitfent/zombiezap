@@ -23,6 +23,7 @@ use std::f32::consts::PI;
 
 use bevy::{
     asset::RenderAssetUsages,
+    camera::ClearColorConfig,
     image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor},
     mesh::Indices,
     pbr::{DistanceFog, FogFalloff},
@@ -977,9 +978,29 @@ const CLOUD_HEIGHT: f32 = 55.0;
 const CLOUD_DRIFT_AMP: f32 = 12.0;
 const CLOUD_DRIFT_SPEED: f32 = 0.04;
 
+/// Identity of the last map we fully built. Survives `is_changed` clearing so
+/// a `CurrentMap` inserted after this system runs in the same frame is still
+/// built on the next tick — and a missing `MapRoot` forces a recovery rebuild.
+#[derive(Resource, Default)]
+struct BuiltMapKey {
+    seed: String,
+    env: Option<EnvKind>,
+}
+
 impl Plugin for MapRenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (rebuild_map_system, drift_clouds_system));
+        app.init_resource::<BuiltMapKey>()
+            // Ensure the set exists even if GamePlugin is not loaded (headless tests).
+            .configure_sets(Update, crate::game::GameSessionSet)
+            .add_systems(
+                Update,
+                // After GameSessionSet so a same-frame GameStart → CurrentMap is
+                // applied before we decide to rebuild (BuiltMapKey also recovers
+                // if ordering ever misses a frame).
+                (rebuild_map_system, drift_clouds_system)
+                    .chain()
+                    .after(crate::game::GameSessionSet),
+            );
     }
 }
 
@@ -998,17 +1019,27 @@ fn rebuild_map_system(
     current: Option<Res<CurrentMap>>,
     roots: Query<Entity, With<MapRoot>>,
     placeholders: Query<Entity, With<Placeholder>>,
-    cameras: Query<Entity, With<Camera3d>>,
+    mut cameras: Query<(Entity, &mut Camera), With<Camera3d>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut ambient: ResMut<GlobalAmbientLight>,
     mut clear_color: ResMut<ClearColor>,
+    mut built: ResMut<BuiltMapKey>,
 ) {
     let Some(current) = current else {
         return;
     };
-    if !current.is_changed() {
+
+    let map = &current.0;
+    let has_root = !roots.is_empty();
+    let key_matches = built.env == Some(map.env) && built.seed == map.seed;
+    // Rebuild when:
+    //  - CurrentMap just changed (GameStart / rematch), OR
+    //  - we have a map resource but no MapRoot (first-frame order miss / lost), OR
+    //  - placeholders still linger under an existing map (partial build).
+    let has_placeholders = !placeholders.is_empty();
+    if key_matches && has_root && !has_placeholders && !current.is_changed() {
         return;
     }
 
@@ -1020,7 +1051,6 @@ fn rebuild_map_system(
         commands.entity(e).despawn();
     }
 
-    let map = &current.0;
     let accent = accent_color(map.accent);
 
     // ── Atmosphere: sky, fog, hemisphere-style fill (per env) ──────────────
@@ -1029,7 +1059,10 @@ fn rebuild_map_system(
     ambient.color = light.ambient;
     ambient.brightness = light.ambient_brightness;
     // Fog scales with the arena: streets stay crisp, horizon hazes.
-    for cam in cameras.iter() {
+    // Force each 3D camera clear to the env sky so the retro target never
+    // keeps the menu-dark clear across a rematch (S5).
+    for (cam, mut camera) in cameras.iter_mut() {
+        camera.clear_color = ClearColorConfig::Custom(light.sky);
         commands.entity(cam).insert(DistanceFog {
             color: light.sky,
             falloff: FogFalloff::Linear {
@@ -1279,6 +1312,11 @@ fn rebuild_map_system(
                 Name::new("MapSun"),
             ));
         });
+
+    // Mark this seed/env as built so we don't re-bake every frame (which
+    // despawns the extractable MapRoot and leaves a stale retro buffer).
+    built.seed = map.seed.clone();
+    built.env = Some(map.env);
 }
 
 fn wall_material(

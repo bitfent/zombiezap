@@ -378,7 +378,15 @@ impl Room {
     fn step(&mut self) {
         self.wire_tick += 1;
 
-        if !self.paused && !self.ended && !self.players.is_empty() {
+        // After MatchEnd: keep the task alive only for the grace timer so the
+        // lobby can rematch. Do NOT keep broadcasting snapshots — clients
+        // share the same OutMsg channel with the next room, and post-end
+        // frames corrupt the decoder + leave a stale horde on screen.
+        if self.ended {
+            return;
+        }
+
+        if !self.paused && !self.players.is_empty() {
             self.sim_tick += 1;
             self.sim_step();
         }
@@ -702,28 +710,42 @@ impl Room {
     }
 
     fn finish(&mut self, now: u32) {
+        // Idempotent: the wipe check sits at the end of every sim_step while
+        // anyone is dead; only the first call should broadcast stats.
+        if self.ended {
+            return;
+        }
         self.ended = true;
         self.ended_at = Some(self.wire_tick);
         let _ = self.lobby_tx.try_send(LobbyCmd::MatchEnded {
             code: self.lobby_code.clone(),
         });
+        // Match length is sim-time from tick 0 → `now` (pause does not advance
+        // sim_tick). Clamp each player's time_alive so a bad death_sim_tick
+        // can never report living longer than the match (NEXT.md item 7).
+        let duration_ms = now as u64 * 1000 / TICK_RATE as u64;
         let stats = MatchStats {
-            duration_ms: now as u64 * 1000 / TICK_RATE as u64,
+            duration_ms,
             zombies_killed: self.zombies_killed,
             peak_zombies: self.peak_zombies,
             difficulty_reached: Director::difficulty(now),
             players: self
                 .players
                 .iter()
-                .map(|p| PlayerStats {
-                    slot: p.slot,
-                    name: p.name.clone(),
-                    kills: p.kills as u32,
-                    damage_dealt: p.damage_dealt as u32,
-                    shots_fired: p.shots_fired,
-                    hits: p.hits,
-                    grenades_thrown: p.grenades_thrown,
-                    time_alive_ms: p.death_sim_tick.unwrap_or(now) as u64 * 1000 / TICK_RATE as u64,
+                .map(|p| {
+                    let alive_tick = p.death_sim_tick.unwrap_or(now).min(now);
+                    let time_alive_ms =
+                        (alive_tick as u64 * 1000 / TICK_RATE as u64).min(duration_ms);
+                    PlayerStats {
+                        slot: p.slot,
+                        name: p.name.clone(),
+                        kills: p.kills as u32,
+                        damage_dealt: p.damage_dealt as u32,
+                        shots_fired: p.shots_fired,
+                        hits: p.hits,
+                        grenades_thrown: p.grenades_thrown,
+                        time_alive_ms,
+                    }
                 })
                 .collect(),
         };
