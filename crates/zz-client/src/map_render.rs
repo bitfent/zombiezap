@@ -10,14 +10,18 @@
 //! - zero asset files: all textures are generated in code (procedural noise /
 //!   stripes), billboards are unlit backlit "YOUR AD HERE"-style striped
 //!   panels keyed by `ad_slot`;
-//! - walls are grouped into a few material families by simple heuristics
-//!   (ground cover < 2 m, building walls, roofs/high boxes, perimeter) and
-//!   merged into ONE mesh per family — a handful of draw calls total;
-//! - per-env palettes + texture tints (Urban pastel, Mountain timber-stone,
-//!   Desert adobe, Sea weathered dock, Rome travertine);
+//! - walls are grouped into material families by ShotAnte heuristics
+//!   (perimeter / roof / building A·B / street cover) and merged into ONE
+//!   mesh per family — a handful of draw calls total;
+//! - ShotAnte `concreteTexture` seam-grid panels (128px, grain + 2px seams);
+//! - Urban: two map-seeded pastel building hues; other envs keep identity;
+//! - edge-trim `LineList` outlines on street furniture only;
 //! - warm window slits on tall Building faces, merged into ONE emissive mesh;
-//! - slow procedural cloud quads under a single drift root (one transform
+//! - voxel cloud box clusters under a single drift root (one transform
 //!   per frame for the whole layer).
+//!
+//! **Barrels:** `GameMap` does not carry barrel indices (only walls/spawns/…);
+//! explosive-barrel meshes are skipped until zz-core exposes them.
 
 use std::f32::consts::PI;
 
@@ -31,6 +35,7 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 use zz_core::map::GameMap;
+use zz_core::rng::Mulberry32;
 use zz_core::types::{Aabb, EnvKind};
 
 /// The map the world should currently display. Insert or overwrite to
@@ -174,22 +179,45 @@ pub fn env_lighting(env: EnvKind) -> EnvLighting {
     }
 }
 
-/// Wall-family base colors (Perimeter, Cover, Building, Roof) before accent mix.
+/// ShotAnte urban pastel palette (hex RGB). Two are picked per map seed.
+pub const URBAN_PASTELS: [u32; 6] = [
+    0x00e8_d8b8,
+    0x00d9_c4ad,
+    0x00c9_d6c2,
+    0x00c4_cede,
+    0x00dc_c6c6,
+    0x00cf_d8c0,
+];
+
+/// Flat slate roof (ShotAnte `roofMat` colour).
+const ROOF_SLATE: u32 = 0x004b_5364;
+/// Dark edge trim on bulky street cover.
+const DARK_TRIM: u32 = 0x006b_542f;
+/// Edge-trim scale: sits just outside the faces (ShotAnte 1.003).
+const TRIM_SCALE: f32 = 1.003;
+/// Small-prop threshold (w ≤ 1.3 && d ≤ 1.3 → accent trim).
+const SMALL_PROP_MAX: f32 = 1.3;
+
+/// Wall-family base colors
+/// (Perimeter, Cover, BuildingA, BuildingB, Roof) before accent mix.
+/// Urban BuildingA/B are placeholders — rebuild overwrites with map pastels.
 /// Each env has a distinct family so the town reads at a glance.
-fn family_base_colors(env: EnvKind) -> [Color; 4] {
+fn family_base_colors(env: EnvKind) -> [Color; 5] {
     match env {
-        // Pastel city: cool concrete perimeter, warm crates, stucco buildings, slate roofs.
+        // Pastel city: near-white walls get hue from materials; slate roofs.
         EnvKind::Urban => [
-            Color::srgb(0.62, 0.65, 0.71),
-            Color::srgb(0.80, 0.66, 0.46),
-            Color::srgb(0.88, 0.82, 0.70),
-            Color::srgb(0.38, 0.42, 0.50),
+            Color::WHITE, // perimeter colour lives in the texture
+            Color::WHITE, // crate colour lives in the texture
+            color_u32(URBAN_PASTELS[0]),
+            color_u32(URBAN_PASTELS[1]),
+            color_u32(ROOF_SLATE),
         ],
         // Timber-and-stone: grey rock perimeter, dark wood cover/cabins, stone roofs.
         EnvKind::MountainTown => [
             Color::srgb(0.50, 0.50, 0.52),
             Color::srgb(0.40, 0.28, 0.18),
             Color::srgb(0.38, 0.26, 0.16),
+            Color::srgb(0.42, 0.30, 0.18),
             Color::srgb(0.52, 0.50, 0.46),
         ],
         // Adobe: sand/ochre walls, flat sand roofs, dusty cover crates.
@@ -197,6 +225,7 @@ fn family_base_colors(env: EnvKind) -> [Color; 4] {
             Color::srgb(0.70, 0.60, 0.46),
             Color::srgb(0.68, 0.50, 0.32),
             Color::srgb(0.86, 0.72, 0.50),
+            Color::srgb(0.80, 0.68, 0.48),
             Color::srgb(0.72, 0.58, 0.40),
         ],
         // Weathered dock: blue-grey warehouses, bleached timber, dock crates.
@@ -204,6 +233,7 @@ fn family_base_colors(env: EnvKind) -> [Color; 4] {
             Color::srgb(0.52, 0.56, 0.60),
             Color::srgb(0.60, 0.52, 0.40),
             Color::srgb(0.56, 0.60, 0.66),
+            Color::srgb(0.52, 0.58, 0.64),
             Color::srgb(0.58, 0.54, 0.46),
         ],
         // Travertine: cream stone, warm planters, warm roof stone.
@@ -211,9 +241,31 @@ fn family_base_colors(env: EnvKind) -> [Color; 4] {
             Color::srgb(0.72, 0.68, 0.60),
             Color::srgb(0.78, 0.62, 0.42),
             Color::srgb(0.92, 0.86, 0.74),
+            Color::srgb(0.88, 0.82, 0.70),
             Color::srgb(0.48, 0.42, 0.36),
         ],
     }
+}
+
+fn color_u32(rgb: u32) -> Color {
+    Color::srgb_u8(
+        ((rgb >> 16) & 0xff) as u8,
+        ((rgb >> 8) & 0xff) as u8,
+        (rgb & 0xff) as u8,
+    )
+}
+
+/// Pick two distinct pastel hues from [`URBAN_PASTELS`] with a map-seeded rng
+/// (`"{seed}-paint"`, matching ShotAnte's paint stream).
+pub fn pick_urban_pastels(seed: &str) -> (Color, Color) {
+    let mut rng = Mulberry32::from_seed(&format!("{seed}-paint"));
+    let n = URBAN_PASTELS.len();
+    let ia = (rng.next() * n as f64).floor() as usize % n;
+    let mut ib = (rng.next() * n as f64).floor() as usize % n;
+    if ia == ib {
+        ib = (ib + 1) % n;
+    }
+    (color_u32(URBAN_PASTELS[ia]), color_u32(URBAN_PASTELS[ib]))
 }
 
 /// Per-env RGB multipliers applied when baking wall/cover/roof textures so the
@@ -233,8 +285,17 @@ fn env_texture_tint(env: EnvKind) -> [f32; 3] {
 pub enum WallFamily {
     Perimeter,
     Cover,
-    Building,
+    /// Building facade hue A (map side `(x0+z0) > 0`).
+    BuildingA,
+    /// Building facade hue B (map side `(x0+z0) ≤ 0`).
+    BuildingB,
     Roof,
+}
+
+impl WallFamily {
+    pub fn is_building(self) -> bool {
+        matches!(self, WallFamily::BuildingA | WallFamily::BuildingB)
+    }
 }
 
 /// Pure vertex/index buffer produced by the geometry builder.
@@ -446,19 +507,33 @@ pub fn bake_face_colors(geom: &mut MeshGeom, sun_to: Vec3, walls: &[Aabb]) {
 
 /// Classify an AABB into a wall material family.
 ///
-/// Priority: perimeter → roof → cover → building.
+/// ShotAnte paint rules (`loadArena`):
+/// - perimeter: tall edge walls (geometry heuristic; urban first-4 walls)
+/// - roof: `y0 >= 2.5`
+/// - building: `y1 > 2.5 || (y0 ≈ 0 && y1 ≈ 1.3)` (walls + doorway
+///   headers/sills) — hue A/B by `(x0 + z0) > 0`
+/// - else: street cover / crates
 pub fn classify_wall(aabb: &Aabb, arena_half: f32) -> WallFamily {
     let height = (aabb.y1 - aabb.y0).abs();
     if height >= 5.0 && is_near_perimeter(aabb, arena_half) {
         return WallFamily::Perimeter;
     }
-    if aabb.y0 > 2.5 {
+    // Legacy: roof = y0 >= 2.5
+    if aabb.y0 >= 2.5 {
         return WallFamily::Roof;
     }
-    if aabb.y1 < 2.0 {
-        return WallFamily::Cover;
+    // Legacy: building = y1 > 2.5 || (y0 == 0 && y1 == 1.3)
+    let is_sill = aabb.y0.abs() <= 1e-3 && (aabb.y1 - 1.3).abs() <= 1e-2;
+    let is_building = aabb.y1 > 2.5 || is_sill;
+    if is_building {
+        if (aabb.x0 + aabb.z0) > 0.0 {
+            WallFamily::BuildingA
+        } else {
+            WallFamily::BuildingB
+        }
+    } else {
+        WallFamily::Cover
     }
-    WallFamily::Building
 }
 
 fn is_near_perimeter(aabb: &Aabb, arena_half: f32) -> bool {
@@ -483,8 +558,8 @@ pub fn build_merged_boxes(boxes: &[Aabb]) -> MeshGeom {
 }
 
 /// Group walls by family and build one merged mesh per non-empty family.
-pub fn build_family_meshes(walls: &[Aabb], arena_half: f32) -> [(WallFamily, MeshGeom); 4] {
-    let mut buckets: [Vec<Aabb>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+pub fn build_family_meshes(walls: &[Aabb], arena_half: f32) -> [(WallFamily, MeshGeom); 5] {
+    let mut buckets: [Vec<Aabb>; 5] = Default::default();
     for w in walls {
         let fam = classify_wall(w, arena_half);
         let idx = family_index(fam);
@@ -493,8 +568,9 @@ pub fn build_family_meshes(walls: &[Aabb], arena_half: f32) -> [(WallFamily, Mes
     [
         (WallFamily::Perimeter, build_merged_boxes(&buckets[0])),
         (WallFamily::Cover, build_merged_boxes(&buckets[1])),
-        (WallFamily::Building, build_merged_boxes(&buckets[2])),
-        (WallFamily::Roof, build_merged_boxes(&buckets[3])),
+        (WallFamily::BuildingA, build_merged_boxes(&buckets[2])),
+        (WallFamily::BuildingB, build_merged_boxes(&buckets[3])),
+        (WallFamily::Roof, build_merged_boxes(&buckets[4])),
     ]
 }
 
@@ -502,9 +578,101 @@ fn family_index(f: WallFamily) -> usize {
     match f {
         WallFamily::Perimeter => 0,
         WallFamily::Cover => 1,
-        WallFamily::Building => 2,
-        WallFamily::Roof => 3,
+        WallFamily::BuildingA => 2,
+        WallFamily::BuildingB => 3,
+        WallFamily::Roof => 4,
     }
+}
+
+// ── Edge trim (ShotAnte LineSegments on street furniture only) ─────────────
+
+/// Line-list positions: pairs of endpoints (24 verts = 12 edges per box).
+#[derive(Clone, Debug, Default)]
+pub struct LineGeom {
+    pub positions: Vec<[f32; 3]>,
+}
+
+impl LineGeom {
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    /// 12 edges of a box scaled by `scale` about its centre (ShotAnte 1.003).
+    pub fn append_scaled_box_edges(&mut self, aabb: &Aabb, scale: f32) {
+        let cx = (aabb.x0 + aabb.x1) * 0.5;
+        let cy = (aabb.y0 + aabb.y1) * 0.5;
+        let cz = (aabb.z0 + aabb.z1) * 0.5;
+        let hx = (aabb.x1 - aabb.x0).abs() * 0.5 * scale;
+        let hy = (aabb.y1 - aabb.y0).abs() * 0.5 * scale;
+        let hz = (aabb.z1 - aabb.z0).abs() * 0.5 * scale;
+        // 8 corners: index bits x=1, y=2, z=4
+        let mut c = [[0.0f32; 3]; 8];
+        for (i, corner) in c.iter_mut().enumerate() {
+            let sx = if i & 1 == 0 { -1.0 } else { 1.0 };
+            let sy = if i & 2 == 0 { -1.0 } else { 1.0 };
+            let sz = if i & 4 == 0 { -1.0 } else { 1.0 };
+            *corner = [cx + sx * hx, cy + sy * hy, cz + sz * hz];
+        }
+        // 12 edges (pairs of corner indices)
+        const EDGES: [[usize; 2]; 12] = [
+            [0, 1], [2, 3], [4, 5], [6, 7], // x-parallel
+            [0, 2], [1, 3], [4, 6], [5, 7], // y-parallel
+            [0, 4], [1, 5], [2, 6], [3, 7], // z-parallel
+        ];
+        for [a, b] in EDGES {
+            self.positions.push(c[a]);
+            self.positions.push(c[b]);
+        }
+    }
+
+    fn into_mesh(self) -> Mesh {
+        let n = self.positions.len();
+        let normals = vec![[0.0, 1.0, 0.0]; n];
+        let uvs = vec![[0.0, 0.0]; n];
+        Mesh::new(
+            bevy::mesh::PrimitiveTopology::LineList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    }
+}
+
+/// Which trim colour bucket a cover box belongs to (if any).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimBucket {
+    Accent,
+    Dark,
+}
+
+/// Street-furniture trim: only Cover-family boxes. Small props → accent;
+/// bulky cover → dark. Buildings, roofs, perimeter excluded.
+pub fn classify_trim(aabb: &Aabb, arena_half: f32) -> Option<TrimBucket> {
+    if classify_wall(aabb, arena_half) != WallFamily::Cover {
+        return None;
+    }
+    let w = (aabb.x1 - aabb.x0).abs();
+    let d = (aabb.z1 - aabb.z0).abs();
+    if w <= SMALL_PROP_MAX && d <= SMALL_PROP_MAX {
+        Some(TrimBucket::Accent)
+    } else {
+        Some(TrimBucket::Dark)
+    }
+}
+
+/// Build merged accent + dark edge-trim line lists for a wall set.
+pub fn build_edge_trim(walls: &[Aabb], arena_half: f32) -> (LineGeom, LineGeom) {
+    let mut accent = LineGeom::default();
+    let mut dark = LineGeom::default();
+    for w in walls {
+        match classify_trim(w, arena_half) {
+            Some(TrimBucket::Accent) => accent.append_scaled_box_edges(w, TRIM_SCALE),
+            Some(TrimBucket::Dark) => dark.append_scaled_box_edges(w, TRIM_SCALE),
+            None => {}
+        }
+    }
+    (accent, dark)
 }
 
 /// Billboard quad in local space, facing +Z. Sized `w` × `h`, centred at origin.
@@ -576,7 +744,7 @@ fn hash_u32(mut n: u32) -> u32 {
 pub fn place_window_slits(walls: &[Aabb], arena_half: f32) -> Vec<WindowSlit> {
     let mut out = Vec::new();
     for (wi, w) in walls.iter().enumerate() {
-        if classify_wall(w, arena_half) != WallFamily::Building {
+        if !classify_wall(w, arena_half).is_building() {
             continue;
         }
         let height = (w.y1 - w.y0).abs();
@@ -691,14 +859,6 @@ fn hash_noise(x: u32, y: u32, salt: u32) -> f32 {
     (n & 0xffff) as f32 / 65535.0
 }
 
-fn apply_tint(r: f32, g: f32, b: f32, tint: [f32; 3]) -> [u8; 3] {
-    [
-        (r * tint[0] * 255.0).clamp(0.0, 255.0) as u8,
-        (g * tint[1] * 255.0).clamp(0.0, 255.0) as u8,
-        (b * tint[2] * 255.0).clamp(0.0, 255.0) as u8,
-    ]
-}
-
 fn rgba_image(width: u32, height: u32, pixels: Vec<u8>) -> Image {
     let mut image = Image::new(
         Extent3d {
@@ -727,39 +887,120 @@ fn tiled(mut image: Image) -> Image {
     image
 }
 
-/// Whole-arena ground texture: sun-bleached asphalt with pavement seams and
-/// the baked shadow mask multiplied in. UV 0..1 across the map (not tiled) —
-/// the retro render target hides the modest texel density.
+/// ShotAnte `concreteTexture(base, seam, panels, grain)` — 128-style panel
+/// canvas: flat base, 900× 2×2 grain specks, 2 px seam grid both axes.
+/// Deterministic hash noise (no `rand`). Nearest + repeat applied by caller.
+///
+/// Returns raw RGBA bytes of length `size * size * 4`.
+pub fn concrete_texture_rgba(
+    size: u32,
+    base: [u8; 3],
+    seam: [u8; 3],
+    panels: u32,
+    grain: f32,
+) -> Vec<u8> {
+    let n = (size * size) as usize;
+    let mut px = vec![0u8; n * 4];
+    for i in 0..n {
+        let o = i * 4;
+        px[o] = base[0];
+        px[o + 1] = base[1];
+        px[o + 2] = base[2];
+        px[o + 3] = 255;
+    }
+    // 900 random 2×2 px grain specks — hash replaces Math.random.
+    for i in 0..900u32 {
+        let u = (hash_noise(i, 0, 701) * size as f32).floor() as u32 % size;
+        let v = (hash_noise(i, 1, 702) * size as f32).floor() as u32 % size;
+        let g = (hash_noise(i, 2, 703) * grain).floor() as i32;
+        let gr = g.clamp(0, 255) as u8;
+        let gb = (g + 10).clamp(0, 255) as u8;
+        const A: f32 = 0.16;
+        for dy in 0..2u32 {
+            for dx in 0..2u32 {
+                let x = (u + dx) % size;
+                let y = (v + dy) % size;
+                let o = ((y * size + x) * 4) as usize;
+                px[o] = ((gr as f32) * A + px[o] as f32 * (1.0 - A)) as u8;
+                px[o + 1] = ((gr as f32) * A + px[o + 1] as f32 * (1.0 - A)) as u8;
+                px[o + 2] = ((gb as f32) * A + px[o + 2] as f32 * (1.0 - A)) as u8;
+            }
+        }
+    }
+    // 2 px seam grid every size/panels.
+    let panels = panels.max(1);
+    let step = size as f32 / panels as f32;
+    for i in 0..=panels {
+        let line = (i as f32 * step).round() as i32;
+        for t in 0..2i32 {
+            let row = (line + t).clamp(0, size as i32 - 1) as u32;
+            for x in 0..size {
+                let o = ((row * size + x) * 4) as usize;
+                px[o] = seam[0];
+                px[o + 1] = seam[1];
+                px[o + 2] = seam[2];
+            }
+            let col = (line + t).clamp(0, size as i32 - 1) as u32;
+            for y in 0..size {
+                let o = ((y * size + col) * 4) as usize;
+                px[o] = seam[0];
+                px[o + 1] = seam[1];
+                px[o + 2] = seam[2];
+            }
+        }
+    }
+    px
+}
+
+/// Apply an RGB multiplier to every opaque texel (env identity wash).
+fn tint_rgba(mut px: Vec<u8>, tint: [f32; 3]) -> Vec<u8> {
+    for chunk in px.chunks_exact_mut(4) {
+        chunk[0] = ((chunk[0] as f32 * tint[0]).clamp(0.0, 255.0)) as u8;
+        chunk[1] = ((chunk[1] as f32 * tint[1]).clamp(0.0, 255.0)) as u8;
+        chunk[2] = ((chunk[2] as f32 * tint[2]).clamp(0.0, 255.0)) as u8;
+    }
+    px
+}
+
+/// Sample a concrete tile at integer pattern coords (nearest, wrap).
+fn sample_concrete_px(tile: &[u8], tile_size: u32, u: i32, v: i32) -> [u8; 3] {
+    let s = tile_size as i32;
+    let x = u.rem_euclid(s) as u32;
+    let y = v.rem_euclid(s) as u32;
+    let o = ((y * tile_size + x) * 4) as usize;
+    [tile[o], tile[o + 1], tile[o + 2]]
+}
+
+/// Whole-arena ground texture: ShotAnte asphalt concrete tiled at 2 m/tile,
+/// baked shadow mask multiplied in. UV 0..1 across the map (not GPU-tiled).
 fn gen_ground_lit(size: u32, half: f32, occlusion: &[f32], occ_res: u32) -> Image {
+    // Legacy: base #8d9099, seam #797d88, panels 4, grain 120; one tile / 2 m.
+    const TILE_M: f32 = 2.0;
+    const PAT: u32 = 128;
+    let tile = concrete_texture_rgba(PAT, [0x8d, 0x90, 0x99], [0x79, 0x7d, 0x88], 4, 120.0);
     let mut px = Vec::with_capacity((size * size * 4) as usize);
-    // Pavement seams roughly every 4 m.
-    let seam_every_px = (4.0 / (2.0 * half) * size as f32).max(2.0) as u32;
+    let diameter = 2.0 * half;
     for y in 0..size {
         for x in 0..size {
-            let n = hash_noise(x, y, 1);
-            let speck = hash_noise(x, y, 99) > 0.97;
-            let seam = x % seam_every_px < 1 || y % seam_every_px < 1;
-            // Legacy palette: "#8d9099" asphalt, darker seams.
-            let mut v = 0.46 + n * 0.09;
-            if speck {
-                v += 0.10;
-            }
-            if seam {
-                v -= 0.10;
-            }
             let u = (x as f32 + 0.5) / size as f32;
             let w = (y as f32 + 0.5) / size as f32;
+            let wx = -half + u * diameter;
+            let wz = -half + w * diameter;
+            // Map world → pattern texel (one 128px tile per 2 m).
+            let pu = ((wx.rem_euclid(TILE_M) / TILE_M) * PAT as f32).floor() as i32;
+            let pv = ((wz.rem_euclid(TILE_M) / TILE_M) * PAT as f32).floor() as i32;
+            let mut rgb = sample_concrete_px(&tile, PAT, pu, pv);
             let light = sample_occlusion(occlusion, occ_res, u, w);
-            v = (v * light).clamp(0.0, 1.0);
-            // Distance-based subtle darkening toward the map rim so buildings
-            // sit on an anchored ground plane (center stays brightest).
+            // Rim darken (keep existing ground anchoring).
             let dx = u * 2.0 - 1.0;
             let dz = w * 2.0 - 1.0;
             let rim = (dx * dx + dz * dz).sqrt().clamp(0.0, 1.0);
             let rim_dark = 1.0 - rim * rim * 0.28;
-            v = (v * rim_dark).clamp(0.0, 1.0);
-            let c = (v * 255.0) as u8;
-            px.extend_from_slice(&[c, c, (c as f32 * 0.95) as u8, 255]);
+            let factor = (light * rim_dark).clamp(0.0, 1.0);
+            for c in &mut rgb {
+                *c = ((*c as f32) * factor).clamp(0.0, 255.0) as u8;
+            }
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
     }
     rgba_image(size, size, px)
@@ -810,155 +1051,58 @@ fn horizon_haze(sky: Color, env: EnvKind) -> Color {
     )
 }
 
-fn gen_concrete(size: u32, dark: bool, tint: [f32; 3]) -> Image {
-    let mut px = Vec::with_capacity((size * size * 4) as usize);
-    // Bright bases (legacy building textures are near-white; hue comes from
-    // the material base_color multiplied on top + env texture tint).
-    let base0 = if dark { 0.58 } else { 0.76 };
-    for y in 0..size {
-        for x in 0..size {
-            let n = hash_noise(x, y, if dark { 3 } else { 2 });
-            // Faint horizontal darker bands every ~32 px.
-            let band = if (y % 32) < 2 { 0.08 } else { 0.0 };
-            let v = (base0 + n * 0.09 - band).clamp(0.0, 1.0);
-            let rgb = apply_tint(v, v, v, tint);
-            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-        }
-    }
-    rgba_image(size, size, px)
-}
-
-/// Mountain / sea building face: horizontal timber / plank grain.
-fn gen_wood_planks(size: u32, tint: [f32; 3], bleached: bool) -> Image {
-    let mut px = Vec::with_capacity((size * size * 4) as usize);
-    let plank_h = 10u32;
-    for y in 0..size {
-        for x in 0..size {
-            let n = hash_noise(x, y, 11);
-            let plank = y / plank_h;
-            let seam = y % plank_h == 0;
-            let row_n = hash_noise(plank, 0, 12);
-            let base = if bleached {
-                0.62 + row_n * 0.10 + n * 0.06
-            } else {
-                0.38 + row_n * 0.12 + n * 0.08
-            };
-            let v = if seam { base * 0.72 } else { base };
-            let (r, g, b) = if bleached {
-                (v * 0.95, v * 0.92, v * 0.88)
-            } else {
-                (v * 1.05, v * 0.78, v * 0.48)
-            };
-            let rgb = apply_tint(r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), tint);
-            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-        }
-    }
-    rgba_image(size, size, px)
-}
-
-/// Desert building: flat adobe with soft mottling (no strong bands).
-fn gen_adobe(size: u32, tint: [f32; 3]) -> Image {
-    let mut px = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let n = hash_noise(x, y, 13);
-            let n2 = hash_noise(x / 4, y / 4, 14);
-            let v = (0.70 + n * 0.08 + n2 * 0.06).clamp(0.0, 1.0);
-            let rgb = apply_tint(v, v * 0.90, v * 0.68, tint);
-            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-        }
-    }
-    rgba_image(size, size, px)
-}
-
-/// Building wall texture keyed by environment (detail + tint).
+/// Building wall texture: ShotAnte near-white panels (`#ffffff` / `#d8d2c4`,
+/// panels 2, grain 150). Hue comes from the material base_color; env tint
+/// washes non-urban maps so they keep identity.
 fn gen_building_tex(env: EnvKind, size: u32) -> Image {
     let tint = env_texture_tint(env);
-    match env {
-        EnvKind::MountainTown => gen_wood_planks(size, tint, false),
-        EnvKind::DesertTown => gen_adobe(size, tint),
-        EnvKind::SeaTown => gen_wood_planks(size, tint, true),
-        EnvKind::RomeEur | EnvKind::Urban => gen_concrete(size, false, tint),
-    }
+    let px = concrete_texture_rgba(size, [0xff, 0xff, 0xff], [0xd8, 0xd2, 0xc4], 2, 150.0);
+    rgba_image(size, size, tint_rgba(px, tint))
 }
 
+/// Perimeter: ShotAnte `#aeb6c4` / `#9aa2b2`, panels 2, grain 140 (+ env tint).
 fn gen_perimeter_tex(env: EnvKind, size: u32) -> Image {
     let tint = env_texture_tint(env);
-    match env {
-        // Mountain perimeter = grey stone (dark concrete + cool tint override).
-        EnvKind::MountainTown => gen_concrete(size, true, [0.92, 0.92, 0.96]),
-        EnvKind::DesertTown => gen_adobe(size, tint),
-        _ => gen_concrete(size, true, tint),
-    }
+    let px = concrete_texture_rgba(size, [0xae, 0xb6, 0xc4], [0x9a, 0xa2, 0xb2], 2, 140.0);
+    rgba_image(size, size, tint_rgba(px, tint))
 }
 
+/// Crate / street cover: ShotAnte `#caa36a` / `#a8814c`, panels 2, grain 110.
 fn gen_cover(size: u32, tint: [f32; 3]) -> Image {
-    let mut px = Vec::with_capacity((size * size * 4) as usize);
-    let border = 4u32;
-    for y in 0..size {
-        for x in 0..size {
-            let n = hash_noise(x, y, 4);
-            let edge = x < border || y < border || x >= size - border || y >= size - border;
-            let (r, g, b) = if edge {
-                (0.34, 0.23, 0.13)
-            } else {
-                let v = 0.64 + n * 0.14;
-                (v, v * 0.76, v * 0.48)
+    let px = concrete_texture_rgba(size, [0xca, 0xa3, 0x6a], [0xa8, 0x81, 0x4c], 2, 110.0);
+    rgba_image(size, size, tint_rgba(px, tint))
+}
+
+/// Voxel cloud clusters (ShotAnte): ~9 clusters of 2–4 white boxes, y 18–30,
+/// spread ±2.6·arena_half. ONE merged mesh. Deterministic from seed.
+pub fn build_voxel_clouds(seed: &str, arena_half: f32) -> MeshGeom {
+    let mut rng = Mulberry32::from_seed(&format!("{seed}-clouds"));
+    let mut geom = MeshGeom::default();
+    let span = arena_half * 2.6;
+    for _ in 0..9 {
+        let cx = (rng.next() as f32 * 2.0 - 1.0) * span;
+        let cy = 18.0 + rng.next() as f32 * 12.0;
+        let cz = (rng.next() as f32 * 2.0 - 1.0) * span;
+        let puffs = 2 + (rng.next() * 3.0).floor() as i32;
+        for _ in 0..puffs {
+            let w = 3.0 + rng.next() as f32 * 4.0;
+            let h = 1.2 + rng.next() as f32;
+            let d = 2.0 + rng.next() as f32 * 2.0;
+            let px = cx + (rng.next() as f32 * 2.0 - 1.0) * 3.0;
+            let py = cy + (rng.next() as f32 - 0.5);
+            let pz = cz + (rng.next() as f32 * 2.0 - 1.0) * 2.0;
+            let box_ = Aabb {
+                x0: px - w * 0.5,
+                x1: px + w * 0.5,
+                y0: py - h * 0.5,
+                y1: py + h * 0.5,
+                z0: pz - d * 0.5,
+                z1: pz + d * 0.5,
             };
-            let rgb = apply_tint(r, g, b, tint);
-            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            geom.append_box(&box_);
         }
     }
-    rgba_image(size, size, px)
-}
-
-fn gen_roof(size: u32, tint: [f32; 3]) -> Image {
-    let mut px = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let n = hash_noise(x, y, 5);
-            let v = 0.52 + n * 0.12;
-            let rgb = apply_tint(v, v, v, tint);
-            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-        }
-    }
-    rgba_image(size, size, px)
-}
-
-/// Soft cloud blob: white centre, transparent edges (unlit translucent quads).
-fn gen_cloud(size: u32) -> Image {
-    let mut px = Vec::with_capacity((size * size * 4) as usize);
-    let cx = size as f32 * 0.5;
-    let cy = size as f32 * 0.5;
-    // Two soft ellipses for a lumpy cloud silhouette.
-    let blobs = [
-        (0.0f32, 0.0, 0.42, 0.28),
-        (-0.18, 0.06, 0.28, 0.22),
-        (0.20, -0.04, 0.26, 0.20),
-    ];
-    for y in 0..size {
-        for x in 0..size {
-            let u = (x as f32 - cx) / cx;
-            let v = (y as f32 - cy) / cy;
-            let mut a = 0.0f32;
-            for (ox, oy, rx, ry) in blobs {
-                let dx = (u - ox) / rx;
-                let dy = (v - oy) / ry;
-                let d = (dx * dx + dy * dy).sqrt();
-                // Soft falloff: 1 at centre → 0 at edge.
-                let blob = (1.0 - d).clamp(0.0, 1.0).powf(1.6);
-                a = (a + blob * 0.55).min(1.0);
-            }
-            // Slight noise so edges aren't perfect math ellipses.
-            let n = hash_noise(x, y, 77) * 0.08;
-            a = (a - n).clamp(0.0, 1.0);
-            let c = 255u8;
-            px.extend_from_slice(&[c, c, c, (a * 200.0) as u8]);
-        }
-    }
-    // Linear filtering would soft-blur; nearest keeps retro look but clouds
-    // are large so either is fine — match project nearest default.
-    rgba_image(size, size, px)
+    geom
 }
 
 /// Loud placeholder ad: flat bg, 6 px border, diagonal stripes or checker.
@@ -1020,13 +1164,12 @@ fn tinted(base: Color, accent: Color) -> Color {
 
 // ── Plugin ─────────────────────────────────────────────────────────────────
 
-/// Parent of all cloud quads; one entity, drifted slowly each frame.
+/// Parent of voxel cloud mesh; one entity, drifted slowly each frame.
 #[derive(Component)]
 struct CloudDriftRoot;
 
-/// How high above the arena floor the cloud layer sits (metres).
-const CLOUD_HEIGHT: f32 = 55.0;
-/// Slow drift amplitude (m) and period scale (rad/s).
+/// Slow drift amplitude (m) and period scale (rad/s). Clouds sit at y 18–30
+/// in mesh space (ShotAnte); the root stays at origin so fog doesn't erase them.
 const CLOUD_DRIFT_AMP: f32 = 12.0;
 const CLOUD_DRIFT_SPEED: f32 = 0.04;
 
@@ -1169,8 +1312,6 @@ fn rebuild_map_system(
     let tex_building = images.add(tiled(gen_building_tex(map.env, 128)));
     let tex_perimeter = images.add(tiled(gen_perimeter_tex(map.env, 128)));
     let tex_cover = images.add(tiled(gen_cover(128, tex_tint)));
-    let tex_roof = images.add(tiled(gen_roof(128, tex_tint)));
-    let tex_cloud = images.add(gen_cloud(64));
     let ad_handles: [Handle<Image>; 4] = [
         images.add(gen_ad(0, 256, 128)),
         images.add(gen_ad(1, 256, 128)),
@@ -1178,45 +1319,50 @@ fn rebuild_map_system(
         images.add(gen_ad(3, 256, 128)),
     ];
 
-    // Near-white textures carry the detail; family bases carry the hue;
-    // env texture tints bake into the image; accent mixes into the base.
-    let bases = family_base_colors(map.env);
-    let family_mats: [Handle<StandardMaterial>; 4] = [
-        materials.add(wall_material(
-            tinted(bases[0], accent),
-            Some(tex_perimeter.clone()),
-            0.92,
-        )),
-        materials.add(wall_material(
-            tinted(bases[1], accent),
-            Some(tex_cover.clone()),
-            0.90,
-        )),
+    // Near-white textures carry the panel detail; family bases carry the hue.
+    // Urban: two map-seeded pastels for BuildingA/B; roof is flat slate.
+    let mut bases = family_base_colors(map.env);
+    if map.env == EnvKind::Urban {
+        let (hue_a, hue_b) = pick_urban_pastels(&map.seed);
+        bases[2] = hue_a;
+        bases[3] = hue_b;
+        bases[4] = color_u32(ROOF_SLATE);
+    }
+    let family_mats: [Handle<StandardMaterial>; 5] = [
+        // Perimeter: colour in texture (Urban base WHITE).
+        materials.add(wall_material(tinted(bases[0], accent), Some(tex_perimeter), 0.95)),
+        // Cover crates: colour in texture.
+        materials.add(wall_material(tinted(bases[1], accent), Some(tex_cover), 0.95)),
+        // Building A / B: pastel × near-white seam texture.
         materials.add(wall_material(
             tinted(bases[2], accent),
             Some(tex_building.clone()),
-            0.88,
+            0.95,
         )),
         materials.add(wall_material(
             tinted(bases[3], accent),
-            Some(tex_roof.clone()),
+            Some(tex_building),
             0.95,
         )),
+        // Roof: flat slate (no texture — MeshLambert flat colour).
+        materials.add(wall_material(tinted(bases[4], accent), None, 0.98)),
     ];
 
     // Tone lives in the texture (shadow mask baked in): keep base white.
     let ground_mat = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(tex_ground),
-        perceptual_roughness: 0.95,
+        perceptual_roughness: 0.98,
         metallic: 0.0,
+        reflectance: 0.0,
         ..default()
     });
 
     let frame_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.08, 0.08, 0.09),
-        perceptual_roughness: 0.9,
-        metallic: 0.05,
+        perceptual_roughness: 0.95,
+        metallic: 0.0,
+        reflectance: 0.0,
         unlit: false,
         ..default()
     });
@@ -1239,17 +1385,35 @@ fn rebuild_map_system(
         ..default()
     });
 
+    // Voxel clouds: unlit white, fog disabled so they stay visible past haze.
     let cloud_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 1.0, 1.0, 0.85),
-        base_color_texture: Some(tex_cloud),
+        base_color: Color::WHITE,
         unlit: true,
-        alpha_mode: AlphaMode::Blend,
-        // Double-sided so the camera can look up from any yaw.
+        fog_enabled: false,
         cull_mode: None,
+        reflectance: 0.0,
+        ..default()
+    });
+
+    // Edge trim: accent (map) for small props, dark brown for bulky cover.
+    let accent_trim_mat = materials.add(StandardMaterial {
+        base_color: accent,
+        unlit: true,
+        fog_enabled: false,
+        reflectance: 0.0,
+        ..default()
+    });
+    let dark_trim_mat = materials.add(StandardMaterial {
+        base_color: color_u32(DARK_TRIM),
+        unlit: true,
+        fog_enabled: false,
+        reflectance: 0.0,
         ..default()
     });
 
     let family_geoms = build_family_meshes(&map.walls, map.arena_half);
+    let (accent_trim, dark_trim) = build_edge_trim(&map.walls, map.arena_half);
+    let cloud_geom = build_voxel_clouds(&map.seed, map.arena_half);
     let window_slits = place_window_slits(&map.walls, map.arena_half);
     let half = map.arena_half;
 
@@ -1284,6 +1448,26 @@ fn rebuild_map_system(
                     MeshMaterial3d(mat),
                     Transform::IDENTITY,
                     Name::new(format!("Walls/{fam:?}")),
+                ));
+            }
+
+            // Edge trim on street furniture only — two LineList draw calls.
+            if !accent_trim.is_empty() {
+                let mesh = meshes.add(accent_trim.into_mesh());
+                root.spawn((
+                    Mesh3d(mesh),
+                    MeshMaterial3d(accent_trim_mat),
+                    Transform::IDENTITY,
+                    Name::new("Trim/Accent"),
+                ));
+            }
+            if !dark_trim.is_empty() {
+                let mesh = meshes.add(dark_trim.into_mesh());
+                root.spawn((
+                    Mesh3d(mesh),
+                    MeshMaterial3d(dark_trim_mat),
+                    Transform::IDENTITY,
+                    Name::new("Trim/Dark"),
                 ));
             }
 
@@ -1340,39 +1524,19 @@ fn rebuild_map_system(
                 ));
             }
 
-            // Procedural cloud layer: handful of big flat quads under one
-            // drift root (one cheap transform per frame for the whole set).
-            let cloud_span = half * 1.6;
-            // Deterministic placements from env discriminant + half.
-            let cloud_specs: [(f32, f32, f32); 6] = [
-                (-0.35, 0.20, 28.0),
-                (0.25, -0.30, 36.0),
-                (0.10, 0.35, 24.0),
-                (-0.15, -0.10, 40.0),
-                (0.40, 0.05, 30.0),
-                (-0.40, -0.35, 22.0),
-            ];
-            root.spawn((
-                CloudDriftRoot,
-                Transform::from_xyz(0.0, CLOUD_HEIGHT, 0.0),
-                Visibility::default(),
-                Name::new("Clouds"),
-            ))
-            .with_children(|clouds| {
-                for (i, (nx, nz, size)) in cloud_specs.iter().enumerate() {
-                    // Flat horizontal quad (local +Y up); Plane3d faces +Y.
-                    let mesh = meshes.add(Mesh::from(Plane3d::new(
-                        Vec3::Y,
-                        Vec2::splat(*size * 0.5),
-                    )));
-                    clouds.spawn((
-                        Mesh3d(mesh),
-                        MeshMaterial3d(cloud_mat.clone()),
-                        Transform::from_xyz(nx * cloud_span, 0.0, nz * cloud_span),
-                        Name::new(format!("Cloud/{i}")),
-                    ));
-                }
-            });
+            // Voxel cloud clusters (ShotAnte): one merged white mesh under a
+            // slow-drift root. Unlit + fog off so they read past distance haze.
+            if !cloud_geom.is_empty() {
+                let cloud_mesh = meshes.add(cloud_geom.into_mesh());
+                root.spawn((
+                    CloudDriftRoot,
+                    Mesh3d(cloud_mesh),
+                    MeshMaterial3d(cloud_mat),
+                    Transform::IDENTITY,
+                    Visibility::default(),
+                    Name::new("Clouds"),
+                ));
+            }
 
             // Map-owned sun (the skeleton backdrop light is a Placeholder and
             // is gone by now). Real-time shadow maps stay OFF — shadows were
@@ -1427,11 +1591,13 @@ fn wall_material(
     texture: Option<Handle<Image>>,
     roughness: f32,
 ) -> StandardMaterial {
+    // Lambert-flat: zero specular sheen so faces read like MeshLambertMaterial.
     StandardMaterial {
         base_color,
         base_color_texture: texture,
         perceptual_roughness: roughness,
-        metallic: 0.02,
+        metallic: 0.0,
+        reflectance: 0.0,
         ..default()
     }
 }
@@ -1481,13 +1647,102 @@ mod tests {
         let cover = box_at(1.0, 0.0, 1.0, 2.0, 1.2, 2.0);
         assert_eq!(classify_wall(&cover, half), WallFamily::Cover);
 
-        // Building wall (mid height, interior).
-        let build = box_at(0.0, 0.0, 0.0, 0.4, 3.2, 4.0);
-        assert_eq!(classify_wall(&build, half), WallFamily::Building);
+        // Building wall (mid height, interior) — side by (x0+z0).
+        let build_a = box_at(1.0, 0.0, 1.0, 1.4, 3.2, 5.0); // x0+z0 > 0
+        assert_eq!(classify_wall(&build_a, half), WallFamily::BuildingA);
+        let build_b = box_at(-4.0, 0.0, -2.0, -3.6, 3.2, 2.0); // x0+z0 < 0
+        assert_eq!(classify_wall(&build_b, half), WallFamily::BuildingB);
 
-        // Roof slab (bottom above 2.5 m).
+        // Doorway sill (y0=0, y1=1.3) must be building, not crate wood.
+        let sill = box_at(2.0, 0.0, 2.0, 3.8, 1.3, 2.4);
+        assert!(classify_wall(&sill, half).is_building());
+
+        // Roof slab (bottom at/above 2.5 m).
         let roof = box_at(0.0, 3.2, 0.0, 4.0, 3.55, 4.0);
         assert_eq!(classify_wall(&roof, half), WallFamily::Roof);
+        let roof_eq = box_at(0.0, 2.5, 0.0, 4.0, 2.85, 4.0);
+        assert_eq!(classify_wall(&roof_eq, half), WallFamily::Roof);
+    }
+
+    #[test]
+    fn concrete_texture_seam_grid_and_deterministic() {
+        const SIZE: u32 = 128;
+        const PANELS: u32 = 4;
+        let a = concrete_texture_rgba(SIZE, [0x8d, 0x90, 0x99], [0x79, 0x7d, 0x88], PANELS, 120.0);
+        let b = concrete_texture_rgba(SIZE, [0x8d, 0x90, 0x99], [0x79, 0x7d, 0x88], PANELS, 120.0);
+        assert_eq!(a, b, "texture bake must be deterministic");
+        assert_eq!(a.len(), (SIZE * SIZE * 4) as usize);
+
+        let seam = [0x79u8, 0x7d, 0x88];
+        let step = SIZE as f32 / PANELS as f32;
+        // Seams at i*step for i in 0..=panels — sample a few rows/cols.
+        for i in 0..=PANELS {
+            let line = (i as f32 * step).round() as u32;
+            let line = line.min(SIZE - 1);
+            // Horizontal seam row
+            let o = ((line * SIZE + SIZE / 2) * 4) as usize;
+            assert_eq!(&a[o..o + 3], &seam[..], "H seam at row {line}");
+            // Vertical seam col
+            let o2 = (((SIZE / 2) * SIZE + line) * 4) as usize;
+            assert_eq!(&a[o2..o2 + 3], &seam[..], "V seam at col {line}");
+        }
+        // Interior of a panel (away from seams) is not pure seam colour.
+        let mid = (step * 0.5).round() as u32;
+        let o = ((mid * SIZE + mid) * 4) as usize;
+        assert_ne!(&a[o..o + 3], &seam[..], "panel interior should not be seam");
+    }
+
+    #[test]
+    fn edge_trim_24_verts_per_box_and_buckets() {
+        let half = 30.0;
+        // Small prop → accent; bulky cover → dark; building/roof/perim excluded.
+        let small = box_at(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+        let bulky = box_at(5.0, 0.0, 5.0, 8.0, 1.5, 8.0);
+        let building = box_at(10.0, 0.0, 10.0, 10.4, 3.2, 14.0);
+        let roof = box_at(10.0, 3.2, 10.0, 14.0, 3.55, 14.0);
+        let peri = box_at(-5.0, 0.0, -30.0, 5.0, 6.0, -29.4);
+
+        assert_eq!(classify_trim(&small, half), Some(TrimBucket::Accent));
+        assert_eq!(classify_trim(&bulky, half), Some(TrimBucket::Dark));
+        assert_eq!(classify_trim(&building, half), None);
+        assert_eq!(classify_trim(&roof, half), None);
+        assert_eq!(classify_trim(&peri, half), None);
+
+        let mut lg = LineGeom::default();
+        lg.append_scaled_box_edges(&small, TRIM_SCALE);
+        assert_eq!(lg.positions.len(), 24, "12 edges × 2 verts");
+
+        let (accent, dark) = build_edge_trim(&[small, bulky, building, roof, peri], half);
+        assert_eq!(accent.positions.len(), 24);
+        assert_eq!(dark.positions.len(), 24);
+    }
+
+    #[test]
+    fn urban_pastel_hues_deterministic_and_distinct() {
+        let (a1, b1) = pick_urban_pastels("preview");
+        let (a2, b2) = pick_urban_pastels("preview");
+        assert_eq!(a1.to_srgba().red, a2.to_srgba().red);
+        assert_eq!(b1.to_srgba().red, b2.to_srgba().red);
+        // Hues must differ (force-differ when rng collides).
+        let ca = a1.to_srgba();
+        let cb = b1.to_srgba();
+        let d = (ca.red - cb.red).abs() + (ca.green - cb.green).abs() + (ca.blue - cb.blue).abs();
+        assert!(d > 1e-4, "pastel pair must differ");
+        // Different seeds can (and usually do) differ.
+        let (a3, _) = pick_urban_pastels("other-seed-xyz");
+        // Not a hard assert they differ (possible collision), just that both run.
+        let _ = a3;
+    }
+
+    #[test]
+    fn voxel_clouds_deterministic_and_nonempty() {
+        let a = build_voxel_clouds("preview", 30.0);
+        let b = build_voxel_clouds("preview", 30.0);
+        assert_eq!(a.positions.len(), b.positions.len());
+        assert!(!a.is_empty());
+        // 9 clusters × 2–4 puffs × 24 verts → at least 9*2*24.
+        assert!(a.positions.len() >= 9 * 2 * 24);
+        assert_eq!(a.positions.len() % 24, 0);
     }
 
     #[test]
@@ -1580,14 +1835,16 @@ mod tests {
         let occ = bake_ground_occlusion(8, map.arena_half, Vec3::new(0.4, 0.8, 0.3), &map.walls);
         let _ = gen_ground_lit(16, map.arena_half, &occ, 8);
         let tint = env_texture_tint(EnvKind::Urban);
-        let _ = gen_concrete(16, false, tint);
-        let _ = gen_concrete(16, true, tint);
         let _ = gen_cover(16, tint);
-        let _ = gen_roof(16, tint);
+        let _ = gen_building_tex(EnvKind::Urban, 16);
         let _ = gen_building_tex(EnvKind::MountainTown, 16);
         let _ = gen_building_tex(EnvKind::DesertTown, 16);
         let _ = gen_building_tex(EnvKind::SeaTown, 16);
-        let _ = gen_cloud(16);
+        let _ = gen_perimeter_tex(EnvKind::Urban, 16);
+        let _ = build_voxel_clouds(&map.seed, map.arena_half);
+        let (at, dt) = build_edge_trim(&map.walls, map.arena_half);
+        assert!(at.positions.len().is_multiple_of(24) || at.is_empty());
+        assert!(dt.positions.len().is_multiple_of(24) || dt.is_empty());
         for s in 0..4u8 {
             let _ = gen_ad(s, 32, 16);
         }
@@ -1721,10 +1978,13 @@ mod tests {
     fn rome_family_bases_are_travertine_warm() {
         let rome = family_base_colors(EnvKind::RomeEur);
         let urban = family_base_colors(EnvKind::Urban);
-        // Building base should be creammer (higher r+g, warmer) than urban grey-pastel.
+        // Building base should be creammer (higher r+g) than urban placeholder pastels
+        // are not the runtime urban look — Urban A/B are seed-picked pastels.
+        // Compare Rome building vs Mountain timber instead for warmth.
         let rb = rome[2].to_srgba();
-        let ub = urban[2].to_srgba();
-        assert!(rb.red + rb.green > ub.red + ub.green - 0.01);
+        let mb = family_base_colors(EnvKind::MountainTown)[2].to_srgba();
+        assert!(rb.red + rb.green > mb.red + mb.green);
+        let _ = urban; // Urban defaults exist for non-seed fallback.
     }
 
     #[test]
@@ -1736,10 +1996,10 @@ mod tests {
             EnvKind::SeaTown,
             EnvKind::RomeEur,
         ];
-        let bases: Vec<[Color; 4]> = envs.iter().map(|e| family_base_colors(*e)).collect();
-        for (i, a) in bases.iter().enumerate() {
+        let bases: Vec<[Color; 5]> = envs.iter().map(|e| family_base_colors(*e)).collect();
+        // Non-urban envs must differ (Urban BuildingA/B are seed-picked pastels at rebuild).
+        for (i, a) in bases.iter().enumerate().skip(1) {
             for (j, b) in bases.iter().enumerate().skip(i + 1) {
-                // Compare building family (index 2) — the most visible facade hue.
                 let ca = a[2].to_srgba();
                 let cb = b[2].to_srgba();
                 let d = (ca.red - cb.red).abs()
@@ -1751,7 +2011,7 @@ mod tests {
                 );
             }
         }
-        // Mountain building should read darker/warmer wood than urban stucco.
+        // Mountain building should read darker/warmer wood than urban pastel placeholder.
         let m = bases[1][2].to_srgba();
         let u = bases[0][2].to_srgba();
         assert!(m.red + m.green + m.blue < u.red + u.green + u.blue);
@@ -1760,6 +2020,14 @@ mod tests {
         let s = bases[3][2].to_srgba();
         assert!(d.red > s.red);
         assert!(s.blue > d.blue);
+    }
+
+    #[test]
+    fn wall_material_is_lambert_flat() {
+        let m = wall_material(Color::WHITE, None, 0.95);
+        assert!((m.reflectance - 0.0).abs() < 1e-6);
+        assert!((m.metallic - 0.0).abs() < 1e-6);
+        assert!(m.perceptual_roughness >= 0.9);
     }
 
     #[test]

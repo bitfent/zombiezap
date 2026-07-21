@@ -382,12 +382,28 @@ On a 1280×720 pane: stick **(230, 518)**, FIRE **(1224, 648)**, JUMP
     - **Lit ads:** `ad_material` stays unlit (readable in shadow) with a mild
       emissive lift (`LinearRgba::rgb(0.55, 0.48, 0.40)`) so panels read as
       backlit signage in every env.
-    - **Clouds:** six large `Plane3d` quads, shared soft-blob texture
-      (`gen_cloud`, alpha falloff), unlit `AlphaMode::Blend`, parented under
-      `CloudDriftRoot` at y≈55. `drift_clouds_system` only translates that
-      root (sin/cos, ~0.04 rad/s) — draw-call budget otherwise unchanged.
-    - **WebGL2:** still no texture view-format tricks (item 35); cloud/window
-      images are plain `Rgba8UnormSrgb`.
+    - **Clouds (M16):** ShotAnte voxel clusters — ~9 groups of 2–4 white
+      boxes (w 3–7 m, y 18–30), one merged mesh, unlit + `fog_enabled: false`,
+      parented as `CloudDriftRoot`. `drift_clouds_system` only translates that
+      root (sin/cos, ~0.04 rad/s).
+    - **WebGL2:** still no texture view-format tricks (item 35); wall/ground
+      images are plain `Rgba8UnormSrgb`. LineList edge trim works on WebGL2
+      (1 px lines, same as legacy `LineBasicMaterial`).
+
+45. **ShotAnte visual parity (M16):** port of legacy `concreteTexture` /
+    `loadArena` paint recipe in `map_render.rs`.
+    - **Textures:** 128px base + 900×2×2 grain + 2px seam grid (`panels`,
+      `grain`); ground tiles at 2 m with baked shadow multiply; perimeter /
+      building / crate exact legacy colour combos; env tint wash on non-urban.
+    - **Urban hues:** two distinct pastels from
+      `[0xe8d8b8, 0xd9c4ad, 0xc9d6c2, 0xc4cede, 0xdcc6c6, 0xcfd8c0]` via
+      `"{seed}-paint"` Mulberry32; BuildingA/B by `(x0+z0)>0`; roof flat
+      `0x4b5364`. Other envs keep family base identity + seam-grid style.
+    - **Edge trim:** Cover only; small (w,d ≤ 1.3) → map accent LineList;
+      bulky → `0x6b542f`; scale 1.003; two draw calls. Buildings/roofs/perim
+      excluded. Headers/sills (`y0≈0,y1≈1.3`) classify as Building.
+    - **Lambert-flat:** `reflectance: 0.0` + high roughness on map materials.
+    - **Barrels:** skipped — `GameMap` has no barrel list yet (only walls).
 
 ### Lobby env-picker automation anchors (1280×720)
 
