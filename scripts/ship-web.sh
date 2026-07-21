@@ -7,6 +7,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/../web"
 
+# Some agent shells export NO_COLOR=1 + FORCE_COLOR=1 together; trunk 0.21
+# then passes a bad --no-color flag. Clear both so cargo/trunk stay happy.
+unset NO_COLOR FORCE_COLOR CLICOLOR_FORCE || true
+
 trunk build --release   # Trunk.toml maps --release → cargo wasm-release + wasm-opt -Oz
 
 shopt -s nullglob

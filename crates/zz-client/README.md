@@ -31,20 +31,21 @@ trunk build          # emits web/dist/ (wasm + JS glue)
 ### Smaller release wasm (SHIP path)
 
 Workspace root defines `[profile.wasm-release]` (`opt-level = "z"`, fat LTO,
-strip). **This is the documented ship path** (also wired via Trunk.toml when
-using plain `trunk build --release`):
+`strip`, `panic = "abort"`). **This is the documented ship path** (also wired
+via Trunk.toml when using plain `trunk build --release`):
 
 ```bash
-cd web
-trunk build --release --cargo-profile wasm-release
-# equivalent (Trunk.toml maps --release → wasm-release profile):
-# trunk build --release
+# from repo root (also runs gzip/brotli siblings for zz-server):
+scripts/ship-web.sh
+# or:
+cd web && trunk build --release
 ```
 
-**M15 verified ship size** (with binaryen `wasm-opt -Oz` on PATH):
-**23.51 MiB** `_bg.wasm` (24_647_501 bytes) + 128 KiB JS glue. Cold load:
-loading card shows immediately; hide only after stable canvas frames.
-Pre-M15 unoptimized bundles were ~28 MiB with a black-page first paint.
+**M18 ship size** (binaryen `wasm-opt -Oz --strip-debug --strip-producers`):
+**22.20 MiB** `_bg.wasm` (23_280_475 bytes raw / 7.11 MiB gzip / **4.87 MiB
+brotli**). Pre-M18 (M15 pipeline) was 24.65 MB / 8.22 MB gz / 5.80 MB br.
+Cold load: loading card shows immediately; hide only after stable canvas
+frames. Pre-M15 unoptimized bundles were ~28 MiB with a black-page first paint.
 
 Requires `wasm-opt` (binaryen) on PATH for `data-wasm-opt="z"`. Debug
 `trunk build` (no `--release`) is enough for iteration.
@@ -60,15 +61,20 @@ Curated in this crate’s `Cargo.toml` (workspace pins `bevy = "0.19"` with
 
 | Area | Features |
 |------|----------|
-| App core | `std`, `async_executor`, `multi_threaded`, `bevy_asset`, `bevy_log`, `bevy_state`, `reflect_auto_register` |
-| Window / platform | `bevy_window`, `bevy_winit`, `x11`, `wayland`, `webgl2`, `default_font` |
-| Render / PBR | `bevy_render`, `bevy_core_pipeline`, `bevy_pbr`, `bevy_light`, `bevy_camera`, `bevy_mesh`, `bevy_material`, `bevy_image`, `bevy_shader`, `bevy_color`, `tonemapping_luts`, `ktx2`, `zstd_rust`, `png` |
+| App core | `std`, `async_executor`, `bevy_asset`, `bevy_log`, `bevy_state` — **no** `reflect_auto_register` |
+| Native-only | `multi_threaded`, `x11`, `wayland` (target-gated; wasm is single-threaded) |
+| Window / platform | `bevy_window`, `bevy_winit`, `webgl2`, `default_font` |
+| Render / PBR | `bevy_render`, `bevy_core_pipeline`, `bevy_pbr`, `bevy_light`, `bevy_camera`, `bevy_mesh`, `bevy_material`, `bevy_image`, `bevy_shader`, `bevy_color` — **no** `tonemapping_luts` / `ktx2` (LUT-free `SomewhatBoringDisplayTransform` on both cameras) |
 | UI / text | `bevy_text`, `bevy_ui`, `bevy_ui_render` |
 | Audio | `bevy_audio` (no `wav`/`vorbis`/… — procedural only) |
+| bevy_egui | `default_fonts`, `render`, `bevy_ui`, `open_url` only (no clipboard/picking) |
 
 Explicitly **not** enabled: `bevy_gltf`, `bevy_animation`, file-format audio
 features (`wav`, `vorbis`, `mp3`, …), `scene`, `webgpu` (browser target is
-WebGL2 only).
+WebGL2 only), `tonemapping_luts`/`ktx2` (M18), `reflect_auto_register` (M18).
+
+Note: `bevy_egui` still forces `bevy_image/zstd_rust` and wasm `image/png`
+internally — those two cannot be fully dropped while egui is present.
 
 ## Bevy 0.19 API notes (vs 0.14–0.16 era)
 
@@ -99,8 +105,11 @@ work next:
    the big profiles. There is no feature literally named `"state"` —
    use `bevy_state`.
 
-6. **`tonemapping_luts` is required** for non-pink PBR unless you change the
-   camera’s `Tonemapping` method. Easy to miss when disabling defaults.
+6. **`tonemapping_luts` is required** for the default `TonyMcMapface` tonemap
+   (and for AgX / BlenderFilmic). Without the feature, set an explicit
+   LUT-free mode on every 3D camera — we use
+   `Tonemapping::SomewhatBoringDisplayTransform` (M18). Leaving the default
+   without LUTs can produce a pink / wrong-looking frame.
 
 7. **Web canvas fields on `Window` (still):**  
    `canvas: Option<String>`, `fit_canvas_to_parent: bool`,
@@ -126,9 +135,10 @@ work next:
 12. **Shadow flag renamed.**  
     Lights use `shadow_maps_enabled` (not `shadows_enabled`).
 
-13. **LUT stack needs `ktx2` + a zstd backend.**  
-    Enabling `tonemapping_luts` without `zstd_rust` (or `zstd_c`) fails at
-    compile time inside `bevy_image`.
+13. **LUT stack needs `ktx2` + a zstd backend** if you re-enable
+    `tonemapping_luts`. M18 drops the whole stack in favour of a LUT-free
+    tonemapper. Residual `zstd_rust` / wasm `png` come from `bevy_egui`, not
+    from our Bevy feature list.
 
 14. **`despawn()` is recursive for children.**  
     There is no `despawn_recursive()` in 0.19 — `EntityCommands::despawn()`

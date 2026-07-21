@@ -22,7 +22,7 @@ tower-http = { version = "0.7", features = ["fs"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 bevy = { version = "0.19", default-features = false }
-bevy_egui = "0.41"
+bevy_egui = { version = "0.41", default-features = false }
 ewebsock = "0.8"
 
 # Own code compiles fast, dependencies (Bevy!) compile optimized once.
@@ -43,3 +43,5 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true
+# Abort panics drop unwinding tables (meaningful on wasm).
+panic = "abort"

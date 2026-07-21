@@ -72,12 +72,17 @@ impl NetClient {
 
     pub fn send_bin(&mut self, frame: Vec<u8>) {
         if let Some(s) = self.sender.as_mut() {
-            s.send(ewebsock::WsMessage::Binary(frame));
-        } else {
-            // Headless / disconnected: capture for match_flow assertions.
-            // Never buffer when a live socket exists (would grow without bound).
-            self.outbound_bin.push(frame);
+            s.send(ewebsock::WsMessage::Binary(frame.clone()));
         }
+        // Always mirror into the test capture buffer. Headless match_flow
+        // injects GameStart/Snap without owning the socket; if a local server
+        // happens to accept `connect_on_start`, frames still need to be
+        // observable via `take_outbound_bin`. Cap so production never grows.
+        const CAP: usize = 64;
+        if self.outbound_bin.len() >= CAP {
+            self.outbound_bin.remove(0);
+        }
+        self.outbound_bin.push(frame);
     }
 
     /// Drain outbound binary frames (inputs / voice) for tests.

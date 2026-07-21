@@ -9,23 +9,27 @@ description = "ZombieZap first-person client: Bevy, native for dev and wasm32 fo
 # zz-core re-enters with netcode (protocol / map / sim). Skeleton is Bevy-only.
 bevy = { workspace = true, features = [
     # --- app core (default_app pieces, no scene/audio) ---
+    # multi_threaded is native-only (see target block below) — wasm is single-
+    # threaded and the feature only bloats the ship bundle.
     "std",
     "async_executor",
-    "multi_threaded",
     "bevy_asset",
     "bevy_log",
     "bevy_state",
-    "reflect_auto_register",
+    # No reflect_auto_register: we don't drive scenes from reflection; skipping
+    # the auto type registry is free size on wasm.
 
     # --- windowing / platform ---
+    # x11/wayland are native-only (see target block).
     "bevy_window",
     "bevy_winit",
-    "x11",
-    "wayland",
     "webgl2",
     "default_font",
 
     # --- render + pbr (no gltf / animation / audio) ---
+    # LUT-free tonemap (SomewhatBoringDisplayTransform on the 3D camera) so we
+    # can drop tonemapping_luts + ktx2 + zstd_rust (largest wasm win).
+    # No png: all textures are procedural; default_font is a TTF subset.
     "bevy_render",
     "bevy_core_pipeline",
     "bevy_pbr",
@@ -36,10 +40,6 @@ bevy = { workspace = true, features = [
     "bevy_image",
     "bevy_shader",
     "bevy_color",
-    "tonemapping_luts",
-    "ktx2",
-    "zstd_rust",
-    "png",
 
     # --- ui + text ---
     "bevy_text",
@@ -60,11 +60,27 @@ workspace = true
 [dependencies.serde_json]
 workspace = true
 
+# Slim bevy_egui: keep render + fonts for the lobby, drop clipboard/picking
+# (we never copy invite URLs via arboard; pointer goes through egui's own
+# input, not bevy_picking). Saves arboard + mesh_picking graph on wasm.
 [dependencies.bevy_egui]
 workspace = true
+default-features = false
+features = [
+    "default_fonts",
+    "render",
+    "bevy_ui",
+    "open_url",
+]
 
-# Native mic capture for proximity voice (wasm uses getUserMedia + AudioWorklet).
+# Desktop-only: Bevy multi_threaded + window backends, plus mic capture.
+# (Bevy features merge with the shared list above for non-wasm targets.)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { workspace = true, features = [
+    "multi_threaded",
+    "x11",
+    "wayland",
+] }
 cpal = "0.15"
 
 # Browser platform seam: same-origin WS URL, ?join= prefill, localStorage name,
