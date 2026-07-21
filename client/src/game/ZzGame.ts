@@ -47,6 +47,16 @@ const ZOMBIE_SKINS: Record<number, [string, string, string]> = {
   2: ["#4e5a33", "#2f3a1c", "#5a2e24"], // brute — dark olive, wound-red rags
 };
 
+/** Per-zombie gait personality — no two shamble alike. */
+interface GaitStyle {
+  lurch: number; // lateral body roll amplitude
+  phaseMul: number; // step frequency multiplier
+  hunch: number; // forward bend
+  armDrop: number; // 0 = both arms raised, 1 = right arm dangles
+  legAsym: number; // how unevenly the legs swing (dragging a foot)
+  stagger: number; // secondary jitter frequency (stumbler twitch)
+}
+
 /** Jointed limbs for the shamble/gait cycle (pivots at shoulder/hip). */
 interface Rig {
   body: THREE.Group;
@@ -59,6 +69,7 @@ interface Rig {
   px: number;
   pz: number;
   init: boolean;
+  style?: GaitStyle;
 }
 
 interface RemoteAvatar {
@@ -93,13 +104,15 @@ export class ZzGame {
   private roster: RosterPlayer[];
   private body: Body = { x: 0, y: 0, z: 0, vy: 0, onGround: true };
   private spawned = false;
-  private sequence = 1;
+  /** Input sequence is monotonic per CONNECTION, not per match — the server
+   *  keeps its high-water mark across rematches and drops stale-seq frames
+   *  (a fresh counter made every rematch an AFK corpse). */
+  private static nextSeq = 1;
   private sendAccum = 0;
 
   private remotes = new Map<number, RemoteAvatar>(); // slot → avatar
   private zombies = new Map<number, ZombieAvatar>(); // id → avatar
   private lootMeshes = new Map<number, THREE.Object3D>(); // id → mesh
-  private tracers: { line: THREE.Line; ttl: number }[] = [];
 
   private lastSnap: ZzSnapshot | null = null;
   private raf = 0;
@@ -495,26 +508,86 @@ export class ZzGame {
     };
   }
 
-  private zombieMats = new Map<number, { skin: THREE.Material; cloth: THREE.Material; face: THREE.Material }>();
+  private skinMats = new Map<number, THREE.Material>();
+  private faceMat: THREE.Material | null = null;
+  private clothMats: THREE.Material[] = [];
   private survivorMats: { skin: THREE.Material; cloth: THREE.Material } | null = null;
 
-  private zombieRig(kind: number): { group: THREE.Group; rig: Rig } {
-    let mats = this.zombieMats.get(kind);
-    if (!mats) {
-      const [base, blotch, cloth] = ZOMBIE_SKINS[kind] ?? ZOMBIE_SKINS[0];
-      mats = {
-        skin: new THREE.MeshLambertMaterial({ map: ZzGame.skinTexture(base, blotch) }),
-        cloth: new THREE.MeshLambertMaterial({ map: ZzGame.skinTexture(cloth, "#1c1814") }),
-        face: new THREE.MeshBasicMaterial({ map: ZzGame.faceTexture() }),
-      };
-      this.zombieMats.set(kind, mats);
+  /** Wardrobe: dull street clothes gone bad — each zombie draws from this so
+   *  the horde reads as former PEOPLE, not copies. */
+  private clothCatalogue(): THREE.Material[] {
+    if (this.clothMats.length) return this.clothMats;
+    const CLOTHES: [string, string][] = [
+      ["#7a3b34", "#4e241f"], // rust-red flannel
+      ["#3d5470", "#293b52"], // work denim
+      ["#5b5346", "#3a352c"], // brown jacket
+      ["#4d5b3a", "#333e26"], // olive drab
+      ["#585d63", "#3b3f44"], // grey hoodie
+      ["#8a793c", "#5c5026"], // mustard shirt
+      ["#4a3550", "#302136"], // faded plum
+      ["#38635e", "#24443f"], // washed teal
+    ];
+    this.clothMats = CLOTHES.map(
+      ([b, s]) => new THREE.MeshLambertMaterial({ map: ZzGame.skinTexture(b, s) }),
+    );
+    return this.clothMats;
+  }
+
+  private zombieRig(kind: number, id: number): { group: THREE.Group; rig: Rig } {
+    let skin = this.skinMats.get(kind);
+    if (!skin) {
+      const [base, blotch] = ZOMBIE_SKINS[kind] ?? ZOMBIE_SKINS[0];
+      skin = new THREE.MeshLambertMaterial({ map: ZzGame.skinTexture(base, blotch) });
+      this.skinMats.set(kind, skin);
     }
+    if (!this.faceMat) this.faceMat = new THREE.MeshBasicMaterial({ map: ZzGame.faceTexture() });
+
+    // deterministic per-id identity: clothes, gait, accessories
+    const wardrobe = this.clothCatalogue();
+    const h = (id * 2654435761) >>> 0;
+    const shirt = wardrobe[h % wardrobe.length];
+    const pants = wardrobe[(h >> 3) % wardrobe.length];
+
     const scale = kind === 2 ? 1.45 : kind === 1 ? 0.95 : 1.0;
-    const made = ZzGame.makeRig(mats.skin, mats.cloth, mats.face, scale);
-    // arms raised forward + hungry forward hunch — the shamble silhouette
+    const made = ZzGame.makeRigDressed(skin, shirt, pants, this.faceMat, scale);
+
+    // some still wear a cap; brutes never kept theirs
+    if (kind !== 2 && h % 5 === 0) {
+      const cap = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.08, 0.34), pants);
+      cap.position.set(0, 1.82, 0.02);
+      made.rig.body.add(cap);
+    }
+
+    // gait personality from the id hash (kind sets the envelope)
+    const f = (n: number) => ((h >> n) & 15) / 15; // 0..1 nibbles
+    made.rig.style = {
+      lurch: 0.08 + f(0) * 0.14 + (kind === 2 ? 0.05 : 0),
+      phaseMul: kind === 1 ? 1.5 + f(4) * 0.5 : 0.8 + f(4) * 0.5,
+      hunch: kind === 1 ? 0.24 + f(8) * 0.12 : 0.08 + f(8) * 0.18,
+      armDrop: f(12) < 0.35 ? 1 : 0, // ~a third drag one dead arm
+      legAsym: 0.7 + f(16) * 0.6,
+      stagger: f(20) * 1.4,
+    };
+    made.rig.body.rotation.x = made.rig.style.hunch;
     made.rig.lArm.rotation.x = -Math.PI / 2.4;
-    made.rig.rArm.rotation.x = -Math.PI / 2.4;
-    made.rig.body.rotation.x = kind === 1 ? 0.28 : 0.14; // runners lope low
+    made.rig.rArm.rotation.x = made.rig.style.armDrop ? -0.25 : -Math.PI / 2.4;
+    return made;
+  }
+
+  /** makeRig with separate shirt/pants materials (torso vs legs). */
+  private static makeRigDressed(
+    skinMat: THREE.Material,
+    shirtMat: THREE.Material,
+    pantsMat: THREE.Material,
+    faceMat: THREE.Material | null,
+    scale = 1,
+  ): { group: THREE.Group; rig: Rig } {
+    const made = ZzGame.makeRig(skinMat, shirtMat, faceMat, scale);
+    // legs were built with the torso material — re-dress them as pants
+    for (const leg of [made.rig.lLeg, made.rig.rLeg]) {
+      const mesh = leg.children[0] as THREE.Mesh;
+      mesh.material = pantsMat;
+    }
     return made;
   }
 
@@ -538,18 +611,21 @@ export class ZzGame {
       rig.body.position.y += (0 - rig.body.position.y) * ease;
     } else if (rig.speed > 0.3) {
       const amp = Math.min(0.25 + rig.speed * 0.09, 0.8);
-      rig.phase += rig.speed * dt * 2.2;
+      rig.phase += rig.speed * dt * 2.2 * (rig.style?.phaseMul ?? 1);
       const s = Math.sin(rig.phase);
       rig.lLeg.rotation.x = s * amp;
       rig.rLeg.rotation.x = -s * amp;
       rig.body.position.y = Math.abs(s) * 0.05;
       if (zombie) {
-        // shamble: heavy lateral lurch, uneven step, arms wavering off-phase
-        rig.body.rotation.z = s * 0.14;
-        rig.lLeg.rotation.x = s * amp * 1.15; // dragging, asymmetric gait
-        rig.rLeg.rotation.x = -s * amp * 0.8;
+        // shamble driven by this zombie's own gait personality
+        const st = rig.style ?? { lurch: 0.14, phaseMul: 1, hunch: 0.14, armDrop: 0, legAsym: 1, stagger: 0 };
+        rig.body.rotation.z = s * st.lurch + Math.sin(rig.phase * (2.3 + st.stagger)) * st.stagger * 0.03;
+        rig.lLeg.rotation.x = s * amp * st.legAsym;
+        rig.rLeg.rotation.x = -s * amp * (2 - st.legAsym) * 0.55;
         rig.lArm.rotation.x = -Math.PI / 2.4 + Math.sin(rig.phase * 0.9) * 0.18;
-        rig.rArm.rotation.x = -Math.PI / 2.4 + Math.cos(rig.phase * 1.1) * 0.18;
+        rig.rArm.rotation.x = st.armDrop
+          ? -0.25 + Math.sin(rig.phase * 0.8) * 0.1 // dead arm swings loose
+          : -Math.PI / 2.4 + Math.cos(rig.phase * 1.1) * 0.18;
         rig.lArm.rotation.z = Math.sin(rig.phase * 0.7) * 0.1;
       } else {
         rig.lArm.rotation.x = -s * amp * 0.7;
@@ -624,7 +700,7 @@ export class ZzGame {
       seen.add(z.id);
       let av = this.zombies.get(z.id);
       if (!av) {
-        const made = this.zombieRig(z.kind);
+        const made = this.zombieRig(z.kind, z.id);
         this.scene.add(made.group);
         av = {
           group: made.group,
@@ -642,8 +718,10 @@ export class ZzGame {
     }
     for (const [id, av] of this.zombies) {
       if (!seen.has(id)) {
-        this.scene.remove(av.group);
+        // died: crumple where it stood + a few soft chunks — no vanishing
         this.zombies.delete(id);
+        this.dying.push({ group: av.group, t: 0 });
+        this.spawnChunks(av.group.position, 5, 0x6a1f18);
       }
     }
 
@@ -665,13 +743,13 @@ export class ZzGame {
       }
     }
 
-    // tracers + hit feedback for this tick's shots
+    // bullets + hit feedback for this tick's shots
     for (const sh of snap.shots) {
-      this.addTracer(sh.slot, [
-        dequantPos(sh.end[0]),
-        dequantPos(sh.end[1]),
-        dequantPos(sh.end[2]),
-      ]);
+      this.fireBullet(
+        sh.slot,
+        [dequantPos(sh.end[0]), dequantPos(sh.end[1]), dequantPos(sh.end[2])],
+        sh.hitKind,
+      );
       if (sh.slot === this.mySlot && sh.hitKind > 0) this.sfx.hit();
     }
   }
@@ -692,23 +770,54 @@ export class ZzGame {
     );
   }
 
-  private addTracer(slot: number, end: [number, number, number]): void {
+  // ── bullets, chunks, corpses ─────────────────────────────────────────────
+
+  private bullets: { mesh: THREE.Mesh; from: THREE.Vector3; to: THREE.Vector3; t: number; dur: number; hitKind: number }[] = [];
+  private chunks: { mesh: THREE.Mesh; vel: THREE.Vector3; ttl: number }[] = [];
+  private dying: { group: THREE.Group; t: number }[] = [];
+  private bulletMat = new THREE.MeshBasicMaterial({ color: 0xffd23f });
+  private bulletGeo = new THREE.BoxGeometry(0.05, 0.05, 0.34);
+  private chunkGeo = new THREE.BoxGeometry(0.12, 0.12, 0.12);
+  private chunkMats = new Map<number, THREE.MeshBasicMaterial>();
+
+  /** A visible slug flying the shot path (server hitscan is instant; this is
+   *  the dakka the eye wants). Impact chunks pop when it arrives. */
+  private fireBullet(slot: number, end: [number, number, number], hitKind: number): void {
     let from: THREE.Vector3;
     if (slot === this.mySlot) {
-      from = new THREE.Vector3(this.body.x, this.body.y + PLAYER_EYE - 0.12, this.body.z);
+      from = new THREE.Vector3();
+      this.flash.getWorldPosition(from); // leaves the actual muzzle
     } else {
       const av = this.remotes.get(slot);
       if (!av) return;
       from = av.group.position.clone().setY(av.group.position.y + PLAYER_EYE - 0.12);
     }
-    const geo = new THREE.BufferGeometry().setFromPoints([from, new THREE.Vector3(...end)]);
-    const line = new THREE.Line(
-      geo,
-      new THREE.LineBasicMaterial({ color: 0xff8a3d, transparent: true, opacity: 1 }),
-    );
-    line.frustumCulled = false;
-    this.scene.add(line);
-    this.tracers.push({ line, ttl: 0.09 });
+    const to = new THREE.Vector3(...end);
+    const mesh = new THREE.Mesh(this.bulletGeo, this.bulletMat);
+    mesh.position.copy(from);
+    mesh.lookAt(to);
+    this.scene.add(mesh);
+    const dur = Math.max(0.04, from.distanceTo(to) / 95); // ~95 m/s visual speed
+    this.bullets.push({ mesh, from, to, t: 0, dur, hitKind });
+  }
+
+  private spawnChunks(at: THREE.Vector3, n: number, color: number): void {
+    let mat = this.chunkMats.get(color);
+    if (!mat) {
+      mat = new THREE.MeshBasicMaterial({ color });
+      this.chunkMats.set(color, mat);
+    }
+    for (let i = 0; i < n; i++) {
+      const mesh = new THREE.Mesh(this.chunkGeo, mat);
+      mesh.position.copy(at);
+      mesh.position.y += 0.9;
+      this.scene.add(mesh);
+      this.chunks.push({
+        mesh,
+        vel: new THREE.Vector3((Math.random() - 0.5) * 3.5, 1.5 + Math.random() * 2.5, (Math.random() - 0.5) * 3.5),
+        ttl: 0.45 + Math.random() * 0.25,
+      });
+    }
   }
 
   // ── loop ─────────────────────────────────────────────────────────────────
@@ -736,7 +845,7 @@ export class ZzGame {
 
   private update(dt: number): void {
     const input = this.input.frame();
-    input.sequence = this.sequence;
+    input.sequence = ZzGame.nextSeq;
 
     if (this.spawned) {
       // predict locally with the shared sim
@@ -754,7 +863,7 @@ export class ZzGame {
     if (this.sendAccum >= TICK_DT) {
       this.sendAccum %= TICK_DT;
       this.socket.sendBinary(encodeInput(input));
-      this.sequence++;
+      ZzGame.nextSeq++;
     }
 
     // local fire feedback: flash + recoil kick + gunshot crack (server owns
@@ -812,14 +921,44 @@ export class ZzGame {
     // loot idle spin
     for (const mesh of this.lootMeshes.values()) mesh.rotation.y += dt * 2.0;
 
-    // expire tracers
-    for (let i = this.tracers.length - 1; i >= 0; i--) {
-      const tr = this.tracers[i];
-      tr.ttl -= dt;
-      if (tr.ttl <= 0) {
-        this.scene.remove(tr.line);
-        tr.line.geometry.dispose();
-        this.tracers.splice(i, 1);
+    // bullets in flight
+    for (let i = this.bullets.length - 1; i >= 0; i--) {
+      const b = this.bullets[i];
+      b.t += dt;
+      const k = Math.min(1, b.t / b.dur);
+      b.mesh.position.lerpVectors(b.from, b.to, k);
+      if (k >= 1) {
+        // impact: red flesh puff on a hit, grey masonry chips on a wall
+        this.spawnChunks(b.to.clone().setY(b.to.y - 0.9), 3, b.hitKind > 0 ? 0x6a1f18 : 0x8d9099);
+        this.scene.remove(b.mesh);
+        this.bullets.splice(i, 1);
+      }
+    }
+
+    // chunk physics: pop, arc, expire
+    for (let i = this.chunks.length - 1; i >= 0; i--) {
+      const c = this.chunks[i];
+      c.ttl -= dt;
+      c.vel.y -= 9 * dt;
+      c.mesh.position.addScaledVector(c.vel, dt);
+      c.mesh.rotation.x += dt * 7;
+      c.mesh.rotation.z += dt * 5;
+      if (c.ttl <= 0 || c.mesh.position.y < 0.05) {
+        this.scene.remove(c.mesh);
+        this.chunks.splice(i, 1);
+      }
+    }
+
+    // corpses: keel over, rest a beat, sink away
+    for (let i = this.dying.length - 1; i >= 0; i--) {
+      const d = this.dying[i];
+      d.t += dt;
+      const fall = Math.min(1, d.t / 0.4);
+      d.group.rotation.z = (Math.PI / 2) * (1 - (1 - fall) * (1 - fall)); // ease-out keel
+      if (d.t > 1.0) d.group.position.y -= dt * 1.6; // sink
+      if (d.t > 1.6) {
+        this.scene.remove(d.group);
+        this.dying.splice(i, 1);
       }
     }
   }
