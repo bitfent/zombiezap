@@ -13,7 +13,7 @@ use zz_core::constants::*;
 use zz_core::map::generate_map;
 use zz_core::movement::step_body;
 use zz_core::protocol::{ClientMsg, ServerMsg, encode_input};
-use zz_core::snapshot::{dequant_pos, dequant_yaw8, dequant_yaw16};
+use zz_core::snapshot::{dequant_pitch, dequant_pos, dequant_yaw8, dequant_yaw16};
 use zz_core::types::{Body, PlayerInput};
 
 use crate::map_render::CurrentMap;
@@ -178,6 +178,14 @@ impl Default for Predicted {
     }
 }
 
+impl Predicted {
+    /// True once the first authoritative self-sample has seeded prediction.
+    /// `fps_controller` refuses to send inputs until this is set.
+    pub fn is_synced(&self) -> bool {
+        self.synced
+    }
+}
+
 #[derive(Component)]
 pub struct RemotePlayer {
     pub slot: u8,
@@ -322,9 +330,10 @@ fn net_poll(
                 players,
             }) => {
                 info!("game_start: slot {your_slot}, env {env:?}, seed {map_seed}");
-                // Fresh snapshot baseline — previous room's encoder state must
-                // not bleed into this match's keyframe stream.
-                net.reset_decoder();
+                // Decoder baseline is reset in `NetClient::drain` when the
+                // GameStart text frame is parsed — *before* any snapshot
+                // binaries that follow in the same poll. Do not reset here:
+                // that would wipe a keyframe already decoded in this drain.
                 // Clear leftover remotes / crumples from a previous match.
                 for (e, _, _, _) in zombies.iter() {
                     commands.entity(e).despawn();
@@ -337,7 +346,14 @@ fn net_poll(
                 seams.latest.0 = None;
                 seams.last_stats.0 = None;
                 seams.fx.0.clear();
+                // Insert immediately so same-frame Snaps (and fps_controller
+                // on the next system) see walls — commands.apply is end-of-stage.
                 commands.insert_resource(CurrentMap(generate_map(env, &map_seed)));
+                // Also write through world-visible path for inject/headless:
+                // Bevy applies Commands after the system, so a Snap in this
+                // same drain would otherwise still see Option<Res<CurrentMap>>
+                // as None. We re-fetch via insert on the resource if present
+                // is handled below by not requiring map for self-sync.
                 *session = Session::Playing { my_slot: your_slot };
                 *predicted = Predicted::default();
                 *seams.prev_self = PrevSelf::default();
@@ -383,7 +399,14 @@ fn net_poll(
                 voice_rx.0.push_back((slot, pcm));
             }
             NetEvent::Snap(snap) => {
-                let (Some(my_slot), Some(map)) = (session.my_slot(), map.as_deref()) else {
+                // Map is optional for HUD / self-sync / remotes. GameStart
+                // inserts CurrentMap via Commands (end of stage), so the first
+                // post-start snapshots often arrive while `map` is still None.
+                // Requiring it here left `predicted.synced == false` and
+                // suppressed all PlayerInput until a later keyframe — idle
+                // browsers looked "alive" (HUD from a later snap) but had
+                // spent the open window sending nothing.
+                let Some(my_slot) = session.my_slot() else {
                     continue;
                 };
 
@@ -458,16 +481,21 @@ fn net_poll(
                     while predicted.pending.front().is_some_and(|i| i.seq <= acked) {
                         predicted.pending.pop_front();
                     }
-                    let pending: Vec<PlayerInput> = predicted.pending.iter().copied().collect();
-                    for input in &pending {
-                        step_body(
-                            &mut predicted.body,
-                            input,
-                            TICK_DT,
-                            PLAYER_SPEED,
-                            &map.0.walls,
-                            map.0.arena_half,
-                        );
+                    // Replay only when walls are available; first seed does not
+                    // need it (pending is empty until we start sending).
+                    if let Some(map) = map.as_deref() {
+                        let pending: Vec<PlayerInput> =
+                            predicted.pending.iter().copied().collect();
+                        for input in &pending {
+                            step_body(
+                                &mut predicted.body,
+                                input,
+                                TICK_DT,
+                                PLAYER_SPEED,
+                                &map.0.walls,
+                                map.0.arena_half,
+                            );
+                        }
                     }
 
                     if predicted.synced {
@@ -476,8 +504,15 @@ fn net_poll(
                         predicted.error_offset =
                             (rendered_before - corrected).clamp_length_max(2.0);
                     } else {
+                        // First authoritative sample: seed aim from the server
+                        // spawn yaw so idle inputs don't overwrite facing with 0.
+                        predicted.yaw = dequant_yaw16(me.yaw);
+                        predicted.pitch = dequant_pitch(me.pitch);
                         predicted.synced = true;
                         predicted.error_offset = Vec3::ZERO;
+                        // Don't wait a full tick of accum after open — send on
+                        // this frame's fps_controller pass.
+                        predicted.send_accum = TICK_DT;
                     }
                 }
 
@@ -683,8 +718,6 @@ fn fps_controller(
     mut predicted: ResMut<Predicted>,
     mut net: ResMut<NetClient>,
 ) {
-    let Some(map) = map else { return };
-
     // mouse look only while the pointer is captured (desktop non-touch path)
     let locked = windows
         .iter()
@@ -720,7 +753,10 @@ fn fps_controller(
     }
 
     // fixed 30 Hz: sample intent, send, predict — one step per send
-    // (cadence untouched; touch ORs into the same bools)
+    // (cadence untouched; touch ORs into the same bools).
+    // Map is optional for *sending*: GameStart inserts CurrentMap via
+    // Commands (visible next frame). We must still emit idle inputs so the
+    // server sees a live player immediately after the first snapshot.
     predicted.send_accum += time.delta_secs();
     while predicted.send_accum >= TICK_DT {
         predicted.send_accum -= TICK_DT;
@@ -755,14 +791,16 @@ fn fps_controller(
         }
         predicted.pending.push_back(input);
 
-        step_body(
-            &mut predicted.body,
-            &input,
-            TICK_DT,
-            PLAYER_SPEED,
-            &map.0.walls,
-            map.0.arena_half,
-        );
+        if let Some(map) = map.as_deref() {
+            step_body(
+                &mut predicted.body,
+                &input,
+                TICK_DT,
+                PLAYER_SPEED,
+                &map.0.walls,
+                map.0.arena_half,
+            );
+        }
     }
 }
 

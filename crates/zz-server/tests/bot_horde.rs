@@ -395,3 +395,88 @@ async fn rematch_resets_peak_horde_and_time_alive_bounded() {
         match_ends[1].duration_ms
     );
 }
+
+/// M14b: idle / zero-input players must still be prey. Parameterized over
+/// (never send any input) and (send inputs but never move). First damage
+/// within 25 s of GameStart; match reaches MatchEnd.
+#[tokio::test]
+async fn idle_zero_input_takes_damage_and_match_ends() {
+    idle_player_engagement(false).await;
+}
+
+#[tokio::test]
+async fn idle_standing_inputs_takes_damage_and_match_ends() {
+    idle_player_engagement(true).await;
+}
+
+async fn idle_player_engagement(send_idle_inputs: bool) {
+    // Same aggressive rate band as other tests in this binary (env is
+    // process-global and tests share a process — do not set "1" here or a
+    // parallel horde_grows can starve). Pin seed for stable travel time.
+    unsafe {
+        std::env::set_var("ZZ_DIRECTOR_RATE", "40");
+        std::env::set_var("MAP_SEED", "m4-dev");
+    }
+    let url = start_server().await;
+    let (mut ws, slot) = connect(&url, "statue").await;
+    let mut dec = SnapshotDecoder::new();
+
+    let mut seq = 0u32;
+    let mut first_damage_ms: Option<u32> = None;
+    let mut peak_zeds = 0usize;
+    let mut saw_self = false;
+    let match_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let damage_deadline_ms = 25_000u32;
+
+    let stats = loop {
+        assert!(
+            tokio::time::Instant::now() < match_deadline,
+            "no MatchEnd within 90 s (send_idle={send_idle_inputs}, peak_zeds={peak_zeds}, first_dmg={first_damage_ms:?})"
+        );
+        if send_idle_inputs {
+            seq += 1;
+            let idle = PlayerInput {
+                seq,
+                ..Default::default()
+            };
+            let _ = ws
+                .send(Message::Binary(encode_input(&idle).to_vec().into()))
+                .await;
+        }
+        match recv_any(&mut ws, &mut dec).await {
+            Some(Incoming::Snap(s)) => {
+                peak_zeds = peak_zeds.max(s.zombies.len());
+                if let Some(me) = s.players.iter().find(|p| p.slot == slot) {
+                    saw_self = true;
+                    if me.health < 100 && first_damage_ms.is_none() {
+                        first_damage_ms = Some(s.game_time_ms);
+                        assert!(
+                            s.game_time_ms <= damage_deadline_ms,
+                            "first damage at {} ms > {} ms budget (send_idle={send_idle_inputs})",
+                            s.game_time_ms,
+                            damage_deadline_ms
+                        );
+                    }
+                }
+            }
+            Some(Incoming::Msg(ServerMsg::MatchEnd { stats })) => break stats,
+            Some(_) => {}
+            None => panic!("connection dropped before MatchEnd (send_idle={send_idle_inputs})"),
+        }
+    };
+
+    assert!(saw_self, "must observe self in snapshots");
+    assert!(
+        first_damage_ms.is_some(),
+        "must take damage before MatchEnd (send_idle={send_idle_inputs}, peak={peak_zeds})"
+    );
+    assert!(
+        first_damage_ms.unwrap() <= damage_deadline_ms,
+        "first damage {} ms exceeds 25 s",
+        first_damage_ms.unwrap()
+    );
+    assert_eq!(stats.players.len(), 1);
+    assert!(stats.peak_zombies > 0);
+    assert!(stats.duration_ms > 0);
+    assert!(stats.players[0].time_alive_ms <= stats.duration_ms);
+}

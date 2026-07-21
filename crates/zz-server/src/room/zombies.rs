@@ -67,6 +67,11 @@ impl FlowField {
         }
     }
 
+    /// True until the first rebuild against a live walk grid.
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
     pub fn rebuild(grid: &WalkGrid, player_positions: &[(f32, f32)]) -> Self {
         let sources: Vec<(usize, usize)> = player_positions
             .iter()

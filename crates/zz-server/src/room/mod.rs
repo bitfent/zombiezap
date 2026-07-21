@@ -462,7 +462,10 @@ impl Room {
             .step(now, &self.map, &mut self.zombies, &player_views);
         self.peak_zombies = self.peak_zombies.max(self.zombies.len() as u32);
 
-        if now.is_multiple_of(FLOWFIELD_REBUILD_TICKS) {
+        // Rebuild on the periodic cadence, and immediately when the field is
+        // still empty (first ticks after join) so zombies path to idle prey
+        // without waiting FLOWFIELD_REBUILD_TICKS.
+        if now.is_multiple_of(FLOWFIELD_REBUILD_TICKS) || self.flow.is_empty() {
             let alive_pos: Vec<(f32, f32)> = self
                 .players
                 .iter()

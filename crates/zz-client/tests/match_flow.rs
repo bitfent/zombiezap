@@ -8,15 +8,17 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
-use zz_client::game::{GamePlugin, RemotePlayer, RemoteZombie, Session};
+use zz_client::game::{GamePlugin, Predicted, RemotePlayer, RemoteZombie, Session};
 use zz_client::hud::{HudChrome, HudPlugin};
 use zz_client::map_render::{CurrentMap, MapRenderPlugin, MapRoot, Placeholder};
-use zz_client::net::NetClient;
+use zz_client::net::{NetClient, NetEvent};
 use zz_client::seams::{LastStats, LatestSnapshot, Roster};
 use zz_client::touch::TouchIntent;
 use zz_client::voice::{VoiceRx, VoiceState};
+use zz_core::constants::{MAG_SIZE, MAX_HEALTH, START_GRENADES, START_RESERVE_AMMO};
 use zz_core::map::generate_map;
-use zz_core::protocol::{MatchStats, PlayerStats};
+use zz_core::protocol::{MatchStats, PlayerStats, RosterPlayer, ServerMsg};
+use zz_core::snapshot::{Snapshot, WirePlayer, quant_pos3, quant_yaw16};
 use zz_core::types::EnvKind;
 
 /// Minimal plugin set: assets + session + map build + HUD gate, no window/GPU.
@@ -228,5 +230,92 @@ fn rematch_wipes_stale_horde_stats_and_rebuilds_map() {
     assert!(
         app.world().resource::<LastStats>().0.is_none(),
         "S3: LastStats still clear while Playing"
+    );
+}
+
+/// M14b: after GameStart + first snapshot, prediction is synced and at least
+/// one encoded input frame is queued within a few ticks (even with no keys).
+#[test]
+fn game_start_snapshot_syncs_and_queues_input() {
+    let mut app = headless_app();
+    // Leave Menu so we're ready for a synthetic GameStart (not Boot reconnect).
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    app.update();
+
+    let slot = 0u8;
+    let spawn = generate_map(EnvKind::Urban, "match-flow-input").spawns[0];
+    let snap = Snapshot {
+        tick: 1,
+        game_time_ms: 33,
+        difficulty: 0,
+        paused: false,
+        players: vec![WirePlayer {
+            slot,
+            pos: quant_pos3(spawn.x, 0.0, spawn.z),
+            yaw: quant_yaw16(spawn.yaw),
+            pitch: 0,
+            health: MAX_HEALTH,
+            ammo_mag: MAG_SIZE,
+            ammo_reserve: START_RESERVE_AMMO,
+            grenades: START_GRENADES,
+            kills: 0,
+            alive: true,
+            last_acked_seq: 0,
+        }],
+        zombies: vec![],
+        loot: vec![],
+        grenades: vec![],
+        shots: vec![],
+        booms: vec![],
+    };
+
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Msg(ServerMsg::GameStart {
+            map_seed: "match-flow-input".into(),
+            env: EnvKind::Urban,
+            your_slot: slot,
+            players: vec![RosterPlayer {
+                slot,
+                id: "c1".into(),
+                name: "tester".into(),
+            }],
+        }));
+        net.inject(NetEvent::Snap(snap));
+        net.take_outbound_bin(); // clear any prior
+    }
+
+    // N ticks of fixed 16 ms: GameStart+Snap → synced + idle input send.
+    let mut saw_synced = false;
+    let mut saw_input = false;
+    for i in 0..8 {
+        app.update();
+        let synced = app.world().resource::<Predicted>().is_synced();
+        if synced {
+            saw_synced = true;
+        }
+        let out = app.world_mut().resource_mut::<NetClient>().take_outbound_bin();
+        if !out.is_empty() {
+            // BIN_INPUT tag = 0
+            assert_eq!(out[0].first().copied(), Some(0), "frame {i}: expected BIN_INPUT");
+            saw_input = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_synced,
+        "predicted.synced must become true after GameStart + first snapshot"
+    );
+    assert!(
+        saw_input,
+        "at least one encoded input frame must be queued within N ticks after sync"
+    );
+    assert!(
+        matches!(
+            *app.world().resource::<Session>(),
+            Session::Playing { my_slot: 0 }
+        ),
+        "session Playing"
     );
 }

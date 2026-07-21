@@ -23,6 +23,10 @@ pub struct NetClient {
     receiver: Option<std::sync::Mutex<ewebsock::WsReceiver>>,
     decoder: SnapshotDecoder,
     connected: bool,
+    /// Headless / unit-test inject queue (drained first each poll).
+    inject: Vec<NetEvent>,
+    /// Binary frames handed to `send_bin` (real socket and/or test capture).
+    outbound_bin: Vec<Vec<u8>>,
 }
 
 // ewebsock's wasm WsSender holds `Rc<WebSocket>`, which is !Send/!Sync.
@@ -41,6 +45,8 @@ impl NetClient {
             receiver: None,
             decoder: SnapshotDecoder::new(),
             connected: false,
+            inject: Vec::new(),
+            outbound_bin: Vec::new(),
         }
     }
 
@@ -67,19 +73,36 @@ impl NetClient {
     pub fn send_bin(&mut self, frame: Vec<u8>) {
         if let Some(s) = self.sender.as_mut() {
             s.send(ewebsock::WsMessage::Binary(frame));
+        } else {
+            // Headless / disconnected: capture for match_flow assertions.
+            // Never buffer when a live socket exists (would grow without bound).
+            self.outbound_bin.push(frame);
         }
     }
 
-    /// Reset the snapshot decoder baseline. Call on every `GameStart` so a
-    /// rematch's keyframe is not applied against the previous room's state
-    /// (rooms each own a fresh encoder; the client must match).
+    /// Drain outbound binary frames (inputs / voice) for tests.
+    pub fn take_outbound_bin(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.outbound_bin)
+    }
+
+    /// Queue a synthetic event (GameStart, Snap, …) for the next `drain`.
+    /// Used by headless match-flow tests that have no real socket.
+    pub fn inject(&mut self, ev: NetEvent) {
+        self.inject.push(ev);
+    }
+
+    /// Reset the snapshot decoder baseline. Prefer letting `drain` do this
+    /// when it sees `GameStart` **before** decoding later binary frames in the
+    /// same batch — calling this *after* those frames were decoded drops the
+    /// room's opening keyframe and leaves the client without a baseline until
+    /// the next periodic keyframe (~2 s).
     pub fn reset_decoder(&mut self) {
         self.decoder = SnapshotDecoder::new();
     }
 
     /// Drain everything that arrived since last frame. Call once per frame.
     pub fn drain(&mut self) -> Vec<NetEvent> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.inject);
         let mut events = Vec::new();
         if let Some(r) = self.receiver.as_ref() {
             let r = r.lock().expect("net receiver lock");
@@ -100,7 +123,19 @@ impl NetClient {
                             // gameplay's problem
                             self.send_msg(&ClientMsg::Pong { t });
                         }
-                        Ok(m) => out.push(NetEvent::Msg(m)),
+                        Ok(m) => {
+                            // GameStart must reset the decoder *before* any
+                            // snapshot frames that follow in this same drain
+                            // batch. The new room's encoder starts with a
+                            // keyframe; applying it against a previous room's
+                            // baseline (or wiping the baseline *after* the
+                            // keyframe was already decoded) desyncs the stream
+                            // for up to KEYFRAME_EVERY ticks.
+                            if matches!(m, ServerMsg::GameStart { .. }) {
+                                self.decoder = SnapshotDecoder::new();
+                            }
+                            out.push(NetEvent::Msg(m));
+                        }
                         Err(_) => {} // unknown control message: drop
                     }
                 }

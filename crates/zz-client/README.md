@@ -418,13 +418,18 @@ Prefer a 1 px `left_click_drag` (item 36) so egui registers the press.
     `CurrentMap` inserted after the rebuild system in the same frame still
     builds on the next tick (and recovers if `MapRoot` is missing). Rebuild
     runs in `Update` **after** `GameSessionSet`. Rematch: client resets the
-    snapshot decoder on every `GameStart`, clears `LatestSnapshot` /
-    `LastStats` / `FxQueue`, and despawns remotes; server **stops snapshot
-    broadcast after `MatchEnd`** so the old room cannot corrupt the next
-    room's stream on the shared `OutMsg` channel. `MatchStats.time_alive_ms`
-    is clamped to `duration_ms`. Headless coverage:
-    `crates/zz-client/tests/match_flow.rs` +
-    `bot_horde::rematch_resets_peak_horde_and_time_alive_bounded`.
+    snapshot decoder on every `GameStart` **inside `NetClient::drain` before
+    decoding later binaries in the same poll** (resetting after decode dropped
+    the room keyframe — M14b), clears `LatestSnapshot` / `LastStats` /
+    `FxQueue`, and despawns remotes; server **stops snapshot broadcast after
+    `MatchEnd`** so the old room cannot corrupt the next room's stream on the
+    shared `OutMsg` channel. `MatchStats.time_alive_ms` is clamped to
+    `duration_ms`. Snapshots apply HUD/self-sync without requiring
+    `CurrentMap` (Commands insert is end-of-stage); `fps_controller` sends
+    idle inputs as soon as `predicted.synced` even if walls are not loaded yet.
+    Headless coverage: `crates/zz-client/tests/match_flow.rs` +
+    `bot_horde::rematch_resets_peak_horde_and_time_alive_bounded` +
+    idle/zero-input engagement suite (M14b).
 
 45. **Ended-state perf (M14 / S7):** while `Session::Ended`, do **not** run
     remote interpolation, rig animation, growls, FX drain, or FPS controller
