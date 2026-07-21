@@ -216,8 +216,8 @@ pub struct WaveUi {
 
 /// Combo resets after this many seconds without a kill.
 pub const COMBO_RESET_SEC: f32 = 4.0;
-/// Wave banner display duration.
-pub const WAVE_BANNER_SEC: f32 = 2.8;
+/// Wave banner display duration (time-based fade; not tied to WaveClear).
+pub const WAVE_BANNER_SEC: f32 = 2.5;
 
 /// Transient visual events derived from snapshots (shots are per-snapshot
 /// transients on the wire; game.rs re-emits them here for fx to consume).

@@ -257,8 +257,10 @@ pub fn step_zombie(
 
     let len = (dx * dx + dz * dz).sqrt();
     if len < 1e-3 {
+        // No steering: try to unstick out of a solid/partial wall cell.
+        unstick_body(&mut z.body, grid, walls, arena_half);
         z.state = with_frenzy(ZS_WALK, z.frenzy);
-        return None; // unreachable pocket — idle (director avoids these gates)
+        return None;
     }
     let (dx, dz) = (dx / len, dz / len);
 
@@ -268,9 +270,71 @@ pub fn step_zombie(
         yaw: z.yaw,
         ..Default::default()
     };
+    let before = (z.body.x, z.body.z);
     zz_core::movement::step_body(&mut z.body, &input, TICK_DT, speed, walls, arena_half);
+    // Flow non-zero but continuous collision blocked every axis (spawn inside
+    // a walkable cell that still overlaps a wall footprint) — snap free.
+    if (z.body.x - before.0).abs() + (z.body.z - before.1).abs() < 1e-5 {
+        unstick_body(&mut z.body, grid, walls, arena_half);
+    }
     z.state = with_frenzy(ZS_WALK, z.frenzy);
     None
+}
+
+/// Move a body to the nearest walkable cell centre that continuous collision
+/// accepts. No-op if already free or no free cell is nearby.
+fn unstick_body(body: &mut Body, grid: &WalkGrid, walls: &[Aabb], arena_half: f32) {
+    if !zz_core::movement::body_blocked_at(body.x, body.z, walls) {
+        // Free but maybe jammed against a corner — still try cell centre of
+        // our own cell so the next step has room to move.
+        if let Some((ix, iz)) = grid.cell_of(body.x, body.z)
+            && grid.is_walkable(ix, iz)
+        {
+            let (cx, cz) = cell_center(grid, ix, iz);
+            if !zz_core::movement::body_blocked_at(cx, cz, walls) {
+                body.x = cx.clamp(-arena_half + 0.5, arena_half - 0.5);
+                body.z = cz.clamp(-arena_half + 0.5, arena_half - 0.5);
+            }
+        }
+        return;
+    }
+    let Some((ox, oz)) = grid.cell_of(body.x, body.z) else {
+        return;
+    };
+    for r in 0..=10 {
+        let ri = r as isize;
+        for dz in -ri..=ri {
+            for dx in -ri..=ri {
+                if r > 0 && dx.abs() != ri && dz.abs() != ri {
+                    continue;
+                }
+                let nx = ox as isize + dx;
+                let nz = oz as isize + dz;
+                if nx < 0 || nz < 0 {
+                    continue;
+                }
+                let (nx, nz) = (nx as usize, nz as usize);
+                if !grid.is_walkable(nx, nz) {
+                    continue;
+                }
+                let (cx, cz) = cell_center(grid, nx, nz);
+                if zz_core::movement::body_blocked_at(cx, cz, walls) {
+                    continue;
+                }
+                body.x = cx.clamp(-arena_half + 0.5, arena_half - 0.5);
+                body.z = cz.clamp(-arena_half + 0.5, arena_half - 0.5);
+                return;
+            }
+        }
+    }
+}
+
+fn cell_center(grid: &WalkGrid, ix: usize, iz: usize) -> (f32, f32) {
+    const CELL: f32 = 1.0;
+    (
+        -grid.half + (ix as f32 + 0.5) * CELL,
+        -grid.half + (iz as f32 + 0.5) * CELL,
+    )
 }
 
 pub fn yaw_toward(from_x: f32, from_z: f32, to_x: f32, to_z: f32) -> f32 {

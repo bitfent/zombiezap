@@ -9,8 +9,9 @@ use super::zombies::{Zombie, ZombieKind, yaw_toward};
 use zz_core::constants::*;
 use zz_core::map::{GameMap, Gate};
 use zz_core::math::{Vec3, dir_from_angles, nearest_wall_t};
+use zz_core::movement::body_blocked_at;
 use zz_core::rng::Mulberry32;
-use zz_core::types::{Body, EnvKind};
+use zz_core::types::{Aabb, Body, EnvKind};
 
 /// Side effects the room applies after each director step.
 #[derive(Default)]
@@ -234,7 +235,10 @@ impl Director {
                 (self.rng.next() as f32 - 0.5) * 1.5,
             );
             let (gx, gz) = (gate.x + jx, gate.z + jz);
-            let (x, z) = Self::approach_spawn(gx, gz, players, approach, grid);
+            // Per-spawn approach jitter so a wave dump does not stack every
+            // walker on the same (possibly stuck) pull-in cell.
+            let approach_i = (approach * (0.82 + self.rng.next() as f32 * 0.30)).clamp(14.0, approach);
+            let (x, z) = Self::approach_spawn(gx, gz, players, approach_i, grid, &map.walls);
             let (x, z) = (
                 x.clamp(-map.arena_half + 1.0, map.arena_half - 1.0),
                 z.clamp(-map.arena_half + 1.0, map.arena_half - 1.0),
@@ -253,7 +257,7 @@ impl Director {
                 let (px, pz) = (px / plen, pz / plen);
                 let fx_t = cx + px * RUNNER_FLANK_OFFSET_M;
                 let fz_t = cz + pz * RUNNER_FLANK_OFFSET_M;
-                let (fx_t, fz_t) = Self::snap_walkable(fx_t, fz_t, grid);
+                let (fx_t, fz_t) = Self::snap_walkable(fx_t, fz_t, grid, &map.walls);
                 Some((fx_t, fz_t))
             } else {
                 None
@@ -324,13 +328,15 @@ impl Director {
 
     /// If the gate is farther than `approach` from every alive player, place
     /// the spawn on the segment gate→nearest-player at distance `approach`,
-    /// then snap to a walkable cell so the flow field can route.
+    /// then snap to a walkable, body-clear cell so the flow field can route
+    /// and continuous collision can actually step (M22b).
     fn approach_spawn(
         gx: f32,
         gz: f32,
         players: &[(f32, f32, f32, f32, bool)],
         approach: f32,
         grid: &zz_core::map::WalkGrid,
+        walls: &[Aabb],
     ) -> (f32, f32) {
         let mut best: Option<(f32, f32, f32)> = None; // (px, pz, d2)
         for p in players.iter().filter(|p| p.4) {
@@ -346,47 +352,89 @@ impl Director {
             }
         }
         let Some((px, pz, d2)) = best else {
-            return Self::snap_walkable(gx, gz, grid);
+            return Self::snap_walkable(gx, gz, grid, walls);
         };
         let dist = d2.sqrt();
         if dist <= approach || dist < 1e-3 {
-            return Self::snap_walkable(gx, gz, grid);
+            return Self::snap_walkable(gx, gz, grid, walls);
         }
-        for k in 0..20 {
+        for k in 0..24 {
             let along = (approach + k as f32 * 2.0).min(dist);
             let t = along / dist;
             let x = px + (gx - px) * t;
             let z = pz + (gz - pz) * t;
-            if grid.walkable_at(x, z) {
-                return (x, z);
+            if let Some(c) = Self::try_spawn_point(x, z, grid, walls) {
+                return c;
             }
         }
-        Self::snap_walkable(gx, gz, grid)
+        Self::snap_walkable(gx, gz, grid, walls)
     }
 
-    fn snap_walkable(x: f32, z: f32, grid: &zz_core::map::WalkGrid) -> (f32, f32) {
-        if grid.walkable_at(x, z) {
-            return (x, z);
+    /// Accept only positions whose cell is walkable AND whose continuous body
+    /// footprint is free. Always return the cell centre so partial wall
+    /// overlaps inside a walkable cell cannot freeze the body (M22b).
+    fn try_spawn_point(
+        x: f32,
+        z: f32,
+        grid: &zz_core::map::WalkGrid,
+        walls: &[Aabb],
+    ) -> Option<(f32, f32)> {
+        let (ix, iz) = grid.cell_of(x, z)?;
+        if !grid.is_walkable(ix, iz) {
+            return None;
         }
-        for r in 1..=8 {
-            let rf = r as f32;
-            for (dx, dz) in [
-                (1.0, 0.0),
-                (-1.0, 0.0),
-                (0.0, 1.0),
-                (0.0, -1.0),
-                (1.0, 1.0),
-                (1.0, -1.0),
-                (-1.0, 1.0),
-                (-1.0, -1.0),
-            ] {
-                let nx = x + dx * rf;
-                let nz = z + dz * rf;
-                if grid.walkable_at(nx, nz) {
-                    return (nx, nz);
+        let (cx, cz) = Self::cell_center(grid, ix, iz);
+        if body_blocked_at(cx, cz, walls) {
+            return None;
+        }
+        Some((cx, cz))
+    }
+
+    fn cell_center(grid: &zz_core::map::WalkGrid, ix: usize, iz: usize) -> (f32, f32) {
+        const CELL: f32 = 1.0;
+        (
+            -grid.half + (ix as f32 + 0.5) * CELL,
+            -grid.half + (iz as f32 + 0.5) * CELL,
+        )
+    }
+
+    fn snap_walkable(
+        x: f32,
+        z: f32,
+        grid: &zz_core::map::WalkGrid,
+        walls: &[Aabb],
+    ) -> (f32, f32) {
+        if let Some(c) = Self::try_spawn_point(x, z, grid, walls) {
+            return c;
+        }
+        // Spiral search in cell units (centre samples) — farther than the old
+        // 8 m ring so a thick block does not leave the spawn inside solid.
+        if let Some((ox, oz)) = grid.cell_of(x, z) {
+            for r in 1..=14 {
+                let ri = r as isize;
+                for dz in -ri..=ri {
+                    for dx in -ri..=ri {
+                        if dx.abs() != ri && dz.abs() != ri {
+                            continue; // ring only
+                        }
+                        let nx = ox as isize + dx;
+                        let nz = oz as isize + dz;
+                        if nx < 0 || nz < 0 {
+                            continue;
+                        }
+                        let (nx, nz) = (nx as usize, nz as usize);
+                        if !grid.is_walkable(nx, nz) {
+                            continue;
+                        }
+                        let (cx, cz) = Self::cell_center(grid, nx, nz);
+                        if !body_blocked_at(cx, cz, walls) {
+                            return (cx, cz);
+                        }
+                    }
                 }
             }
         }
+        // Last resort: original coords (may still be stuck — step_zombie unsticks).
         (x, z)
     }
 
@@ -401,8 +449,10 @@ impl Director {
         }
     }
 
-    /// Prefer a gate no alive player currently sees; among those, nearest the
-    /// player centroid. Falls back to any gate when all are watched.
+    /// Prefer a gate no alive player currently sees; among those, sample near
+    /// the player centroid. A wave dumps many spawns in one tick — always
+    /// picking the single nearest gate stacked every walker on one pull-in
+    /// cell (M22b). We pick uniformly among competitive gates instead.
     fn pick_gate<'m>(
         &mut self,
         map: &'m GameMap,
@@ -442,23 +492,31 @@ impl Director {
             false
         };
 
-        let mut best: Option<(&Gate, f32, bool)> = None;
-        for g in &map.gates {
-            let hidden = !visible(g);
-            let d2 = (g.x - cx).powi(2) + (g.z - cz).powi(2);
-            let better = match &best {
-                None => true,
-                Some((_, bd2, bhidden)) => match (hidden, bhidden) {
-                    (true, false) => true,
-                    (false, true) => false,
-                    _ => d2 < *bd2,
-                },
-            };
-            if better {
-                best = Some((g, d2, hidden));
-            }
+        let mut scored: Vec<(&Gate, f32, bool)> = map
+            .gates
+            .iter()
+            .map(|g| {
+                let hidden = !visible(g);
+                let d2 = (g.x - cx).powi(2) + (g.z - cz).powi(2);
+                (g, d2, hidden)
+            })
+            .collect();
+        if scored.is_empty() {
+            return None;
         }
-        best.map(|(g, _, _)| g)
+        // Prefer hidden tier; among that tier keep gates within 1.6× best d².
+        let any_hidden = scored.iter().any(|(_, _, h)| *h);
+        if any_hidden {
+            scored.retain(|(_, _, h)| *h);
+        }
+        let best_d2 = scored
+            .iter()
+            .map(|(_, d2, _)| *d2)
+            .fold(f32::MAX, f32::min);
+        let cutoff = (best_d2 * 1.6).max(best_d2 + 1.0);
+        scored.retain(|(_, d2, _)| *d2 <= cutoff);
+        let i = (self.rng.next() * scored.len() as f64).floor() as usize;
+        scored.get(i.min(scored.len() - 1)).map(|(g, _, _)| *g)
     }
 }
 
@@ -502,3 +560,6 @@ mod tests {
         }
     }
 }
+
+
+

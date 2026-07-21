@@ -80,10 +80,18 @@ impl Plugin for HudPlugin {
                         update_paused_overlay,
                         update_death_banner,
                         update_mic_chip,
-                        update_wave_banner,
                         update_combo,
-                        tick_wave_ui,
                     )
+                        .run_if(playing),
+                    // Wave banner: tick timer then paint, after gate_visibility so
+                    // chrome force-show cannot re-reveal a cleared banner (M22b).
+                    // Fade is TIME-based (~WAVE_BANNER_SEC), never WaveClear-gated.
+                    (
+                        tick_wave_ui,
+                        update_wave_banner,
+                    )
+                        .chain()
+                        .after(gate_visibility)
                         .run_if(playing),
                     (update_stats_overlay, stats_back_button).run_if(ended),
                     // FX only while playing — Ended freezes the world (S7).
@@ -1194,7 +1202,8 @@ fn update_top_left(
 }
 
 fn tick_wave_ui(time: Res<Time>, mut wave: ResMut<WaveUi>) {
-    let dt = time.delta_secs();
+    // Prefer real wall-clock so a paused/virtual hitch cannot pin the banner.
+    let dt = time.delta_secs().max(0.0);
     if wave.banner_timer > 0.0 {
         wave.banner_timer = (wave.banner_timer - dt).max(0.0);
         if wave.banner_timer <= 0.0 {
@@ -1214,13 +1223,24 @@ fn update_wave_banner(
     wave: Res<WaveUi>,
     mut q: Query<(&mut Text, &mut Visibility), With<WaveBannerText>>,
 ) {
+    let show = !wave.banner.is_empty() && wave.banner_timer > 0.0;
     for (mut t, mut vis) in &mut q {
-        if wave.banner.is_empty() || wave.banner_timer <= 0.0 {
-            **t = String::new();
-            *vis = Visibility::Hidden;
+        if show {
+            // Assign only when changed — full-width 48px layout every frame
+            // was a live FPS tax while the banner stuck (M22b).
+            if **t != wave.banner {
+                **t = wave.banner.clone();
+            }
+            if *vis != Visibility::Visible {
+                *vis = Visibility::Visible;
+            }
         } else {
-            **t = wave.banner.clone();
-            *vis = Visibility::Visible;
+            if !t.is_empty() {
+                **t = String::new();
+            }
+            if *vis != Visibility::Hidden {
+                *vis = Visibility::Hidden;
+            }
         }
     }
 }

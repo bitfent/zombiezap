@@ -53,6 +53,14 @@ fn blocked_xz(x: f32, z: f32, feet_y: f32, walls: &[Aabb]) -> bool {
     false
 }
 
+/// True when a body at `(x, z)` with feet on the ground would be inside solid
+/// geometry (cannot take any step). Used by the director spawn snap so wave
+/// zombies are never born inside a wall that the 1 m walk-grid still marks
+/// walkable at the cell centre.
+pub fn body_blocked_at(x: f32, z: f32, walls: &[Aabb]) -> bool {
+    blocked_xz(x, z, 0.0, walls)
+}
+
 /// Advance one body by one input over dt seconds. `speed` is the body's move
 /// speed (players and zombies share this integrator), `arena_half` the hard
 /// clamp. Mutates `b`.

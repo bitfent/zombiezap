@@ -1,5 +1,7 @@
-//! M22 bot tests: wave lifecycle, supply drops, brute cover smash, difficulty
-//! table. Separate binary so ZZ_DIRECTOR_RATE does not leak into other suites.
+//! M22/M22b bot tests: wave lifecycle, supply drops, brute cover smash,
+//! difficulty table, and live-faithful wave-1 engagement.
+//!
+//! Separate binary so ZZ_DIRECTOR_RATE / MAP_SEED do not leak into other suites.
 //!
 //! Env lock is held across `await` on purpose (serializes process-global
 //! director env for the whole match).
@@ -395,4 +397,166 @@ fn runner_flank_offset_from_centroid() {
     );
     assert!(env_pressure(EnvKind::DesertTown) > env_pressure(EnvKind::Urban));
     assert!(env_pressure(EnvKind::SeaTown) < env_pressure(EnvKind::Urban));
+}
+
+/// M22b live-faithful: same lobby path as a real match (CreateLobby+StartGame,
+/// seed = `{code}-N`, default rate, no MAP_SEED pin). AFK solo urban must take
+/// real HP damage in wave 1 within 25 s sim time. Pre-fix, wave dumps could
+/// freeze walkers in body-blocked cells (ZEDS=6, HP=100 forever).
+#[tokio::test]
+async fn wave1_afk_hp_drop_within_25s_live_path() {
+    let _env = lock_env();
+    unsafe {
+        std::env::set_var("ZZ_DIRECTOR_RATE", "1");
+        std::env::remove_var("MAP_SEED");
+    }
+    let url = start_server().await;
+    // Known-bad seed class: approach pull-in landed inside solid while the
+    // walk-grid cell stayed walkable. Pin only for regression sharpness —
+    // still uses CreateLobby+StartGame (Room::spawn honours MAP_SEED like ops).
+    pin_env("S25-1", "1");
+    let (mut ws, slot) = connect(&url, "afk-wave1").await;
+    let mut dec = SnapshotDecoder::new();
+    let mut seq = 0u32;
+    let mut saw_start1 = false;
+    let mut first_damage_ms: Option<u32> = None;
+    let mut peak_zeds = 0usize;
+    let mut min_zed_dist = f32::MAX;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    while tokio::time::Instant::now() < deadline {
+        seq += 1;
+        let _ = ws
+            .send(Message::Binary(encode_input(&idle(seq)).to_vec().into()))
+            .await;
+        match recv_any(&mut ws, &mut dec).await {
+            Some(Incoming::Msg(ServerMsg::WaveStart { wave: 1 })) => {
+                saw_start1 = true;
+            }
+            Some(Incoming::Snap(s)) => {
+                peak_zeds = peak_zeds.max(s.zombies.len());
+                let Some(me) = s.players.iter().find(|p| p.slot == slot) else {
+                    continue;
+                };
+                let px = dequant_pos(me.pos[0]);
+                let pz = dequant_pos(me.pos[2]);
+                for z in &s.zombies {
+                    let d = ((dequant_pos(z.pos[0]) - px).powi(2)
+                        + (dequant_pos(z.pos[2]) - pz).powi(2))
+                    .sqrt();
+                    min_zed_dist = min_zed_dist.min(d);
+                }
+                if me.health < 100 {
+                    first_damage_ms = Some(s.game_time_ms);
+                    break;
+                }
+            }
+            Some(Incoming::Msg(ServerMsg::MatchEnd { .. })) => {
+                break;
+            }
+            Some(_) => {}
+            None => panic!("connection dropped during wave1 AFK test"),
+        }
+    }
+
+    assert!(saw_start1, "expected WaveStart 1 on live path");
+    assert!(
+        peak_zeds >= 4,
+        "wave 1 should front a pack (peak_zeds={peak_zeds})"
+    );
+    let ms = first_damage_ms.unwrap_or_else(|| {
+        panic!(
+            "no HP drop in 45 s wall (peak_zeds={peak_zeds}, min_zed_dist={min_zed_dist:.1})"
+        )
+    });
+    assert!(
+        ms < 25_000,
+        "first damage at {ms} ms, want < 25_000 (peak={peak_zeds}, min_d={min_zed_dist:.1})"
+    );
+}
+
+/// WaveClear must not fire until the player has actually killed the wave
+/// (no free clear while zombies idle out of reach). Live path, rate 1.
+#[tokio::test]
+async fn wave_clear_only_after_kills_not_idle_timeout() {
+    let _env = lock_env();
+    pin_env("m22b-clear", "1");
+    let url = start_server().await;
+    let (mut ws, slot) = connect(&url, "clear-test").await;
+    let mut dec = SnapshotDecoder::new();
+    let mut seq = 0u32;
+    let mut saw_start1 = false;
+    let mut clear_before_kill = false;
+    let mut kills_before_clear = 0u16;
+    let mut saw_clear1 = false;
+    let mut last_snap: Option<Snapshot> = None;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while tokio::time::Instant::now() < deadline {
+        seq += 1;
+        let mut input = idle(seq);
+        // After a few seconds of idle pressure, start aimbot so the wave can
+        // actually clear (proves clear requires kills, not just waiting).
+        if let Some(snap) = last_snap.as_ref()
+            && let Some(me) = snap.players.iter().find(|p| p.slot == slot)
+        {
+            let eye = (
+                dequant_pos(me.pos[0]),
+                dequant_pos(me.pos[1]) + PLAYER_EYE,
+                dequant_pos(me.pos[2]),
+            );
+            // Only open fire once we have been bitten or ~12 s sim — enough
+            // to prove clear did not free-fire during idle.
+            let open_fire = me.health < 100 || snap.game_time_ms > 12_000;
+            if open_fire {
+                let mut best: Option<(f32, f32, f32, f32)> = None;
+                for z in &snap.zombies {
+                    let tx = dequant_pos(z.pos[0]);
+                    let ty = dequant_pos(z.pos[1]) + 1.2;
+                    let tz = dequant_pos(z.pos[2]);
+                    let d2 = (tx - eye.0).powi(2) + (tz - eye.2).powi(2);
+                    if best.is_none_or(|(bd, ..)| d2 < bd) {
+                        best = Some((d2, tx, ty, tz));
+                    }
+                }
+                if let Some((_, tx, ty, tz)) = best {
+                    let (yaw, pitch) = aim_at(eye, (tx, ty, tz));
+                    input.yaw = yaw;
+                    input.pitch = pitch;
+                    input.fire = true;
+                }
+            }
+        }
+        let _ = ws
+            .send(Message::Binary(encode_input(&input).to_vec().into()))
+            .await;
+
+        match recv_any(&mut ws, &mut dec).await {
+            Some(Incoming::Msg(ServerMsg::WaveStart { wave: 1 })) => {
+                saw_start1 = true;
+            }
+            Some(Incoming::Msg(ServerMsg::WaveClear { wave: 1, .. })) => {
+                saw_clear1 = true;
+                if let Some(snap) = last_snap.as_ref()
+                    && let Some(me) = snap.players.iter().find(|p| p.slot == slot)
+                {
+                    kills_before_clear = me.kills;
+                    if me.kills == 0 {
+                        clear_before_kill = true;
+                    }
+                }
+                break;
+            }
+            Some(Incoming::Snap(s)) => last_snap = Some(s),
+            Some(_) => {}
+            None => panic!("connection dropped during clear-after-kills test"),
+        }
+    }
+
+    assert!(saw_start1, "expected WaveStart 1");
+    assert!(saw_clear1, "expected WaveClear 1 after combat");
+    assert!(
+        !clear_before_kill && kills_before_clear > 0,
+        "WaveClear must follow real kills (kills_before_clear={kills_before_clear})"
+    );
 }

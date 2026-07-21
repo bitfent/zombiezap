@@ -13,7 +13,7 @@ use zz_client::game::{GamePlugin, LodMetrics, Predicted, RemotePlayer, RemoteZom
 use zz_client::hud::{HudChrome, HudPlugin};
 use zz_client::map_render::{CurrentMap, MapRenderPlugin, MapRoot, Placeholder};
 use zz_client::net::{NetClient, NetEvent};
-use zz_client::seams::{COMBO_RESET_SEC, LastStats, LatestSnapshot, Roster, WaveUi};
+use zz_client::seams::{COMBO_RESET_SEC, LastStats, LatestSnapshot, Roster, WAVE_BANNER_SEC, WaveUi};
 use zz_client::touch::TouchIntent;
 use zz_client::voice::{VoiceRx, VoiceState};
 use zz_core::constants::{
@@ -782,6 +782,45 @@ fn wave_start_sets_banner_state() {
     assert_eq!(wu.wave, 3);
     assert_eq!(wu.banner, "WAVE 3");
     assert!(wu.banner_timer > 0.0, "banner timer armed");
+}
+
+/// M22b: banner fade is TIME-based (~WAVE_BANNER_SEC), not WaveClear-gated.
+#[test]
+fn wave_banner_fades_on_timer_without_clear() {
+    let mut app = headless_app();
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    tick(&mut app);
+    enter_playing_with_snap(&mut app, "m22b-banner-fade");
+
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Msg(ServerMsg::WaveStart { wave: 1 }));
+    }
+    tick(&mut app);
+    {
+        let wu = app.world().resource::<WaveUi>();
+        assert_eq!(wu.banner, "WAVE 1");
+        assert!(
+            (wu.banner_timer - WAVE_BANNER_SEC).abs() < 0.05
+                || wu.banner_timer > 0.0,
+            "timer armed at ~{WAVE_BANNER_SEC}s, got {}",
+            wu.banner_timer
+        );
+    }
+
+    // Advance fixed dt past the banner duration with no WaveClear.
+    let frames = ((WAVE_BANNER_SEC / TICK_DT).ceil() as u32) + 4;
+    for _ in 0..frames {
+        tick(&mut app);
+    }
+
+    let wu = app.world().resource::<WaveUi>();
+    assert!(
+        wu.banner.is_empty() && wu.banner_timer <= 0.0,
+        "banner must clear on timer alone (banner={:?}, timer={})",
+        wu.banner,
+        wu.banner_timer
+    );
 }
 
 /// M22: kill event increments combo; idle timeout resets it.
