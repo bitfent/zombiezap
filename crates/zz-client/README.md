@@ -490,3 +490,18 @@ Prefer a 1 px `left_click_drag` (item 36) so egui registers the press.
     without requiring `Changed<Interaction>` so same-frame presses still fire.
     Transient garbled egui glyphs ("n ob") are an upstream atlas quirk —
     they clear on the next full repaint; not client-owned.
+
+47. **Space jump + prediction (M20):** browser Space is captured in
+    `web/index.html` (capture-phase `keydown`/`keyup` → `window.__zzKeys.space`
+    with `preventDefault`) and ORd into `PlayerInput.jump` via
+    `platform::js_space_pressed()` alongside winit `KeyCode::Space` and
+    `TouchIntent.jump`. On enter-Playing, `platform::refocus_canvas()` blurs
+    egui text agents / closed overlays and focuses `#zz-canvas`. Once per
+    match, if the JS bridge saw Space but Bevy `ButtonInput` never did, the
+    console logs `winit missed Space — focus/default-action issue`. Local
+    `step_body` runs only when `predicted.synced` **and** `CurrentMap` exists
+    (still *sends* idle inputs pre-map — M14b); predicting against empty walls
+    was the start-of-match rubber-band. Headless:
+    `game_start_snapshot_syncs_and_queues_input` (fixed `Time` steps, no
+    wall-clock), `prediction_waits_for_walls_then_matches_server`; server
+    `bot_match::jump_input_raises_player_y`.

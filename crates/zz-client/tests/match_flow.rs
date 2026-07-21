@@ -3,6 +3,7 @@
 //! Reproduces the ECS-level conditions behind the browser regressions:
 //! S1 HUD visibility on GameStart, S2 first-map build (MapRoot + no
 //! Placeholders), S3 rematch wipe of remotes / LastStats / session state.
+//! M20: prediction must not step without walls; GameStart+Snap queues inputs.
 
 use std::time::Duration;
 
@@ -15,11 +16,18 @@ use zz_client::net::{NetClient, NetEvent};
 use zz_client::seams::{LastStats, LatestSnapshot, Roster};
 use zz_client::touch::TouchIntent;
 use zz_client::voice::{VoiceRx, VoiceState};
-use zz_core::constants::{MAG_SIZE, MAX_HEALTH, START_GRENADES, START_RESERVE_AMMO};
+use zz_core::constants::{
+    MAG_SIZE, MAX_HEALTH, PLAYER_SPEED, START_GRENADES, START_RESERVE_AMMO, TICK_DT,
+};
 use zz_core::map::generate_map;
+use zz_core::movement::step_body;
 use zz_core::protocol::{MatchStats, PlayerStats, RosterPlayer, ServerMsg};
 use zz_core::snapshot::{Snapshot, WirePlayer, WireZombie, quant_pos3, quant_yaw8, quant_yaw16};
-use zz_core::types::EnvKind;
+use zz_core::types::{EnvKind, PlayerInput};
+
+/// Fixed sim step for headless Time — exactly one 30 Hz input cadence per
+/// update after `send_accum` is primed. Avoids wall-clock / 16 ms races.
+const FIXED_DT: Duration = Duration::from_nanos(33_333_333); // ≈ TICK_DT
 
 /// Minimal plugin set: assets + session + map build + HUD gate, no window/GPU.
 fn headless_app() -> App {
@@ -31,9 +39,8 @@ fn headless_app() -> App {
         .init_asset::<StandardMaterial>()
         .insert_resource(GlobalAmbientLight::default())
         .insert_resource(ClearColor::default())
-        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
-            16,
-        )))
+        // Drive virtual Time with fixed deltas only — never wall-clock.
+        .insert_resource(TimeUpdateStrategy::ManualDuration(FIXED_DT))
         .insert_resource(NetClient::disconnected())
         // Input resources game/hud systems require (no full InputPlugin).
         .insert_resource(ButtonInput::<KeyCode>::default())
@@ -63,14 +70,21 @@ fn headless_app() -> App {
         ));
     }
 
-    // Drive a few frames so Startup (HUD spawn) runs.
-    for _ in 0..2 {
+    // Drive a few frames so Startup (HUD spawn) + RigAssets bank land.
+    // net_poll inserts RigAssets on first Update and returns early; second
+    // frame is the first that can drain injects.
+    for _ in 0..3 {
         app.update();
     }
     // Leave Boot so connect_on_start stops hammering a missing server.
     *app.world_mut().resource_mut::<Session>() = Session::Menu;
     app.update();
     app
+}
+
+/// Advance one fixed tick (ManualDuration already set; update applies it).
+fn tick(app: &mut App) {
+    app.update();
 }
 
 fn count_with<T: Component>(world: &mut World) -> usize {
@@ -233,17 +247,20 @@ fn rematch_wipes_stale_horde_stats_and_rebuilds_map() {
     );
 }
 
-/// M14b: after GameStart + first snapshot, prediction is synced and at least
-/// one encoded input frame is queued within a few ticks (even with no keys).
+/// M14b / M20: after GameStart + first snapshot, prediction is synced and at
+/// least one encoded input frame is queued. Deterministic: fixed Time steps
+/// of ≈TICK_DT; GameStart and Snap applied on separate ticks so the harness
+/// mirrors a real decoder frame boundary (not a wall-clock race on send_accum).
 #[test]
 fn game_start_snapshot_syncs_and_queues_input() {
     let mut app = headless_app();
     // Leave Menu so we're ready for a synthetic GameStart (not Boot reconnect).
     *app.world_mut().resource_mut::<Session>() = Session::InLobby;
-    app.update();
+    tick(&mut app);
 
     let slot = 0u8;
-    let spawn = generate_map(EnvKind::Urban, "match-flow-input").spawns[0];
+    let seed = "match-flow-input";
+    let spawn = generate_map(EnvKind::Urban, seed).spawns[0];
     let snap = Snapshot {
         tick: 1,
         game_time_ms: 33,
@@ -269,10 +286,12 @@ fn game_start_snapshot_syncs_and_queues_input() {
         booms: vec![],
     };
 
+    // Frame 1: GameStart only — Session→Playing, CurrentMap scheduled, Predicted reset.
     {
         let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.take_outbound_bin(); // clear any prior
         net.inject(NetEvent::Msg(ServerMsg::GameStart {
-            map_seed: "match-flow-input".into(),
+            map_seed: seed.into(),
             env: EnvKind::Urban,
             your_slot: slot,
             players: vec![RosterPlayer {
@@ -281,42 +300,206 @@ fn game_start_snapshot_syncs_and_queues_input() {
                 name: "tester".into(),
             }],
         }));
-        net.inject(NetEvent::Snap(snap));
-        net.take_outbound_bin(); // clear any prior
     }
-
-    // N ticks of fixed 16 ms: GameStart+Snap → synced + idle input send.
-    let mut saw_synced = false;
-    let mut saw_input = false;
-    for i in 0..8 {
-        app.update();
-        let synced = app.world().resource::<Predicted>().is_synced();
-        if synced {
-            saw_synced = true;
-        }
-        let out = app.world_mut().resource_mut::<NetClient>().take_outbound_bin();
-        if !out.is_empty() {
-            // BIN_INPUT tag = 0
-            assert_eq!(out[0].first().copied(), Some(0), "frame {i}: expected BIN_INPUT");
-            saw_input = true;
-            break;
-        }
-    }
-
-    assert!(
-        saw_synced,
-        "predicted.synced must become true after GameStart + first snapshot"
-    );
-    assert!(
-        saw_input,
-        "at least one encoded input frame must be queued within N ticks after sync"
-    );
+    tick(&mut app);
     assert!(
         matches!(
             *app.world().resource::<Session>(),
             Session::Playing { my_slot: 0 }
         ),
-        "session Playing"
+        "session Playing after GameStart tick"
+    );
+    assert!(
+        !app.world().resource::<Predicted>().is_synced(),
+        "must not be synced before the first snapshot"
+    );
+
+    // Frame 2: first Snap seeds body + send_accum=TICK_DT; same-frame
+    // fps_controller (after net_poll in the chain) emits the idle input.
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Snap(snap));
+    }
+    tick(&mut app);
+
+    assert!(
+        app.world().resource::<Predicted>().is_synced(),
+        "predicted.synced must become true after GameStart + first snapshot"
+    );
+    let out = app.world_mut().resource_mut::<NetClient>().take_outbound_bin();
+    assert!(
+        !out.is_empty(),
+        "at least one encoded input frame must be queued on the sync tick \
+         (send_accum primed to TICK_DT; fixed Time step {FIXED_DT:?})"
+    );
+    // BIN_INPUT tag = 0
+    assert_eq!(
+        out[0].first().copied(),
+        Some(0),
+        "expected BIN_INPUT tag on first outbound frame"
+    );
+    assert!(
+        app.world().resource::<Predicted>().pending_len() >= 1,
+        "pending must retain the unacked idle input"
+    );
+}
+
+/// M20: pre-map inputs are *sent* but must not move the predicted body;
+/// post-map prediction with the same inputs matches server step_body within ε,
+/// so reconciliation does not need a >0.25 m snap after walls load.
+#[test]
+fn prediction_waits_for_walls_then_matches_server() {
+    let mut app = headless_app();
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    tick(&mut app);
+
+    let slot = 0u8;
+    let seed = "m20-predict-walls";
+    let map = generate_map(EnvKind::Urban, seed);
+    let spawn = map.spawns[0];
+    let y0 = 0.0f32;
+
+    // GameStart without waiting for Commands→CurrentMap: inject Snap immediately
+    // so we can exercise the synced-but-no-map send path by *removing* CurrentMap.
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Msg(ServerMsg::GameStart {
+            map_seed: seed.into(),
+            env: EnvKind::Urban,
+            your_slot: slot,
+            players: vec![RosterPlayer {
+                slot,
+                id: "c1".into(),
+                name: "pred".into(),
+            }],
+        }));
+    }
+    tick(&mut app);
+    // Drop the map so the next inputs send without local step_body.
+    app.world_mut().remove_resource::<CurrentMap>();
+
+    let snap = Snapshot {
+        tick: 1,
+        game_time_ms: 33,
+        difficulty: 0,
+        paused: false,
+        players: vec![WirePlayer {
+            slot,
+            pos: quant_pos3(spawn.x, y0, spawn.z),
+            yaw: quant_yaw16(spawn.yaw),
+            pitch: 0,
+            health: MAX_HEALTH,
+            ammo_mag: MAG_SIZE,
+            ammo_reserve: START_RESERVE_AMMO,
+            grenades: START_GRENADES,
+            kills: 0,
+            alive: true,
+            last_acked_seq: 0,
+        }],
+        zombies: vec![],
+        loot: vec![],
+        grenades: vec![],
+        shots: vec![],
+        booms: vec![],
+    };
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Snap(snap));
+    }
+    // Hold W via TouchIntent so inputs are non-idle.
+    {
+        let mut touch = app.world_mut().resource_mut::<TouchIntent>();
+        touch.forward = true;
+    }
+    tick(&mut app);
+
+    assert!(
+        app.world().resource::<Predicted>().is_synced(),
+        "synced after first snap"
+    );
+    let body_pre = app.world().resource::<Predicted>().body;
+    assert!(
+        (body_pre.x - spawn.x).abs() < 1e-3 && (body_pre.z - spawn.z).abs() < 1e-3,
+        "pre-map seed body at spawn, got ({}, {}) vs spawn ({}, {})",
+        body_pre.x,
+        body_pre.z,
+        spawn.x,
+        spawn.z
+    );
+
+    // Several fixed ticks with forward held and NO CurrentMap: body must not move.
+    for _ in 0..5 {
+        tick(&mut app);
+    }
+    let out_pre = app.world_mut().resource_mut::<NetClient>().take_outbound_bin();
+    assert!(
+        out_pre.len() >= 5,
+        "must keep sending inputs pre-map (M14b), got {} frames",
+        out_pre.len()
+    );
+    let body_still = app.world().resource::<Predicted>().body;
+    let pre_map_move = ((body_still.x - body_pre.x).powi(2)
+        + (body_still.z - body_pre.z).powi(2))
+    .sqrt();
+    assert!(
+        pre_map_move < 1e-4,
+        "pre-map prediction must not move body (got {pre_map_move} m); empty-wall predict is the rubber-band bug"
+    );
+
+    // Restore walls and continue predicting; compare to offline step_body.
+    app.world_mut().insert_resource(CurrentMap(map.clone()));
+    let mut server_body = body_still;
+    let yaw = app.world().resource::<Predicted>().yaw;
+    // Drain pending so we compare only post-map steps.
+    // (pending still holds pre-map inputs; they were never stepped locally.)
+    // Re-seed body to spawn-equivalent (still there) and step the same
+    // forward inputs we will send for N ticks.
+    let n_post = 10u32;
+    {
+        let mut touch = app.world_mut().resource_mut::<TouchIntent>();
+        touch.forward = true;
+    }
+    for seq in 0..n_post {
+        let input = PlayerInput {
+            seq: 1000 + seq,
+            forward: true,
+            yaw,
+            ..Default::default()
+        };
+        step_body(
+            &mut server_body,
+            &input,
+            TICK_DT,
+            PLAYER_SPEED,
+            &map.walls,
+            map.arena_half,
+        );
+        tick(&mut app);
+    }
+    let pred = app.world().resource::<Predicted>();
+    let dx = pred.body.x - server_body.x;
+    let dy = pred.body.y - server_body.y;
+    let dz = pred.body.z - server_body.z;
+    let err = (dx * dx + dy * dy + dz * dz).sqrt();
+    // Allow pending-replay / seq offset noise under a quarter-metre; a wall-less
+    // diverge would be metres after 10 forward ticks.
+    assert!(
+        err < 0.25,
+        "post-map prediction must match server step_body within 0.25 m (err={err:.3} m); \
+         pred=({:.3},{:.3},{:.3}) server=({:.3},{:.3},{:.3})",
+        pred.body.x,
+        pred.body.y,
+        pred.body.z,
+        server_body.x,
+        server_body.y,
+        server_body.z
+    );
+    // Reconciliation snap budget after map load: error_offset should stay small
+    // when client and server share walls.
+    assert!(
+        pred.error_offset_len() < 0.5,
+        "error_offset after map load should be < 0.5 m, got {}",
+        pred.error_offset_len()
     );
 }
 

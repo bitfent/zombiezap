@@ -31,6 +31,9 @@ const INTERP_DELAY_S: f64 = INTERP_DELAY_MS as f64 / 1000.0;
 /// Error-offset half-life: corrections fade out over roughly two half-lives.
 const ERROR_HALF_LIFE_S: f32 = 0.05;
 const PENDING_CAP: usize = 64;
+/// Hard cap on reconciliation visual snap (metres). Repeated hits ⇒ real
+/// divergence (wrong walls, desynced inputs), not a one-frame glitch.
+const ERROR_OFFSET_CLAMP_M: f32 = 2.0;
 
 pub struct GamePlugin;
 
@@ -61,6 +64,7 @@ impl Plugin for GamePlugin {
             .insert_resource(CameraNudge::default())
             .insert_resource(PendingHitFlashes::default())
             .insert_resource(LodMetrics::default())
+            .insert_resource(SpaceTelemetry::default())
             .configure_sets(Update, GameSessionSet)
             .add_systems(
                 Update,
@@ -69,6 +73,7 @@ impl Plugin for GamePlugin {
                     net_poll,
                     process_intents,
                     sync_cursor,
+                    refocus_on_playing,
                     // In-match only (not Ended): freeze the world on OVERRUN so
                     // we don't keep interpolating/animating a huge horde at 3 fps.
                     fps_controller.run_if(playing),
@@ -88,6 +93,16 @@ impl Plugin for GamePlugin {
                     .in_set(GameSessionSet),
             );
     }
+}
+
+/// Once-per-match diagnostic: did the JS capture-phase Space bridge fire while
+/// Bevy `ButtonInput<KeyCode::Space>` stayed quiet? (winit-web focus / default
+/// action / egui_text_agent steal). Logged to the browser console.
+#[derive(Resource, Default)]
+struct SpaceTelemetry {
+    js_saw: bool,
+    bevy_saw: bool,
+    warned: bool,
 }
 
 // ── session state ──────────────────────────────────────────────────────────
@@ -168,6 +183,8 @@ pub struct Predicted {
     error_offset: Vec3,
     /// false until the first snapshot has seeded the body from server truth
     synced: bool,
+    /// How many snaps hit the error_offset length clamp this match.
+    clamp_hits: u32,
 }
 
 impl Default for Predicted {
@@ -181,6 +198,7 @@ impl Default for Predicted {
             send_accum: 0.0,
             error_offset: Vec3::ZERO,
             synced: false,
+            clamp_hits: 0,
         }
     }
 }
@@ -190,6 +208,16 @@ impl Predicted {
     /// `fps_controller` refuses to send inputs until this is set.
     pub fn is_synced(&self) -> bool {
         self.synced
+    }
+
+    /// Unacked inputs still waiting for a server ack (tests / debug).
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Current visual correction offset length in metres (tests / debug).
+    pub fn error_offset_len(&self) -> f32 {
+        self.error_offset.length()
     }
 }
 
@@ -411,6 +439,8 @@ fn net_poll(
                     .map(|p| (p.slot, p.name.clone(), p.slot == your_slot))
                     .collect();
                 vm_kick.pending = 0;
+                // Keyboard after lobby click: canvas + blur egui_text_agent.
+                platform::refocus_canvas();
             }
             NetEvent::Msg(ServerMsg::MatchEnd { stats }) => {
                 // Only honour MatchEnd while we're actually in a match. A late
@@ -555,8 +585,22 @@ fn net_poll(
                     if predicted.synced {
                         let corrected =
                             Vec3::new(predicted.body.x, predicted.body.y, predicted.body.z);
-                        predicted.error_offset =
-                            (rendered_before - corrected).clamp_length_max(2.0);
+                        let raw = rendered_before - corrected;
+                        let raw_len = raw.length();
+                        if raw_len > ERROR_OFFSET_CLAMP_M {
+                            predicted.clamp_hits = predicted.clamp_hits.saturating_add(1);
+                            // Log on first hit and then every ~1 s of snaps so a
+                            // sustained diverge is obvious without spamming.
+                            if predicted.clamp_hits == 1
+                                || predicted.clamp_hits.is_multiple_of(30)
+                            {
+                                warn!(
+                                    "reconcile error_offset clamp hit (len={raw_len:.2} m, hits={})",
+                                    predicted.clamp_hits
+                                );
+                            }
+                        }
+                        predicted.error_offset = raw.clamp_length_max(ERROR_OFFSET_CLAMP_M);
                     } else {
                         // First authoritative sample: seed aim from the server
                         // spawn yaw so idle inputs don't overwrite facing with 0.
@@ -751,6 +795,18 @@ fn sync_cursor(session: Res<Session>, mut windows: Query<&mut bevy::window::Curs
     }
 }
 
+/// After any path into Playing (GameStart or rematch), put keyboard focus back
+/// on the canvas so Space/WASD are not stuck in an egui text agent / overlay.
+fn refocus_on_playing(session: Res<Session>, mut telemetry: ResMut<SpaceTelemetry>) {
+    if !session.is_changed() {
+        return;
+    }
+    if matches!(*session, Session::Playing { .. }) {
+        platform::refocus_canvas();
+        *telemetry = SpaceTelemetry::default();
+    }
+}
+
 fn push_sample(buf: &mut VecDeque<(f64, Vec3, f32)>, t: f64, pos: Vec3, yaw: f32) {
     buf.push_back((t, pos, yaw));
     while buf.len() > 12 {
@@ -771,6 +827,7 @@ fn fps_controller(
     touch: Res<TouchIntent>,
     mut predicted: ResMut<Predicted>,
     mut net: ResMut<NetClient>,
+    mut space_tel: ResMut<SpaceTelemetry>,
 ) {
     // mouse look only while the pointer is captured (desktop non-touch path)
     let locked = windows
@@ -802,15 +859,33 @@ fn fps_controller(
         predicted.yaw -= KEY_TURN_RATE * time.delta_secs();
     }
 
+    // Space: winit ButtonInput OR capture-phase JS bridge OR on-screen JUMP.
+    let bevy_space = keys.pressed(KeyCode::Space);
+    let js_space = platform::js_space_pressed();
+    if bevy_space {
+        space_tel.bevy_saw = true;
+    }
+    if js_space {
+        space_tel.js_saw = true;
+    }
+    // Once per match: JS saw Space but Bevy never did → focus/default-action.
+    if space_tel.js_saw && !space_tel.bevy_saw && !space_tel.warned {
+        warn!("winit missed Space — focus/default-action issue");
+        space_tel.warned = true;
+    }
+    let jump = bevy_space || js_space || touch.jump;
+
     if !predicted.synced {
         return; // first snapshot seeds the body; don't predict from (0,0)
     }
 
     // fixed 30 Hz: sample intent, send, predict — one step per send
-    // (cadence untouched; touch ORs into the same bools).
+    // (cadence untouched; touch / JS Space OR into the same bools).
     // Map is optional for *sending*: GameStart inserts CurrentMap via
     // Commands (visible next frame). We must still emit idle inputs so the
-    // server sees a live player immediately after the first snapshot.
+    // server sees a live player immediately after the first snapshot (M14b).
+    // Local step_body runs ONLY when CurrentMap exists — predicting against
+    // empty walls while the server collides causes start-of-match rubber-band.
     predicted.send_accum += time.delta_secs();
     while predicted.send_accum >= TICK_DT {
         predicted.send_accum -= TICK_DT;
@@ -828,7 +903,7 @@ fn fps_controller(
             right: keys.pressed(KeyCode::KeyD)
                 || keys.pressed(KeyCode::ArrowRight)
                 || touch.right,
-            jump: keys.pressed(KeyCode::Space) || touch.jump,
+            jump,
             // Desktop: fire while locked + LMB. Touch: FIRE button only
             // (right-side taps/drags never fire — aim is drag-only).
             fire: (locked && buttons.pressed(MouseButton::Left) && !touch.enabled) || touch.fire,
@@ -845,6 +920,7 @@ fn fps_controller(
         }
         predicted.pending.push_back(input);
 
+        // Predict only with real walls (synced already required above).
         if let Some(map) = map.as_deref() {
             step_body(
                 &mut predicted.body,

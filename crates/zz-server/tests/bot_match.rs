@@ -126,6 +126,14 @@ fn forward_input(seq: u32, yaw: f32) -> PlayerInput {
     }
 }
 
+fn jump_input(seq: u32) -> PlayerInput {
+    PlayerInput {
+        seq,
+        jump: true,
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn two_bots_move_independently() {
     pin_map();
@@ -195,6 +203,86 @@ async fn two_bots_move_independently() {
         .unwrap()
         .last_acked_seq;
     assert!(ack > 0, "server must ack applied inputs");
+}
+
+/// M20: wire-protocol probe — jump held at 30 Hz against the real server
+/// raises feet y by > 0.8 m and returns to ground. Pins server/sim jump so
+/// a "no spacebar jump" report cannot be blamed on zz-core / zz-server.
+#[tokio::test]
+async fn jump_input_raises_player_y() {
+    pin_map();
+    let url = start_server().await;
+    let (mut ws, _code) = create_lobby(&url, "jumper").await;
+    start_game(&mut ws).await;
+    let slot = wait_game_start(&mut ws).await;
+
+    let mut dec = SnapshotDecoder::new();
+    let first = recv_snapshot(&mut ws, &mut dec).await.expect("first snapshot");
+    let me0 = first.players.iter().find(|p| p.slot == slot).unwrap();
+    let y0 = dequant_pos(me0.pos[1]);
+    assert!(y0.abs() < 0.15, "spawn y should be near ground, got {y0}");
+
+    // Hold jump ~1 s (apex of JUMP_VELOCITY=7 / g=20 ≈ 1.225 m).
+    let mut peak_y = y0;
+    let mut min_y_after_peak = f32::MAX;
+    let mut saw_peak = false;
+    for seq in 1..=40u32 {
+        ws.send(Message::Binary(encode_input(&jump_input(seq)).to_vec().into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(33)).await;
+        // Non-blocking-ish drain: pull one snap if the server already sent it.
+        if let Ok(Some(s)) =
+            tokio::time::timeout(Duration::from_millis(2), recv_snapshot(&mut ws, &mut dec)).await
+            && let Some(me) = s.players.iter().find(|p| p.slot == slot)
+        {
+            let y = dequant_pos(me.pos[1]);
+            if y > peak_y {
+                peak_y = y;
+            }
+            if peak_y > 0.8 {
+                saw_peak = true;
+                if y < min_y_after_peak {
+                    min_y_after_peak = y;
+                }
+            }
+        }
+    }
+    // Drain remaining buffered snaps until ack covers our last jump input.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let s = match tokio::time::timeout(Duration::from_millis(100), recv_snapshot(&mut ws, &mut dec))
+            .await
+        {
+            Ok(Some(s)) => s,
+            _ => break,
+        };
+        if let Some(me) = s.players.iter().find(|p| p.slot == slot) {
+            let y = dequant_pos(me.pos[1]);
+            if y > peak_y {
+                peak_y = y;
+            }
+            if peak_y > 0.8 {
+                saw_peak = true;
+                if y < min_y_after_peak {
+                    min_y_after_peak = y;
+                }
+            }
+            if me.last_acked_seq >= 40 {
+                break;
+            }
+        }
+    }
+
+    assert!(
+        peak_y > 0.8 && saw_peak,
+        "jump must raise player y by > 0.8 m (peak_y={peak_y}, y0={y0}); server/sim jump broken"
+    );
+    // Continuous jump re-hops; after apex we still expect a sample near ground.
+    assert!(
+        min_y_after_peak < 0.35,
+        "after jump apex, a sample should land near ground (min_y_after_peak={min_y_after_peak})"
+    );
 }
 
 #[tokio::test]

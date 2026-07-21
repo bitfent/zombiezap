@@ -204,6 +204,32 @@ pub fn unlock_audio() {
     }
 }
 
+/// Wasm capture-phase Space from `window.__zzKeys.space` (see `web/index.html`).
+/// Native always false — winit `ButtonInput` owns desktop Space.
+///
+/// ORd into `PlayerInput.jump` alongside winit Space and `TouchIntent.jump`
+/// so a missed canvas focus / browser default action cannot drop jump.
+pub fn js_space_pressed() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_js_space_pressed()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
+/// Refocus the Bevy canvas and blur stray text agents (egui_text_agent, HTML
+/// overlays that already closed). Call on session transitions into Playing
+/// so keyboard after a lobby click lands on the game. No-op on native.
+pub fn refocus_canvas() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_refocus_canvas();
+    }
+}
+
 // ── proximity voice (wasm bridge → web/index.html `__zzVoice`) ─────────────
 // Native capture lives entirely in `voice.rs` (cpal); these exist only on wasm.
 
@@ -387,6 +413,42 @@ fn wasm_unlock_audio() {
         .ok()
         .filter(|v| v.is_function());
     if let Some(f) = unlock
+        && let Ok(func) = f.dyn_into::<js_sys::Function>()
+    {
+        let _ = func.call0(&window);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_js_space_pressed() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Ok(keys) =
+        js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__zzKeys"))
+    else {
+        return false;
+    };
+    if keys.is_undefined() || keys.is_null() {
+        return false;
+    }
+    js_sys::Reflect::get(&keys, &wasm_bindgen::JsValue::from_str("space"))
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_refocus_canvas() {
+    use wasm_bindgen::JsCast;
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let focus =
+        js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__zzFocusCanvas"))
+            .ok()
+            .filter(|v| v.is_function());
+    if let Some(f) = focus
         && let Ok(func) = f.dyn_into::<js_sys::Function>()
     {
         let _ = func.call0(&window);

@@ -237,6 +237,100 @@
         });
       })();
 
+      // M20: capture-phase Space so jump works even if winit-web / canvas
+      // focus / browser default (page scroll) / egui_text_agent steal keys.
+      // Rust polls window.__zzKeys.space and ORs it into PlayerInput.jump.
+      (function () {
+        window.__zzKeys = { space: false };
+        function isSpace(e) {
+          return (
+            e.code === "Space" ||
+            e.key === " " ||
+            e.key === "Spacebar" ||
+            e.keyCode === 32
+          );
+        }
+        function typingInOverlay() {
+          var a = document.activeElement;
+          if (!a) return false;
+          if (a.id === "zz-name-input" || a.id === "zz-code-input") {
+            var d = a.style && a.style.display;
+            return d !== "none";
+          }
+          // Visible text fields only — never treat hidden egui_text_agent as "typing".
+          if (
+            (a.tagName === "INPUT" || a.tagName === "TEXTAREA") &&
+            a.offsetParent !== null &&
+            !a.classList.contains("egui_text_agent")
+          ) {
+            return true;
+          }
+          return false;
+        }
+        function onKey(e, down) {
+          if (!isSpace(e)) return;
+          if (typingInOverlay()) {
+            // Soft-keyboard name/code: leave Space to the input.
+            if (!down) window.__zzKeys.space = false;
+            return;
+          }
+          window.__zzKeys.space = !!down;
+          // Never let the page scroll or a hidden text agent eat Space in-match.
+          if (e.cancelable) e.preventDefault();
+        }
+        window.addEventListener(
+          "keydown",
+          function (e) {
+            onKey(e, true);
+          },
+          true
+        );
+        window.addEventListener(
+          "keyup",
+          function (e) {
+            onKey(e, false);
+          },
+          true
+        );
+        // Blur when tab loses focus so we don't stick jump=true.
+        window.addEventListener("blur", function () {
+          window.__zzKeys.space = false;
+        });
+
+        // Focus hygiene: after lobby/egui clicks, put keyboard target back on
+        // the game canvas and blur any leftover text agent / overlay input.
+        window.__zzFocusCanvas = function () {
+          try {
+            var canvas = document.getElementById("zz-canvas");
+            var active = document.activeElement;
+            // Do not yank focus while the touch soft-keyboard overlays are up.
+            if (
+              active &&
+              (active.id === "zz-name-input" || active.id === "zz-code-input")
+            ) {
+              var style = active.style && active.style.display;
+              if (style !== "none") return;
+            }
+            if (active && active !== canvas && typeof active.blur === "function") {
+              active.blur();
+            }
+            // bevy_egui's hidden text agent (and any other stray inputs).
+            var agents = document.querySelectorAll(
+              'input.egui_text_agent, textarea.egui_text_agent, input[id*="egui"]'
+            );
+            for (var i = 0; i < agents.length; i++) {
+              try {
+                agents[i].blur();
+              } catch (err) {}
+            }
+            if (canvas && typeof canvas.focus === "function") {
+              canvas.tabIndex = canvas.tabIndex >= 0 ? canvas.tabIndex : 0;
+              canvas.focus({ preventScroll: true });
+            }
+          } catch (err) {}
+        };
+      })();
+
       // Proximity voice capture bridge (wasm client polls drainFrames).
       // Mic permission is requested ONLY via requestMic() — never at startup.
       // Worklet is inlined (zero asset files); adapted from legacy
