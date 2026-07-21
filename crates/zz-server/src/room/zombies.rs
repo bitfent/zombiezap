@@ -274,8 +274,34 @@ pub fn step_zombie(
     zz_core::movement::step_body(&mut z.body, &input, TICK_DT, speed, walls, arena_half);
     // Flow non-zero but continuous collision blocked every axis (spawn inside
     // a walkable cell that still overlaps a wall footprint) — snap free.
+    // Mid-range maze freezes (M26): flow can point into a dead end while the
+    // straight shot to the player is clear — try direct pursuit once, then
+    // unstick if still jammed.
     if (z.body.x - before.0).abs() + (z.body.z - before.1).abs() < 1e-5 {
-        unstick_body(&mut z.body, grid, walls, arena_half);
+        if d2 > ZOMBIE_ATTACK_RANGE * ZOMBIE_ATTACK_RANGE {
+            let len = d2.sqrt().max(1e-3);
+            let (pdx, pdz) = ((tx - z.body.x) / len, (tz - z.body.z) / len);
+            z.yaw = libm::atan2f(-pdx, -pdz);
+            let direct = PlayerInput {
+                forward: true,
+                yaw: z.yaw,
+                ..Default::default()
+            };
+            let mid = (z.body.x, z.body.z);
+            zz_core::movement::step_body(
+                &mut z.body,
+                &direct,
+                TICK_DT,
+                speed,
+                walls,
+                arena_half,
+            );
+            if (z.body.x - mid.0).abs() + (z.body.z - mid.1).abs() < 1e-5 {
+                unstick_body(&mut z.body, grid, walls, arena_half);
+            }
+        } else {
+            unstick_body(&mut z.body, grid, walls, arena_half);
+        }
     }
     z.state = with_frenzy(ZS_WALK, z.frenzy);
     None

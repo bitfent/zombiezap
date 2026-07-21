@@ -1,5 +1,6 @@
-//! M22/M22b bot tests: wave lifecycle, supply drops, brute cover smash,
-//! difficulty table, and live-faithful wave-1 engagement.
+//! M22/M22b/M26 bot tests: wave lifecycle, supply drops, brute cover smash,
+//! difficulty table, live-faithful wave-1 engagement, and multi-seed
+//! soft-lock guards (every urban seed must engage within 25 s of wave 1).
 //!
 //! Separate binary so ZZ_DIRECTOR_RATE / MAP_SEED do not leak into other suites.
 //!
@@ -45,6 +46,10 @@ async fn start_server() -> String {
 }
 
 async fn connect(url: &str, name: &str) -> (Ws, u8) {
+    connect_env(url, name, EnvKind::Urban).await
+}
+
+async fn connect_env(url: &str, name: &str, env: EnvKind) -> (Ws, u8) {
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("connect");
@@ -62,10 +67,7 @@ async fn connect(url: &str, name: &str) -> (Ws, u8) {
     }
     for msg in [
         serde_json::to_string(&ClientMsg::Hello { name: name.into() }).unwrap(),
-        serde_json::to_string(&ClientMsg::CreateLobby {
-            env: EnvKind::Urban,
-        })
-        .unwrap(),
+        serde_json::to_string(&ClientMsg::CreateLobby { env }).unwrap(),
         serde_json::to_string(&ClientMsg::StartGame).unwrap(),
     ] {
         ws.send(Message::Text(msg.into())).await.unwrap();
@@ -558,5 +560,168 @@ async fn wave_clear_only_after_kills_not_idle_timeout() {
     assert!(
         !clear_before_kill && kills_before_clear > 0,
         "WaveClear must follow real kills (kills_before_clear={kills_before_clear})"
+    );
+}
+
+/// M26: AFK solo must take HP damage within 25 s of WaveStart 1 for EVERY
+/// seed in the sweep. Known pocket-map seeds (m26-125 class) plus a dense
+/// urban sample — pre-fix, approach snap could land in a walkable but
+/// flow-disconnected courtyard and freeze the whole horde forever.
+/// Returns (ms_after_wave1_start, absolute_game_time_ms) on first HP drop.
+async fn afk_wave1_damage_ms(
+    url: &str,
+    seed: &str,
+    env: EnvKind,
+) -> Result<(u32, u32), String> {
+    pin_env(seed, "1");
+    let (mut ws, slot) = connect_env(url, &format!("m26-{seed}"), env).await;
+    let mut dec = SnapshotDecoder::new();
+    let mut seq = 0u32;
+    let mut saw_start1 = false;
+    let mut wave1_start_ms: Option<u32> = None;
+    let mut peak_zeds = 0usize;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    while tokio::time::Instant::now() < deadline {
+        seq += 1;
+        let _ = ws
+            .send(Message::Binary(encode_input(&idle(seq)).to_vec().into()))
+            .await;
+        match recv_any(&mut ws, &mut dec).await {
+            Some(Incoming::Msg(ServerMsg::WaveStart { wave: 1 })) => {
+                saw_start1 = true;
+            }
+            Some(Incoming::Snap(s)) => {
+                peak_zeds = peak_zeds.max(s.zombies.len());
+                if saw_start1 && wave1_start_ms.is_none() {
+                    // First snap after WaveStart — sim clock at wave-1 open.
+                    wave1_start_ms = Some(s.game_time_ms);
+                }
+                let Some(me) = s.players.iter().find(|p| p.slot == slot) else {
+                    continue;
+                };
+                if me.health < 100 {
+                    let start = wave1_start_ms.unwrap_or(0);
+                    let dt = s.game_time_ms.saturating_sub(start);
+                    let _ = ws.close(None).await;
+                    return Ok((dt, s.game_time_ms));
+                }
+            }
+            Some(Incoming::Msg(ServerMsg::MatchEnd { .. })) => {
+                let _ = ws.close(None).await;
+                return Err(format!(
+                    "{seed}/{env:?}: match ended without HP drop (peak_zeds={peak_zeds})"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                return Err(format!(
+                    "{seed}/{env:?}: connection dropped (peak_zeds={peak_zeds})"
+                ));
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+    Err(format!(
+        "{seed}/{env:?}: no HP drop in 40 s wall (saw_start1={saw_start1}, peak_zeds={peak_zeds})"
+    ))
+}
+
+#[tokio::test]
+async fn m26_wave1_engages_every_urban_seed() {
+    let _env = lock_env();
+    unsafe {
+        std::env::set_var("ZZ_DIRECTOR_RATE", "1");
+        std::env::remove_var("MAP_SEED");
+    }
+    let url = start_server().await;
+
+    // Known M26 pocket class first (would soft-lock pre-fix), then a dense
+    // sample of lobby-like seeds. ≥50 distinct urban maps.
+    let mut seeds: Vec<String> = vec![
+        // Pocket / unroutable approach class (M26 connectivity)
+        "m26-125".into(),
+        "code053-0".into(),
+        "code098-0".into(),
+        "NXW7H-453".into(),
+        "urban-184".into(),
+        // Mid-range geometry freezes (watchdog pull-in)
+        "ZZ13-0".into(),
+        "ZZ27-0".into(),
+        "ZZ42-0".into(),
+        "S25-1".into(),
+        "m4-dev".into(),
+        "m22b-clear".into(),
+    ];
+    for i in 0..50 {
+        seeds.push(format!("m26-urban-{i}"));
+        seeds.push(format!("ZZ{i:02}-0"));
+    }
+    seeds.sort();
+    seeds.dedup();
+    // Cap to a generous ≥50 while keeping CI time reasonable (~seed * ~12 s).
+    let seeds: Vec<String> = seeds.into_iter().take(56).collect();
+    assert!(seeds.len() >= 50, "need ≥50 urban seeds, got {}", seeds.len());
+
+    let mut failures = Vec::new();
+    let mut max_after_w1 = 0u32;
+    for seed in &seeds {
+        match afk_wave1_damage_ms(&url, seed, EnvKind::Urban).await {
+            Ok((after_w1, abs_ms)) => {
+                // Spec: HP drops within 25 s of wave-1 start (not match clock).
+                if after_w1 >= 25_000 {
+                    failures.push(format!(
+                        "{seed}: first damage {after_w1} ms after wave1 (abs={abs_ms})"
+                    ));
+                } else {
+                    max_after_w1 = max_after_w1.max(after_w1);
+                }
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "M26 urban seed sweep failed ({}):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+    eprintln!(
+        "m26 urban sweep ok: {} seeds, max damage after wave1 {max_after_w1} ms",
+        seeds.len()
+    );
+}
+
+#[tokio::test]
+async fn m26_wave1_engages_other_env_sample() {
+    let _env = lock_env();
+    unsafe {
+        std::env::set_var("ZZ_DIRECTOR_RATE", "1");
+        std::env::remove_var("MAP_SEED");
+    }
+    let url = start_server().await;
+
+    let envs = [
+        EnvKind::MountainTown,
+        EnvKind::DesertTown,
+        EnvKind::SeaTown,
+    ];
+    let mut failures = Vec::new();
+    for env in envs {
+        for i in 0..8 {
+            let seed = format!("m26-{env:?}-{i}");
+            match afk_wave1_damage_ms(&url, &seed, env).await {
+                Ok((after_w1, _)) if after_w1 < 25_000 => {}
+                Ok((after_w1, abs_ms)) => failures.push(format!(
+                    "{seed}/{env:?}: damage {after_w1} ms after wave1 (abs={abs_ms})"
+                )),
+                Err(e) => failures.push(e),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "M26 env sample failed:\n  {}",
+        failures.join("\n  ")
     );
 }
