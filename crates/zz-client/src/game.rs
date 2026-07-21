@@ -23,6 +23,7 @@ use crate::models::{
 use crate::net::{NetClient, NetEvent};
 use crate::platform;
 use crate::touch::TouchIntent;
+use crate::voice::VoiceRx;
 
 /// Remote entities render this far in the past (seconds).
 const INTERP_DELAY_S: f64 = INTERP_DELAY_MS as f64 / 1000.0;
@@ -234,6 +235,7 @@ fn net_poll(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut seams: SeamWrites,
     mut vm_kick: ResMut<ViewmodelKick>,
+    mut voice_rx: ResMut<VoiceRx>,
 ) {
     // one-time shared rig mesh/material bank
     if assets.is_none() {
@@ -323,6 +325,13 @@ fn net_poll(
                 warn!("disconnected: {reason} — reconnecting");
                 seams.lobby_view.status = format!("disconnected: {reason}");
                 *session = Session::Boot;
+            }
+            NetEvent::Voice { slot, pcm } => {
+                // Cap inbox so a flood never backs up the frame.
+                while voice_rx.0.len() >= 32 {
+                    voice_rx.0.pop_front();
+                }
+                voice_rx.0.push_back((slot, pcm));
             }
             NetEvent::Snap(snap) => {
                 let (Some(my_slot), Some(map)) = (session.my_slot(), map.as_deref()) else {

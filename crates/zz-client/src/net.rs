@@ -2,7 +2,7 @@
 //! coupling with Bevy), identical API on native and wasm via ewebsock.
 
 use bevy::prelude::Resource;
-use zz_core::protocol::{ClientMsg, ServerMsg};
+use zz_core::protocol::{BIN_VOICE, ClientMsg, ServerMsg, decode_voice};
 use zz_core::snapshot::{Snapshot, SnapshotDecoder};
 
 /// What a frame's worth of polling yields.
@@ -11,6 +11,8 @@ pub enum NetEvent {
     Connected,
     Msg(ServerMsg),
     Snap(Snapshot),
+    /// Proximity voice: authoritative speaker slot + 16 kHz mono i16 LE PCM.
+    Voice { slot: u8, pcm: Vec<u8> },
     Closed(String),
 }
 
@@ -96,7 +98,14 @@ impl NetClient {
                     }
                 }
                 ewebsock::WsEvent::Message(ewebsock::WsMessage::Binary(b)) => {
-                    if let Ok(snap) = self.decoder.decode(&b) {
+                    if b.first() == Some(&BIN_VOICE) {
+                        if let Some((slot, pcm)) = decode_voice(&b) {
+                            out.push(NetEvent::Voice {
+                                slot,
+                                pcm: pcm.to_vec(),
+                            });
+                        }
+                    } else if let Ok(snap) = self.decoder.decode(&b) {
                         out.push(NetEvent::Snap(snap));
                     }
                 }

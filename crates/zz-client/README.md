@@ -390,3 +390,25 @@ row sits near the lower-middle of the card. Approximate click centres:
 | ROME EUR   | **(800, 455)** — wraps to next line if tight: **(520, 485)** |
 
 Prefer a 1 px `left_click_drag` (item 36) so egui registers the press.
+
+43. **Proximity voice (M13 client):** open-mic once unmuted, **muted by
+    default** (privacy). **M** toggles mute in-match. Mic permission is
+    requested on the **first unmute only** — never at startup.
+    - Wire: `BIN_VOICE=2` frames `[tag, slot, 16 kHz mono i16 LE PCM ≤3840 B]`
+      (~120 ms = 1920 samples). Client sends `encode_voice(0, pcm)`; server
+      rewrites slot authoritatively and fans out within
+      `CHAT_PROXIMITY_RADIUS` (25 m).
+    - Capture: wasm → `window.__zzVoice` in `web/index.html` (inline
+      AudioWorklet + resample/frame; `platform::voice_*` polls). Native →
+      `cpal` input (target-gated, not on wasm). Both feed the same frame shape.
+    - Playback: per-speaker jitter buffer (2–4 frames) in `voice.rs`;
+      distance fade starts at 10 m, silence at 25 m; equal-power L/R pan from
+      listener yaw + remote interpolated positions. Chunked stereo
+      `Decodable` one-shots on the zero-asset Bevy audio path.
+    - HUD: tiny **MIC · MUTED / ON / LIVE / … / DENIED** chip at the top of
+      the bottom-left vitals column (`left: 16`, `bottom: 28` desktop /
+      lifted with health in touch mode). Optional roster speaking highlight
+      is not wired (stretch).
+    - Nothing blocks a frame; capture/play queues drop oldest on overflow.
+    - Unit tests cover jitter OOO, fade/pan bounds, and fake-capture
+      encode→decode→jitter round-trip (no real mic required in CI).

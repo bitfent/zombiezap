@@ -187,6 +187,209 @@
           window.addEventListener(evt, unlock, { once: true, capture: true });
         });
       })();
+
+      // Proximity voice capture bridge (wasm client polls drainFrames).
+      // Mic permission is requested ONLY via requestMic() — never at startup.
+      // Worklet is inlined (zero asset files); adapted from legacy
+      // voice-capture-worklet.js + Voice.ts resample/frame pipeline.
+      (function () {
+        var SAMPLE_RATE = 16000;
+        var FRAME_MS = 120;
+        var FRAME_SAMPLES = Math.round((SAMPLE_RATE * FRAME_MS) / 1000); // 1920
+        var MAX_QUEUED = 8;
+
+        // Inline AudioWorklet: batch mono float samples off the main thread.
+        var WORKLET_SRC =
+          "class VoiceCaptureProcessor extends AudioWorkletProcessor{" +
+          "constructor(){super();this.buf=new Float32Array(2048);this.n=0;}" +
+          "process(inputs){var ch=inputs[0]&&inputs[0][0];if(ch){for(var i=0;i<ch.length;i++){" +
+          "this.buf[this.n++]=ch[i];if(this.n===this.buf.length){this.port.postMessage(this.buf.slice(0));this.n=0;}}}" +
+          "return true;}}registerProcessor('voice-capture',VoiceCaptureProcessor);";
+
+        var state = {
+          ready: false,
+          denied: false,
+          txEnabled: false,
+          ctx: null,
+          stream: null,
+          micTrack: null,
+          source: null,
+          capNode: null,
+          silentSink: null,
+          inRate: 48000,
+          cursor: 0,
+          prevSample: 0,
+          outAccum: new Float32Array(FRAME_SAMPLES * 4),
+          outLen: 0,
+          frames: [],
+        };
+
+        function ensureContext() {
+          if (state.ctx) {
+            if (state.ctx.state === "suspended") state.ctx.resume();
+            return state.ctx;
+          }
+          var AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) return null;
+          state.ctx = new AC();
+          state.inRate = state.ctx.sampleRate || 48000;
+          state.silentSink = state.ctx.createGain();
+          state.silentSink.gain.value = 0;
+          state.silentSink.connect(state.ctx.destination);
+          if (!window.__zzAudioContexts) window.__zzAudioContexts = [];
+          window.__zzAudioContexts.push(state.ctx);
+          if (state.ctx.state === "suspended") state.ctx.resume();
+          return state.ctx;
+        }
+
+        function resample(input) {
+          var len = input.length;
+          if (len === 0) return input;
+          if (state.inRate === SAMPLE_RATE) {
+            state.prevSample = input[len - 1];
+            return input;
+          }
+          var ratio = state.inRate / SAMPLE_RATE;
+          var out = [];
+          var pos = state.cursor;
+          while (pos < len) {
+            var i = Math.floor(pos);
+            var frac = pos - i;
+            var a = i < 0 ? state.prevSample : input[i];
+            var j = i + 1;
+            var b = j < 0 ? state.prevSample : j < len ? input[j] : input[len - 1];
+            out.push(a + (b - a) * frac);
+            pos += ratio;
+          }
+          state.cursor = pos - len;
+          state.prevSample = input[len - 1];
+          return Float32Array.from(out);
+        }
+
+        function append(s) {
+          var need = state.outLen + s.length;
+          if (need > state.outAccum.length) {
+            var grow = new Float32Array(Math.max(need, state.outAccum.length * 2));
+            grow.set(state.outAccum.subarray(0, state.outLen));
+            state.outAccum = grow;
+          }
+          state.outAccum.set(s, state.outLen);
+          state.outLen += s.length;
+        }
+
+        function onCaptureChunk(input) {
+          if (!state.txEnabled) {
+            state.outLen = 0;
+            return;
+          }
+          var res = resample(input);
+          append(res);
+          while (state.outLen >= FRAME_SAMPLES) {
+            var pcm = new Int16Array(FRAME_SAMPLES);
+            for (var i = 0; i < FRAME_SAMPLES; i++) {
+              var s = Math.max(-1, Math.min(1, state.outAccum[i]));
+              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            // Store as Uint8Array (LE view of the Int16 buffer) for Rust.
+            var u8 = new Uint8Array(pcm.buffer.slice(0));
+            state.frames.push(u8);
+            while (state.frames.length > MAX_QUEUED) state.frames.shift();
+            state.outAccum.copyWithin(0, FRAME_SAMPLES, state.outLen);
+            state.outLen -= FRAME_SAMPLES;
+          }
+        }
+
+        async function buildCapture() {
+          if (!state.ctx || !state.stream || state.capNode) return;
+          state.source = state.ctx.createMediaStreamSource(state.stream);
+          if (state.ctx.audioWorklet) {
+            try {
+              var blob = new Blob([WORKLET_SRC], { type: "application/javascript" });
+              var url = URL.createObjectURL(blob);
+              await state.ctx.audioWorklet.addModule(url);
+              URL.revokeObjectURL(url);
+              var node = new AudioWorkletNode(state.ctx, "voice-capture");
+              node.port.onmessage = function (e) {
+                onCaptureChunk(e.data);
+              };
+              state.source.connect(node);
+              node.connect(state.silentSink);
+              state.capNode = node;
+              return;
+            } catch (e) {
+              /* fall through */
+            }
+          }
+          // ScriptProcessor fallback (deprecated, widely available).
+          var sp = state.ctx.createScriptProcessor(4096, 1, 1);
+          sp.onaudioprocess = function (e) {
+            onCaptureChunk(e.inputBuffer.getChannelData(0));
+          };
+          state.source.connect(sp);
+          sp.connect(state.silentSink);
+          state.capNode = sp;
+        }
+
+        async function requestMic() {
+          if (state.ready || state.denied) return state.ready;
+          try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+              state.denied = true;
+              return false;
+            }
+            ensureContext();
+            if (!state.ctx) {
+              state.denied = true;
+              return false;
+            }
+            var stream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+              },
+              video: false,
+            });
+            state.stream = stream;
+            state.micTrack = stream.getAudioTracks()[0] || null;
+            if (state.micTrack) state.micTrack.enabled = !!state.txEnabled;
+            await buildCapture();
+            state.ready = true;
+            return true;
+          } catch (e) {
+            state.denied = true;
+            state.ready = false;
+            return false;
+          }
+        }
+
+        function setTxEnabled(on) {
+          state.txEnabled = !!on;
+          if (state.micTrack) state.micTrack.enabled = state.txEnabled;
+          if (!state.txEnabled) {
+            state.outLen = 0;
+            state.frames = [];
+          }
+        }
+
+        function drainFrames() {
+          var out = state.frames;
+          state.frames = [];
+          return out;
+        }
+
+        window.__zzVoice = {
+          get ready() {
+            return state.ready;
+          },
+          get denied() {
+            return state.denied;
+          },
+          requestMic: requestMic,
+          setTxEnabled: setTxEnabled,
+          drainFrames: drainFrames,
+        };
+      })();
     </script>
   </body>
 </html>

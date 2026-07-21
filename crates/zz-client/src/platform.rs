@@ -204,6 +204,40 @@ pub fn unlock_audio() {
     }
 }
 
+// ── proximity voice (wasm bridge → web/index.html `__zzVoice`) ─────────────
+// Native capture lives entirely in `voice.rs` (cpal); these exist only on wasm.
+
+/// Request mic permission + start AudioWorklet capture. Idempotent.
+/// Mic is **never** requested at startup — only on first unmute (Key M).
+#[cfg(target_arch = "wasm32")]
+pub fn voice_request_mic() {
+    wasm_voice_call0("requestMic");
+}
+
+/// Enable/disable transmission of captured frames (privacy mute).
+#[cfg(target_arch = "wasm32")]
+pub fn voice_set_tx_enabled(enabled: bool) {
+    wasm_voice_call1_bool("setTxEnabled", enabled);
+}
+
+/// Drain completed 16 kHz mono i16 LE PCM frames (~120 ms each).
+#[cfg(target_arch = "wasm32")]
+pub fn voice_drain_pcm_frames() -> Vec<Vec<u8>> {
+    wasm_voice_drain_frames()
+}
+
+/// True once getUserMedia + worklet graph is live.
+#[cfg(target_arch = "wasm32")]
+pub fn voice_mic_ready() -> bool {
+    wasm_voice_flag("ready")
+}
+
+/// True if the user denied the mic (or getUserMedia is unavailable).
+#[cfg(target_arch = "wasm32")]
+pub fn voice_mic_denied() -> bool {
+    wasm_voice_flag("denied")
+}
+
 fn normalize_join(raw: String) -> Option<String> {
     let code = raw.trim().to_uppercase();
     if code.is_empty() { None } else { Some(code) }
@@ -316,10 +350,10 @@ fn wasm_input_value(id: &str) -> Option<String> {
     let input: web_sys::HtmlInputElement = el.dyn_into().ok()?;
     // Only report when the overlay is actually shown (display != none).
     let style = input.style();
-    if let Ok(d) = style.get_property_value("display") {
-        if d == "none" {
-            return None;
-        }
+    if let Ok(d) = style.get_property_value("display")
+        && d == "none"
+    {
+        return None;
     }
     Some(input.value())
 }
@@ -352,9 +386,106 @@ fn wasm_unlock_audio() {
     let unlock = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__zzUnlockAudio"))
         .ok()
         .filter(|v| v.is_function());
-    if let Some(f) = unlock {
-        if let Ok(func) = f.dyn_into::<js_sys::Function>() {
-            let _ = func.call0(&window);
+    if let Some(f) = unlock
+        && let Ok(func) = f.dyn_into::<js_sys::Function>()
+    {
+        let _ = func.call0(&window);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_voice_obj() -> Option<js_sys::Object> {
+    use wasm_bindgen::JsCast;
+    let window = web_sys::window()?;
+    let v = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__zzVoice")).ok()?;
+    if v.is_undefined() || v.is_null() {
+        return None;
+    }
+    v.dyn_into::<js_sys::Object>().ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_voice_call0(method: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(obj) = wasm_voice_obj() else {
+        return;
+    };
+    let Ok(f) = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str(method)) else {
+        return;
+    };
+    if let Ok(func) = f.dyn_into::<js_sys::Function>() {
+        let _ = func.call0(&obj);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_voice_call1_bool(method: &str, arg: bool) {
+    use wasm_bindgen::JsCast;
+    let Some(obj) = wasm_voice_obj() else {
+        return;
+    };
+    let Ok(f) = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str(method)) else {
+        return;
+    };
+    if let Ok(func) = f.dyn_into::<js_sys::Function>() {
+        let _ = func.call1(&obj, &wasm_bindgen::JsValue::from_bool(arg));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_voice_flag(field: &str) -> bool {
+    let Some(obj) = wasm_voice_obj() else {
+        return false;
+    };
+    js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str(field))
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Drain `window.__zzVoice.drainFrames()` → `Vec<Uint8Array>` of PCM frames.
+#[cfg(target_arch = "wasm32")]
+fn wasm_voice_drain_frames() -> Vec<Vec<u8>> {
+    use wasm_bindgen::JsCast;
+    let Some(obj) = wasm_voice_obj() else {
+        return Vec::new();
+    };
+    let Ok(f) = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str("drainFrames")) else {
+        return Vec::new();
+    };
+    let Ok(func) = f.dyn_into::<js_sys::Function>() else {
+        return Vec::new();
+    };
+    let Ok(ret) = func.call0(&obj) else {
+        return Vec::new();
+    };
+    let Ok(arr) = ret.dyn_into::<js_sys::Array>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.length() as usize);
+    for i in 0..arr.length() {
+        let v = arr.get(i);
+        // Prefer Uint8Array view of the PCM bytes.
+        if let Ok(u8a) = v.clone().dyn_into::<js_sys::Uint8Array>() {
+            let mut buf = vec![0u8; u8a.length() as usize];
+            u8a.copy_to(&mut buf);
+            if !buf.is_empty() {
+                out.push(buf);
+            }
+            continue;
+        }
+        // Int16Array → LE bytes.
+        if let Ok(i16a) = v.dyn_into::<js_sys::Int16Array>() {
+            let len = i16a.length() as usize;
+            let mut buf = Vec::with_capacity(len * 2);
+            for j in 0..len {
+                let s = i16a.get_index(j as u32);
+                buf.extend_from_slice(&s.to_le_bytes());
+            }
+            if !buf.is_empty() {
+                out.push(buf);
+            }
         }
     }
+    out
 }
