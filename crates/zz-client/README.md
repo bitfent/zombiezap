@@ -28,18 +28,26 @@ trunk serve          # http://127.0.0.1:8080
 trunk build          # emits web/dist/ (wasm + JS glue)
 ```
 
-### Smaller release wasm
+### Smaller release wasm (SHIP path)
 
 Workspace root defines `[profile.wasm-release]` (`opt-level = "z"`, fat LTO,
-strip). Prefer that for shipping:
+strip). **This is the documented ship path** (also wired via Trunk.toml when
+using plain `trunk build --release`):
 
 ```bash
 cd web
-# if your Trunk version supports cargo profiles:
 trunk build --release --cargo-profile wasm-release
+# equivalent (Trunk.toml maps --release → wasm-release profile):
+# trunk build --release
 ```
 
-Debug `trunk build` is enough to prove the pipeline; wasm-release is for size.
+**M15 verified ship size** (with binaryen `wasm-opt -Oz` on PATH):
+**23.51 MiB** `_bg.wasm` (24_647_501 bytes) + 128 KiB JS glue. Cold load:
+loading card shows immediately; hide only after stable canvas frames.
+Pre-M15 unoptimized bundles were ~28 MiB with a black-page first paint.
+
+Requires `wasm-opt` (binaryen) on PATH for `data-wasm-opt="z"`. Debug
+`trunk build` (no `--release`) is enough for iteration.
 
 The HTML canvas id is `zz-canvas`. Bevy’s primary `Window` is configured with
 `canvas: Some("#zz-canvas")`, `fit_canvas_to_parent: true`, and
@@ -257,9 +265,11 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     `Url` / `UrlSearchParams` — query parsing is a tiny split on
     `location.search` so the wasm dep graph stays small.
 
-32. **Trunk loader UI is plain HTML/CSS.** `#zz-loading` sits over the canvas
-    until `canvas.width/height > 0` (Bevy WebGL surface ready). Trunk itself
-    does not inject a loading chrome; keep the hide script in `web/index.html`.
+32. **Trunk loader UI is plain HTML/CSS.** `#zz-loading` is in the static
+    markup *above* the wasm module so it paints on cold load (not a black
+    page). Hide only after the canvas stays nonzero for several ticks (real
+    frames, not a transient size blip). Progress copy: loading wasm →
+    compiling → starting → ready.
 
 33. **`data-wasm-opt="z"` needs binaryen (`wasm-opt`) on PATH.** Without it,
     Trunk fails the release link step — install via package manager or
@@ -290,13 +300,16 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     touch-mode automation (`?touch=1`, item 3) can drive the player with
     clicks alone.
 
-37. **Procedural humanoid rigs (M9):** articulated cuboids hang from empty
-    joint-pivot entities (`models.rs`). One shared `Cuboid` mesh + a small
-    material bank (3 zombie kinds, 5 slot colours, 1 emissive eye, 1 gun) —
-    never per-zombie unique mesh/material handles (ShotAnte draw-call warning).
-    Walk cycles are client-only from interpolated velocity; phase offset is a
-    pure hash of entity id. Death crumples are short-lived FX entities — do
-    not delay `net_poll` despawn bookkeeping.
+37. **Procedural humanoid rigs (M9 + M15 LOD):** articulated cuboids hang from
+    empty joint-pivot entities (`models.rs`). One shared `Cuboid` mesh + a
+    small material bank (3 zombie kinds, 5 slot colours, 1 emissive eye, 1
+    gun) — never per-zombie unique mesh/material at spawn (ShotAnte draw-call
+    warning). **Exception (note 23):** hit-flash briefly swaps body parts onto
+    unique white materials, then restores the shared handles. Animation LOD:
+    full limbs ≤ 40 m (capped to nearest 40 zombies), bob 40–80 m, single
+    shared-mesh impostor cuboid beyond 80 m. Walk cycles are client-only from
+    interpolated velocity; phase offset is a pure hash of entity id. Death
+    crumples are short-lived FX entities — do not delay `net_poll` despawn.
 
 38. **Viewmodel parenting:** first-person rifle is a `ChildOf` the 3D
     `Camera3d` entity (camera-local bottom-right). Own `Shot` events kick

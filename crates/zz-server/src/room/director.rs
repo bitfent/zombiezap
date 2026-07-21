@@ -49,8 +49,16 @@ impl Director {
         let phase =
             (tick as f32 / TICK_RATE as f32) / DIRECTOR_PULSE_PERIOD_SEC * core::f32::consts::TAU;
         let pulse = 1.0 + DIRECTOR_PULSE_AMPLITUDE * libm::sinf(phase);
-        let rate = DIRECTOR_BASE_POINTS_PER_SEC * (1.0 + minutes * DIRECTOR_RAMP_PER_MIN) * pulse;
+        // Map-size scale: big arenas (Rome) get a higher budget so the horde
+        // actually forms; approach-distance clamp below does first-contact.
+        let size_scale = director_rate_scale(map.arena_half);
+        let rate = DIRECTOR_BASE_POINTS_PER_SEC
+            * (1.0 + minutes * DIRECTOR_RAMP_PER_MIN)
+            * pulse
+            * size_scale;
         self.points += rate * self.rate_mul * TICK_DT;
+
+        let approach = director_approach_dist(map.arena_half);
 
         while zombies.len() < MAX_ZOMBIES {
             let kind = self.pick_kind(minutes);
@@ -66,8 +74,11 @@ impl Director {
                 (self.rng.next() as f32 - 0.5) * 1.5,
                 (self.rng.next() as f32 - 0.5) * 1.5,
             );
-            let (x, z) = (gate.x + jx, gate.z + jz);
-            let (cx, cz) = (0.0, 0.0);
+            let (gx, gz) = (gate.x + jx, gate.z + jz);
+            // Pull spawn toward nearest alive player so walkers threaten in
+            // ~20 s even on 500 m arenas (gates alone can be 200 m away).
+            let (x, z) = Self::approach_spawn(gx, gz, players, approach);
+            let (cx, cz) = Self::alive_centroid(players);
             zombies.push(Zombie {
                 id: self.next_id,
                 kind,
@@ -84,6 +95,57 @@ impl Director {
             });
             self.next_id = self.next_id.wrapping_add(1).max(1);
         }
+    }
+
+    fn alive_centroid(players: &[(f32, f32, f32, f32, bool)]) -> (f32, f32) {
+        let mut cx = 0.0f32;
+        let mut cz = 0.0f32;
+        let mut n = 0u32;
+        for p in players.iter().filter(|p| p.4) {
+            cx += p.0;
+            cz += p.2;
+            n += 1;
+        }
+        if n == 0 {
+            (0.0, 0.0)
+        } else {
+            (cx / n as f32, cz / n as f32)
+        }
+    }
+
+    /// If the gate is farther than `approach` from every alive player, place
+    /// the spawn on the segment gate→nearest-player at distance `approach`.
+    fn approach_spawn(
+        gx: f32,
+        gz: f32,
+        players: &[(f32, f32, f32, f32, bool)],
+        approach: f32,
+    ) -> (f32, f32) {
+        let mut best: Option<(f32, f32, f32)> = None; // (px, pz, d2)
+        for p in players.iter().filter(|p| p.4) {
+            let dx = gx - p.0;
+            let dz = gz - p.2;
+            let d2 = dx * dx + dz * dz;
+            let better = match best {
+                None => true,
+                Some((_, _, bd2)) => d2 < bd2,
+            };
+            if better {
+                best = Some((p.0, p.2, d2));
+            }
+        }
+        let Some((px, pz, d2)) = best else {
+            return (gx, gz);
+        };
+        let dist = d2.sqrt();
+        if dist <= approach || dist < 1e-3 {
+            return (gx, gz);
+        }
+        // Point on gate→player segment at `approach` metres from the player.
+        let t = approach / dist;
+        let x = px + (gx - px) * t;
+        let z = pz + (gz - pz) * t;
+        (x, z)
     }
 
     fn pick_kind(&mut self, minutes: f32) -> ZombieKind {

@@ -751,11 +751,63 @@ fn gen_ground_lit(size: u32, half: f32, occlusion: &[f32], occ_res: u32) -> Imag
             let w = (y as f32 + 0.5) / size as f32;
             let light = sample_occlusion(occlusion, occ_res, u, w);
             v = (v * light).clamp(0.0, 1.0);
+            // Distance-based subtle darkening toward the map rim so buildings
+            // sit on an anchored ground plane (center stays brightest).
+            let dx = u * 2.0 - 1.0;
+            let dz = w * 2.0 - 1.0;
+            let rim = (dx * dx + dz * dz).sqrt().clamp(0.0, 1.0);
+            let rim_dark = 1.0 - rim * rim * 0.28;
+            v = (v * rim_dark).clamp(0.0, 1.0);
             let c = (v * 255.0) as u8;
             px.extend_from_slice(&[c, c, (c as f32 * 0.95) as u8, 255]);
         }
     }
     rgba_image(size, size, px)
+}
+
+/// Vertical sky gradient texture (zenith → horizon), env-tinted.
+/// Sampled on a large inverted dome / far sky ring (zero asset files).
+fn gen_sky_gradient(size: u32, zenith: Color, horizon: Color) -> Image {
+    let z = zenith.to_srgba();
+    let h = horizon.to_srgba();
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        // v=0 at bottom of texture → horizon; v=1 at top → zenith.
+        // UV on the dome maps so the upper hemisphere samples zenith.
+        let t = y as f32 / (size - 1).max(1) as f32;
+        // Bias toward horizon haze near the bottom third.
+        let k = t.powf(0.65);
+        let r = h.red + (z.red - h.red) * k;
+        let g = h.green + (z.green - h.green) * k;
+        let b = h.blue + (z.blue - h.blue) * k;
+        for _x in 0..size {
+            px.extend_from_slice(&[
+                (r * 255.0) as u8,
+                (g * 255.0) as u8,
+                (b * 255.0) as u8,
+                255,
+            ]);
+        }
+    }
+    rgba_image(size, size, px)
+}
+
+/// Horizon haze colour: sky pulled toward a warmer / env-tinted edge.
+fn horizon_haze(sky: Color, env: EnvKind) -> Color {
+    let s = sky.to_srgba();
+    let (wr, wg, wb) = match env {
+        EnvKind::DesertTown => (1.05, 0.92, 0.70),
+        EnvKind::RomeEur => (1.02, 0.95, 0.82),
+        EnvKind::SeaTown => (0.95, 1.0, 1.05),
+        EnvKind::MountainTown => (0.98, 1.0, 1.05),
+        EnvKind::Urban => (1.0, 0.98, 0.95),
+    };
+    // Mix sky with a brighter warm rim so the horizon reads as haze.
+    Color::srgb(
+        (s.red * wr * 0.55 + 0.45 * wr.min(1.0)).clamp(0.0, 1.0),
+        (s.green * wg * 0.55 + 0.40 * wg.min(1.0)).clamp(0.0, 1.0),
+        (s.blue * wb * 0.55 + 0.38).clamp(0.0, 1.0),
+    )
 }
 
 fn gen_concrete(size: u32, dark: bool, tint: [f32; 3]) -> Image {
@@ -1058,20 +1110,44 @@ fn rebuild_map_system(
     clear_color.0 = light.sky;
     ambient.color = light.ambient;
     ambient.brightness = light.ambient_brightness;
-    // Fog scales with the arena: streets stay crisp, horizon hazes.
+    // Fog scales with the arena: streets stay crisp, env-tinted horizon haze.
     // Force each 3D camera clear to the env sky so the retro target never
     // keeps the menu-dark clear across a rematch (S5).
+    let haze = horizon_haze(light.sky, map.env);
     for (cam, mut camera) in cameras.iter_mut() {
         camera.clear_color = ClearColorConfig::Custom(light.sky);
         commands.entity(cam).insert(DistanceFog {
-            color: light.sky,
+            color: haze,
             falloff: FogFalloff::Linear {
-                start: map.arena_half * 1.4,
-                end: map.arena_half * 4.0,
+                start: map.arena_half * 1.2,
+                end: map.arena_half * 3.6,
             },
             ..default()
         });
     }
+
+    // Procedural sky gradient + sun disc (zero assets).
+    let sky_tex = images.add(gen_sky_gradient(32, light.sky, haze));
+    let sky_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(sky_tex),
+        unlit: true,
+        // Inside of a sphere/dome: flip culling so we see the interior.
+        cull_mode: Some(bevy::render::render_resource::Face::Front),
+        ..default()
+    });
+    let sun_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.96, 0.75),
+        emissive: LinearRgba::rgb(
+            light.sun_color.to_srgba().red * 12.0,
+            light.sun_color.to_srgba().green * 10.0,
+            light.sun_color.to_srgba().blue * 6.0,
+        ),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        ..default()
+    });
 
     // ── Baked sun shadows (once, here; nothing shadow-related per frame) ───
     // Resolutions derive from arena_half so the 500 m Rome EUR arena stays
@@ -1310,6 +1386,33 @@ fn rebuild_map_system(
                 },
                 Transform::IDENTITY.looking_to(-light.sun_to, Vec3::Y),
                 Name::new("MapSun"),
+            ));
+
+            // Far sky dome: inverted UV sphere with vertical gradient texture.
+            // Radius past fog end so it reads as atmosphere, not geometry.
+            let sky_r = half * 5.5;
+            let sky_mesh = meshes.add(Sphere::new(sky_r).mesh().uv(24, 12));
+            root.spawn((
+                Mesh3d(sky_mesh),
+                MeshMaterial3d(sky_mat),
+                Transform::from_xyz(0.0, 0.0, 0.0),
+                Name::new("SkyDome"),
+            ));
+
+            // Sun disc billboard: bright emissive quad along sun_to.
+            let sun_dist = half * 4.2;
+            let sun_pos = light.sun_to * sun_dist;
+            let sun_size = half * 0.18;
+            let sun_mesh = meshes.add(Mesh::from(Plane3d::new(
+                -light.sun_to,
+                Vec2::splat(sun_size),
+            )));
+            root.spawn((
+                Mesh3d(sun_mesh),
+                MeshMaterial3d(sun_mat),
+                Transform::from_translation(sun_pos)
+                    .looking_to(-light.sun_to, Vec3::Y),
+                Name::new("SunDisc"),
             ));
         });
 

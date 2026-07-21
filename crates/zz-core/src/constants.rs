@@ -93,6 +93,32 @@ pub const DIRECTOR_PULSE_AMPLITUDE: f32 = 0.4;
 pub const RUNNERS_FROM_MIN: f32 = 2.0;
 pub const BRUTES_FROM_MIN: f32 = 4.0;
 
+// ── director pacing vs map size (M15) ───────────────────────────────────────
+// Urban/Mountain/Desert/Sea use arena_half ≈ 30. Rome EUR is 250. Without
+// scaling, walkers take minutes to cross Rome. These formulas keep first
+// contact ~20 s on every map while leaving goldens untouched (no sim math).
+//
+// Reference half-extent for "normal" maps (mapgen ARENA_HALF, not co-op 40).
+pub const DIRECTOR_REF_ARENA_HALF: f32 = 30.0;
+/// Max distance (m) from nearest alive player at which a zombie may spawn.
+/// Walkers at 2.2 m/s cover ~45 m in ~20 s.
+pub const DIRECTOR_APPROACH_DIST_M: f32 = 45.0;
+
+/// Budget rate multiplier for a map of half-extent `arena_half`.
+/// Urban (30) → 1.0; Rome (250) → ~2.9 (sqrt scale, clamped).
+pub fn director_rate_scale(arena_half: f32) -> f32 {
+    let t = (arena_half / DIRECTOR_REF_ARENA_HALF).max(1.0);
+    t.sqrt().clamp(1.0, 3.5)
+}
+
+/// Pull-in distance for spawn placement on large maps (metres).
+/// Never farther than this from the nearest alive player when possible.
+pub fn director_approach_dist(arena_half: f32) -> f32 {
+    DIRECTOR_APPROACH_DIST_M
+        .min(arena_half * 0.9)
+        .max(18.0)
+}
+
 // ── loot ───────────────────────────────────────────────────────────────────
 pub const PICKUP_RADIUS: f32 = 0.9;
 pub const LOOT_DESPAWN_TICKS: u32 = 600; // 20 s
@@ -112,3 +138,34 @@ pub const MAX_PLAYERS: usize = 5;
 /// Lobby codes use this unambiguous alphabet (no 0/O/1/I) — ShotAnte's.
 pub const LOBBY_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const LOBBY_CODE_LEN: usize = 5;
+
+#[cfg(test)]
+mod director_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn rate_scale_vs_arena_half() {
+        let urban = director_rate_scale(30.0);
+        assert!((urban - 1.0).abs() < 1e-4, "urban baseline scale=1, got {urban}");
+        let small = director_rate_scale(20.0);
+        assert!((small - 1.0).abs() < 1e-4, "sub-ref maps clamp to 1");
+        let rome = director_rate_scale(250.0);
+        assert!(rome > urban, "rome needs more budget than urban");
+        assert!(rome <= 3.5 + 1e-4, "rome scale clamped");
+        // Monotonic in half
+        assert!(director_rate_scale(60.0) > director_rate_scale(30.0));
+        assert!(director_rate_scale(120.0) > director_rate_scale(60.0));
+    }
+
+    #[test]
+    fn approach_dist_caps_first_contact() {
+        let urban = director_approach_dist(30.0);
+        // urban half 30 → 45.min(27).max(18) = 27
+        assert!((18.0..=45.0).contains(&urban));
+        let rome = director_approach_dist(250.0);
+        assert!((rome - DIRECTOR_APPROACH_DIST_M).abs() < 1e-4);
+        // Walkers at 2.2 m/s: approach/speed < 25 s
+        let t = rome / 2.2;
+        assert!(t < 25.0, "approach walk time {t}s should be < 25s");
+    }
+}

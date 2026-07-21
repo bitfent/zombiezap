@@ -28,7 +28,8 @@ Open the page. Type a name. **HOST A GAME** → share the code or the
 ```bash
 # optional: browser client (Trunk → web/dist), then served by zz-server at /
 cargo install trunk --locked
-cd web && trunk build --release && cd ..
+# SHIP path: wasm-release profile + binaryen -Oz (see web/index.html data-wasm-opt)
+cd web && trunk build --release --cargo-profile wasm-release && cd ..
 
 # terminal 1 — server on :8080 (healthz, /ws, and static client at /)
 cargo run -p zz-server
@@ -37,6 +38,10 @@ cargo run -p zz-server
 # terminal 2..n — native windows (optional; same server)
 cargo run -p zz-client
 ```
+
+Debug `trunk build` is fine for iteration; **ship** with
+`trunk build --release --cargo-profile wasm-release` (documented size in
+`crates/zz-client/README.md`).
 
 Override the static root with `ZZ_WEB_DIST` (default `web/dist`, relative to
 the process cwd). Missing dist does not crash the server — only static routes

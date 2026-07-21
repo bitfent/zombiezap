@@ -70,10 +70,11 @@
     <div id="zz-loading" aria-live="polite" aria-busy="true">
       <div class="zz-loading-card">
         <div class="zz-loading-title">ZOMBIEZAP</div>
-        <div class="zz-loading-sub">loading…</div>
+        <div class="zz-loading-sub" id="zz-loading-sub">loading wasm…</div>
         <div class="zz-loading-bar" aria-hidden="true">
-          <div class="zz-loading-bar-fill"></div>
+          <div class="zz-loading-bar-fill" id="zz-loading-bar-fill"></div>
         </div>
+        <div class="zz-loading-hint" id="zz-loading-hint">first load may take a moment</div>
       </div>
     </div>
     <canvas id="zz-canvas"></canvas>
@@ -129,22 +130,68 @@
 
     <script>
       (function () {
+        // Loading card is in the HTML above the wasm module script so it paints
+        // immediately on cold load (before the ~wasm-release bundle finishes).
         var loader = document.getElementById("zz-loading");
         var canvas = document.getElementById("zz-canvas");
+        var sub = document.getElementById("zz-loading-sub");
+        var fill = document.getElementById("zz-loading-bar-fill");
+        var hint = document.getElementById("zz-loading-hint");
         if (!loader || !canvas) return;
+
+        var hidden = false;
         function hide() {
+          if (hidden) return;
+          hidden = true;
           loader.classList.add("zz-hidden");
           loader.setAttribute("aria-busy", "false");
         }
-        // Bevy sets canvas width/height when the WebGL surface is ready.
+
+        // Progress hint: size alone is not enough — wait until Bevy has
+        // actually presented frames (canvas still "alive" after size > 0).
+        var sizedAt = 0;
+        var stableFrames = 0;
+        var lastW = 0;
+        var lastH = 0;
         var n = 0;
         var id = setInterval(function () {
           n += 1;
-          if (canvas.width > 0 && canvas.height > 0) {
-            clearInterval(id);
-            hide();
-          } else if (n > 300) {
-            // ~30s safety so a failed init does not spin forever
+          var w = canvas.width | 0;
+          var h = canvas.height | 0;
+          if (w > 0 && h > 0) {
+            if (!sizedAt) {
+              sizedAt = n;
+              if (sub) sub.textContent = "starting…";
+              if (fill) {
+                fill.style.width = "70%";
+                fill.style.animation = "none";
+              }
+            }
+            // Require the surface to stay non-zero for several ticks AND
+            // optionally that WebGL context exists — not just a transient size.
+            if (w === lastW && h === lastH) {
+              stableFrames += 1;
+            } else {
+              stableFrames = 0;
+              lastW = w;
+              lastH = h;
+            }
+            // ~300 ms of stable nonzero size after first size event.
+            if (stableFrames >= 3 && n - sizedAt >= 3) {
+              if (sub) sub.textContent = "ready";
+              if (fill) fill.style.width = "100%";
+              clearInterval(id);
+              // Brief beat so "ready" is visible, then fade.
+              setTimeout(hide, 120);
+              return;
+            }
+          } else if (n > 8 && sub && sub.textContent.indexOf("wasm") >= 0) {
+            if (sub) sub.textContent = "compiling…";
+            if (hint) hint.textContent = "cold start · please wait";
+            if (fill) fill.style.width = "40%";
+          }
+          if (n > 450) {
+            // ~45s safety so a failed init does not spin forever
             clearInterval(id);
             hide();
           }

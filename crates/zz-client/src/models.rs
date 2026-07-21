@@ -12,16 +12,31 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::prelude::*;
 
 // ── shared geometry proportions (metres, upright rest pose) ────────────────
+// Zombie blocks intentionally read larger / more menacing than survivors:
+// bigger head+jaw, hunched torso, longer arms (stranger-test at mid-range).
 
 const TORSO_W: f32 = 0.42;
 const TORSO_H: f32 = 0.62;
 const TORSO_D: f32 = 0.26;
 const TORSO_CY: f32 = 1.14; // torso centre Y
 
+/// Survivor head (players stay human-proportioned).
 const HEAD_W: f32 = 0.34;
 const HEAD_H: f32 = 0.34;
 const HEAD_D: f32 = 0.32;
 const HEAD_CY: f32 = 1.62;
+
+/// Zombie head: larger block + deeper jaw for silhouette at 15–30 m.
+const Z_HEAD_W: f32 = 0.42;
+const Z_HEAD_H: f32 = 0.40;
+const Z_HEAD_D: f32 = 0.40;
+const Z_HEAD_CY: f32 = 1.58;
+const Z_JAW_W: f32 = 0.36;
+const Z_JAW_H: f32 = 0.14;
+const Z_JAW_D: f32 = 0.28;
+const Z_JAW_CY: f32 = 1.36;
+/// Slight forward pitch on the body pivot for a permanent hunch.
+pub const ZOMBIE_HUNCH_PITCH: f32 = 0.28;
 
 const LEG_W: f32 = 0.17;
 const LEG_LEN: f32 = 0.84;
@@ -32,17 +47,33 @@ const ARM_W: f32 = 0.14;
 const ARM_LEN: f32 = 0.62;
 const ARM_JOINT_Y: f32 = 1.42;
 const ARM_X: f32 = 0.27;
+/// Zombie arms hang longer than human (reach + silhouette).
+const Z_ARM_LEN: f32 = 0.78;
+const Z_ARM_W: f32 = 0.15;
 
-const EYE_S: f32 = 0.06;
-const EYE_Y: f32 = 1.66;
-const EYE_Z: f32 = -0.17; // face forward = -Z
-const EYE_X: f32 = 0.08;
+/// Zombie eyes: larger + further forward so emissive reads at 30 m+.
+const Z_EYE_S: f32 = 0.09;
+const Z_EYE_Y: f32 = 1.64;
+const Z_EYE_Z: f32 = -0.22;
+const Z_EYE_X: f32 = 0.10;
 
 /// Max limb swing |angle| (radians) at any speed — tests assert against this.
 pub const MAX_LIMB_SWING: f32 = 0.85;
 
 /// Death crumple duration in seconds.
 pub const CRUMPLE_DURATION_S: f32 = 0.55;
+
+/// Hit-flash lifetime (unique material instances — README note 23).
+pub const HIT_FLASH_S: f32 = 0.09;
+
+// ── animation LOD distances (metres from camera) ───────────────────────────
+/// Full limb walk cycle within this range.
+pub const LOD_FULL_M: f32 = 40.0;
+/// Simple vertical bob only between FULL and this; beyond = static.
+pub const LOD_BOB_M: f32 = 80.0;
+/// Soft cap: only this many nearest zombies keep full limb animation; the rest
+/// drop to bob/static even if inside FULL range (horde frame budget).
+pub const LOD_FULL_CAP: usize = 40;
 
 // ── pure anim math (unit-tested) ───────────────────────────────────────────
 
@@ -63,12 +94,54 @@ pub fn kind_scale(kind: u8) -> Vec3 {
     }
 }
 
-/// Kind → rotten-green body colour (walker / runner / brute silhouettes).
+/// Kind → high-contrast body colour (walker / runner / brute silhouettes).
+/// Boosted separation so kinds read at mid-range under sun-bleached fog.
 pub fn kind_color(kind: u8) -> Color {
     match kind {
-        1 => Color::srgb(0.50, 0.58, 0.22), // runner: sickly yellow-green
-        2 => Color::srgb(0.22, 0.32, 0.20), // brute: dark bulk
-        _ => Color::srgb(0.30, 0.48, 0.26), // walker: rotten green
+        1 => Color::srgb(0.72, 0.78, 0.18), // runner: sickly chartreuse
+        2 => Color::srgb(0.14, 0.22, 0.12), // brute: near-black bulk
+        _ => Color::srgb(0.22, 0.55, 0.20), // walker: saturated rotten green
+    }
+}
+
+/// Per-kind silhouette scale factors (head bulk × arm length) for tests /
+/// stranger-test documentation. Totals must stay kind-distinct.
+pub fn silhouette_scale_table(kind: u8) -> (f32, f32) {
+    match kind {
+        1 => (0.95, 1.15), // runner: slightly smaller head, long arms
+        2 => (1.35, 1.20), // brute: massive head block
+        _ => (1.15, 1.25), // walker: enlarged head + long arms vs human
+    }
+}
+
+/// Attack telegraph root scale pulse (1.0 = rest). Peaks early in windup.
+pub fn telegraph_scale_pulse(attacking: bool, phase: f32) -> f32 {
+    if !attacking {
+        return 1.0;
+    }
+    // Gentle breathe 1.00 → 1.08 so arms-up pose reads at 15 m.
+    1.0 + 0.08 * (0.5 + 0.5 * (phase * 6.0).sin())
+}
+
+/// Animation LOD band from distance (metres).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimLod {
+    /// Full limb walk cycle.
+    Full,
+    /// Vertical bob only (no limb joint writes).
+    Bob,
+    /// Frozen pose (impostor / far tail).
+    Static,
+}
+
+/// Distance → LOD band (before the near-cap is applied).
+pub fn anim_lod_for_distance(dist: f32) -> AnimLod {
+    if dist <= LOD_FULL_M {
+        AnimLod::Full
+    } else if dist <= LOD_BOB_M {
+        AnimLod::Bob
+    } else {
+        AnimLod::Static
     }
 }
 
@@ -96,8 +169,9 @@ pub fn limb_swing_angle(phase: f32, speed: f32, kind: u8, sign: f32) -> f32 {
 }
 
 /// Attack telegraph: arms raise toward this local X rotation (radians).
+/// Stronger raise so the windup silhouette reads at ~15 m.
 pub fn attack_arm_raise() -> f32 {
-    -1.15 // arms up/forward toward the player
+    -1.45 // arms up/forward toward the player
 }
 
 /// Crumple pose at normalized time `t ∈ [0, 1]`.
@@ -128,12 +202,16 @@ pub fn slot_color(slot: u8) -> Color {
 // ── shared GPU assets ──────────────────────────────────────────────────────
 
 /// Shared meshes + materials for every rigged entity and the viewmodel.
+///
+/// **Batching contract (horde perf):** every zombie of kind K reuses the same
+/// `zombie_mats[K]` + `unit_cube` + `eye_mat` handles. Only hit-flash FX clones
+/// a material (README note 23). Do not add per-zombie mesh/material at spawn.
 #[derive(Resource)]
 pub struct RigAssets {
     pub unit_cube: Handle<Mesh>,
     /// Walker / runner / brute body materials (shared across the horde).
     pub zombie_mats: [Handle<StandardMaterial>; 3],
-    /// Glowing eyes — one handle for all zombies.
+    /// Glowing eyes — one handle for all zombies (high emissive for 30 m+).
     pub eye_mat: Handle<StandardMaterial>,
     pub player_mats: Vec<Handle<StandardMaterial>>,
     pub gun_mat: Handle<StandardMaterial>,
@@ -155,15 +233,15 @@ impl RigAssets {
         };
 
         let zombie_mats = [
-            materials.add(entity_mat(kind_color(0), 0.10)),
-            materials.add(entity_mat(kind_color(1), 0.12)),
-            materials.add(entity_mat(kind_color(2), 0.08)),
+            materials.add(entity_mat(kind_color(0), 0.14)),
+            materials.add(entity_mat(kind_color(1), 0.18)),
+            materials.add(entity_mat(kind_color(2), 0.10)),
         ];
 
-        // Bright emissive eyes for dark-street readability (no bloom required).
+        // Hot emissive eyes — readable through fog at 30 m+ without bloom.
         let eye_mat = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.95, 0.15, 0.08),
-            emissive: LinearRgba::rgb(8.0, 0.6, 0.15),
+            base_color: Color::srgb(1.0, 0.12, 0.05),
+            emissive: LinearRgba::rgb(18.0, 1.2, 0.25),
             perceptual_roughness: 1.0,
             metallic: 0.0,
             ..default()
@@ -191,7 +269,7 @@ impl RigAssets {
         }
     }
 
-    fn body_mat(&self, is_zombie: bool, kind_or_slot: u8) -> Handle<StandardMaterial> {
+    pub fn body_mat(&self, is_zombie: bool, kind_or_slot: u8) -> Handle<StandardMaterial> {
         if is_zombie {
             self.zombie_mats[kind_or_slot.min(2) as usize].clone()
         } else {
@@ -210,6 +288,12 @@ pub struct HumanoidRig {
     pub right_arm: Entity,
     pub left_leg: Entity,
     pub right_leg: Entity,
+    /// Full articulated group (hidden at Static impostor LOD).
+    pub detailed: Entity,
+    /// Single shared-mesh cuboid shown at Static LOD (far tail).
+    pub impostor: Entity,
+    /// Mesh entities that use the body material (for hit-flash restore).
+    pub body_parts: Vec<Entity>,
     pub phase: f32,
     pub phase_offset: f32,
     pub speed: f32,
@@ -219,6 +303,16 @@ pub struct HumanoidRig {
     pub is_zombie: bool,
     /// Snapshot `state == 1` attack telegraph.
     pub attacking: bool,
+    /// Current animation LOD (updated each frame from camera distance).
+    pub lod: AnimLod,
+}
+
+/// Brief white flash on a hit zombie — unique material handles (note 23).
+#[derive(Component)]
+pub struct HitFlash {
+    pub age: f32,
+    /// (entity, original material) to restore when the flash ends.
+    pub restore: Vec<(Entity, Handle<StandardMaterial>)>,
 }
 
 /// Short-lived death tumble — does not participate in net bookkeeping.
@@ -278,6 +372,9 @@ fn limb_pivot(
 }
 
 /// Build a full humanoid under `root` (already spawned). Returns the rig component.
+///
+/// Hierarchy: root → detailed{ body{torso,head,jaw?,eyes?,limbs} } + impostor.
+/// Shared mesh/material handles only — see [`RigAssets`] batching contract.
 pub fn attach_humanoid(
     root: &mut EntityCommands,
     assets: &RigAssets,
@@ -288,86 +385,144 @@ pub fn attach_humanoid(
     let mat = assets.body_mat(is_zombie, kind_or_slot);
     let cube = assets.unit_cube.clone();
     let eye_mat = assets.eye_mat.clone();
+    let (sil_head, _sil_arm) = silhouette_scale_table(if is_zombie {
+        kind_or_slot.min(2)
+    } else {
+        0
+    });
 
     let mut body_e = Entity::PLACEHOLDER;
     let mut left_arm = Entity::PLACEHOLDER;
     let mut right_arm = Entity::PLACEHOLDER;
     let mut left_leg = Entity::PLACEHOLDER;
     let mut right_leg = Entity::PLACEHOLDER;
+    let mut detailed_e = Entity::PLACEHOLDER;
+    let mut impostor_e = Entity::PLACEHOLDER;
+    let mut body_parts: Vec<Entity> = Vec::new();
+
+    let arm_len = if is_zombie { Z_ARM_LEN } else { ARM_LEN };
+    let arm_w = if is_zombie { Z_ARM_W } else { ARM_W };
+    let (head_w, head_h, head_d, head_cy) = if is_zombie {
+        (
+            Z_HEAD_W * sil_head,
+            Z_HEAD_H * sil_head,
+            Z_HEAD_D * sil_head,
+            Z_HEAD_CY,
+        )
+    } else {
+        (HEAD_W, HEAD_H, HEAD_D, HEAD_CY)
+    };
 
     root.with_children(|root_c| {
-        let body_id = root_c
-            .spawn((Transform::IDENTITY, Visibility::default()))
-            .with_children(|body| {
-                // Torso
-                part(
-                    body,
-                    cube.clone(),
-                    mat.clone(),
-                    Vec3::new(0.0, TORSO_CY, 0.0),
-                    Vec3::new(TORSO_W, TORSO_H, TORSO_D),
-                );
-                // Head
-                part(
-                    body,
-                    cube.clone(),
-                    mat.clone(),
-                    Vec3::new(0.0, HEAD_CY, 0.0),
-                    Vec3::new(HEAD_W, HEAD_H, HEAD_D),
-                );
-                // Emissive eyes (zombies only) for dark readability
-                if is_zombie {
-                    part(
-                        body,
-                        cube.clone(),
-                        eye_mat.clone(),
-                        Vec3::new(-EYE_X, EYE_Y, EYE_Z),
-                        Vec3::splat(EYE_S),
-                    );
-                    part(
-                        body,
-                        cube.clone(),
-                        eye_mat,
-                        Vec3::new(EYE_X, EYE_Y, EYE_Z),
-                        Vec3::splat(EYE_S),
-                    );
-                }
+        // Far-LOD impostor: one shared cuboid (hidden until Static band).
+        impostor_e = root_c
+            .spawn((
+                Mesh3d(cube.clone()),
+                MeshMaterial3d(mat.clone()),
+                Transform::from_translation(Vec3::new(0.0, 0.95, 0.0))
+                    .with_scale(Vec3::new(0.55, 1.75, 0.40)),
+                Visibility::Hidden,
+            ))
+            .id();
 
-                left_leg = limb_pivot(
-                    body,
-                    cube.clone(),
-                    mat.clone(),
-                    Vec3::new(-LEG_X, LEG_JOINT_Y, 0.0),
-                    LEG_W,
-                    LEG_LEN,
-                );
-                right_leg = limb_pivot(
-                    body,
-                    cube.clone(),
-                    mat.clone(),
-                    Vec3::new(LEG_X, LEG_JOINT_Y, 0.0),
-                    LEG_W,
-                    LEG_LEN,
-                );
-                left_arm = limb_pivot(
-                    body,
-                    cube.clone(),
-                    mat.clone(),
-                    Vec3::new(-ARM_X, ARM_JOINT_Y, 0.0),
-                    ARM_W,
-                    ARM_LEN,
-                );
-                right_arm = limb_pivot(
-                    body,
-                    cube.clone(),
-                    mat.clone(),
-                    Vec3::new(ARM_X, ARM_JOINT_Y, 0.0),
-                    ARM_W,
-                    ARM_LEN,
-                );
+        let detailed_id = root_c
+            .spawn((Transform::IDENTITY, Visibility::default()))
+            .with_children(|det| {
+                let body_id = det
+                    .spawn((
+                        // Permanent hunch on zombies for mid-range menace.
+                        Transform::from_rotation(if is_zombie {
+                            Quat::from_rotation_x(ZOMBIE_HUNCH_PITCH)
+                        } else {
+                            Quat::IDENTITY
+                        }),
+                        Visibility::default(),
+                    ))
+                    .with_children(|body| {
+                        // Torso
+                        body_parts.push(
+                            body.spawn((
+                                Mesh3d(cube.clone()),
+                                MeshMaterial3d(mat.clone()),
+                                Transform::from_translation(Vec3::new(0.0, TORSO_CY, 0.0))
+                                    .with_scale(Vec3::new(TORSO_W, TORSO_H, TORSO_D)),
+                            ))
+                            .id(),
+                        );
+                        // Head
+                        body_parts.push(
+                            body.spawn((
+                                Mesh3d(cube.clone()),
+                                MeshMaterial3d(mat.clone()),
+                                Transform::from_translation(Vec3::new(0.0, head_cy, 0.0))
+                                    .with_scale(Vec3::new(head_w, head_h, head_d)),
+                            ))
+                            .id(),
+                        );
+                        if is_zombie {
+                            // Jaw block — deep silhouette under the head.
+                            body_parts.push(
+                                body.spawn((
+                                    Mesh3d(cube.clone()),
+                                    MeshMaterial3d(mat.clone()),
+                                    Transform::from_translation(Vec3::new(0.0, Z_JAW_CY, -0.04))
+                                        .with_scale(Vec3::new(Z_JAW_W, Z_JAW_H, Z_JAW_D)),
+                                ))
+                                .id(),
+                            );
+                            // Emissive eyes — large, forward, shared eye mat.
+                            body.spawn((
+                                Mesh3d(cube.clone()),
+                                MeshMaterial3d(eye_mat.clone()),
+                                Transform::from_translation(Vec3::new(-Z_EYE_X, Z_EYE_Y, Z_EYE_Z))
+                                    .with_scale(Vec3::splat(Z_EYE_S)),
+                            ));
+                            body.spawn((
+                                Mesh3d(cube.clone()),
+                                MeshMaterial3d(eye_mat),
+                                Transform::from_translation(Vec3::new(Z_EYE_X, Z_EYE_Y, Z_EYE_Z))
+                                    .with_scale(Vec3::splat(Z_EYE_S)),
+                            ));
+                        }
+
+                        left_leg = limb_pivot(
+                            body,
+                            cube.clone(),
+                            mat.clone(),
+                            Vec3::new(-LEG_X, LEG_JOINT_Y, 0.0),
+                            LEG_W,
+                            LEG_LEN,
+                        );
+                        right_leg = limb_pivot(
+                            body,
+                            cube.clone(),
+                            mat.clone(),
+                            Vec3::new(LEG_X, LEG_JOINT_Y, 0.0),
+                            LEG_W,
+                            LEG_LEN,
+                        );
+                        left_arm = limb_pivot(
+                            body,
+                            cube.clone(),
+                            mat.clone(),
+                            Vec3::new(-ARM_X, ARM_JOINT_Y, 0.0),
+                            arm_w,
+                            arm_len,
+                        );
+                        right_arm = limb_pivot(
+                            body,
+                            cube.clone(),
+                            mat.clone(),
+                            Vec3::new(ARM_X, ARM_JOINT_Y, 0.0),
+                            arm_w,
+                            arm_len,
+                        );
+                    })
+                    .id();
+                body_e = body_id;
             })
             .id();
-        body_e = body_id;
+        detailed_e = detailed_id;
     });
 
     HumanoidRig {
@@ -376,6 +531,9 @@ pub fn attach_humanoid(
         right_arm,
         left_leg,
         right_leg,
+        detailed: detailed_e,
+        impostor: impostor_e,
+        body_parts,
         phase: 0.0,
         phase_offset: phase_offset_for_id(id_for_phase),
         speed: 0.0,
@@ -383,6 +541,7 @@ pub fn attach_humanoid(
         kind: kind_or_slot,
         is_zombie,
         attacking: false,
+        lod: AnimLod::Full,
     }
 }
 
@@ -417,18 +576,29 @@ pub struct RigPose {
     pub right_arm_x: f32,
     pub left_leg_x: f32,
     pub right_leg_x: f32,
+    /// Root uniform scale multiplier (telegraph pulse).
+    pub root_scale: f32,
+    /// Whether limb joint rotations should be written this frame.
+    pub write_limbs: bool,
 }
 
 /// Advance walk-cycle state from interpolated root position; return joint pose.
-pub fn compute_rig_pose(rig: &mut HumanoidRig, pos: Vec3, dt: f32) -> RigPose {
-    if let Some(prev) = rig.last_pos {
-        let raw = Vec3::new(pos.x - prev.x, 0.0, pos.z - prev.z).length() / dt.max(1e-4);
-        let target = raw.min(9.0);
-        // Low-pass so interp jitter doesn't stutter the gait.
-        let ease = (dt * 12.0).min(1.0);
-        rig.speed += (target - rig.speed) * ease;
+///
+/// `lod` selects how much work to do (Full / Bob / Static). Bob still advances
+/// phase for continuity when the zombie re-enters Full range.
+pub fn compute_rig_pose(rig: &mut HumanoidRig, pos: Vec3, dt: f32, lod: AnimLod) -> RigPose {
+    rig.lod = lod;
+
+    if lod != AnimLod::Static {
+        if let Some(prev) = rig.last_pos {
+            let raw = Vec3::new(pos.x - prev.x, 0.0, pos.z - prev.z).length() / dt.max(1e-4);
+            let target = raw.min(9.0);
+            // Low-pass so interp jitter doesn't stutter the gait.
+            let ease = (dt * 12.0).min(1.0);
+            rig.speed += (target - rig.speed) * ease;
+        }
+        rig.last_pos = Some(pos);
     }
-    rig.last_pos = Some(pos);
 
     let kind = if rig.is_zombie { rig.kind } else { 0 };
     let cadence = if rig.is_zombie {
@@ -437,11 +607,29 @@ pub fn compute_rig_pose(rig: &mut HumanoidRig, pos: Vec3, dt: f32) -> RigPose {
         1.1 // survivors: subtle, slightly snappy gait
     };
 
-    if rig.speed > 0.25 {
+    if lod != AnimLod::Static && rig.speed > 0.25 {
         rig.phase += rig.speed * dt * 2.4 * cadence;
     }
 
     let walk_phase = rig.phase + rig.phase_offset;
+    let root_scale = if rig.is_zombie {
+        telegraph_scale_pulse(rig.attacking, walk_phase)
+    } else {
+        1.0
+    };
+
+    if lod == AnimLod::Static {
+        return RigPose {
+            body_y: 0.0,
+            left_arm_x: 0.0,
+            right_arm_x: 0.0,
+            left_leg_x: 0.0,
+            right_leg_x: 0.0,
+            root_scale,
+            write_limbs: false,
+        };
+    }
+
     let swing = if rig.speed > 0.35 {
         1.0
     } else {
@@ -450,6 +638,24 @@ pub fn compute_rig_pose(rig: &mut HumanoidRig, pos: Vec3, dt: f32) -> RigPose {
 
     // Survivor walks are subtler.
     let survivor_scale = if rig.is_zombie { 1.0 } else { 0.55 };
+
+    let bob = if rig.speed > 0.35 {
+        walk_phase.sin().abs() * 0.04 * swing * survivor_scale
+    } else {
+        0.0
+    };
+
+    if lod == AnimLod::Bob {
+        return RigPose {
+            body_y: bob,
+            left_arm_x: 0.0,
+            right_arm_x: 0.0,
+            left_leg_x: 0.0,
+            right_leg_x: 0.0,
+            root_scale,
+            write_limbs: false,
+        };
+    }
 
     let leg_l = limb_swing_angle(walk_phase, rig.speed, kind, 1.0) * swing * survivor_scale;
     let leg_r = limb_swing_angle(walk_phase, rig.speed, kind, -1.0) * swing * survivor_scale;
@@ -463,18 +669,54 @@ pub fn compute_rig_pose(rig: &mut HumanoidRig, pos: Vec3, dt: f32) -> RigPose {
         )
     };
 
-    let bob = if rig.speed > 0.35 {
-        walk_phase.sin().abs() * 0.04 * swing * survivor_scale
-    } else {
-        0.0
-    };
-
     RigPose {
         body_y: bob,
         left_arm_x: arm_l,
         right_arm_x: arm_r,
         left_leg_x: leg_l,
         right_leg_x: leg_r,
+        root_scale,
+        write_limbs: true,
+    }
+}
+
+/// Apply unique flash materials; returns restore list for [`HitFlash`].
+pub fn apply_hit_flash_materials(
+    materials: &mut Assets<StandardMaterial>,
+    body_parts: &[Entity],
+    mesh_mats: &mut Query<&mut MeshMaterial3d<StandardMaterial>>,
+) -> Vec<(Entity, Handle<StandardMaterial>)> {
+    let mut restore = Vec::with_capacity(body_parts.len());
+    for &e in body_parts {
+        let Ok(mut mesh_mat) = mesh_mats.get_mut(e) else {
+            continue;
+        };
+        let original = mesh_mat.0.clone();
+        let flash = materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 1.0, 1.0),
+            emissive: LinearRgba::rgb(5.0, 5.0, 5.0),
+            perceptual_roughness: 0.55,
+            metallic: 0.0,
+            ..default()
+        });
+        mesh_mat.0 = flash;
+        restore.push((e, original));
+    }
+    restore
+}
+
+/// Restore shared materials after a hit flash; remove unique handles.
+pub fn end_hit_flash(
+    materials: &mut Assets<StandardMaterial>,
+    flash: &HitFlash,
+    mesh_mats: &mut Query<&mut MeshMaterial3d<StandardMaterial>>,
+) {
+    for (e, original) in &flash.restore {
+        if let Ok(mut mesh_mat) = mesh_mats.get_mut(*e) {
+            // Drop the unique flash handle by swapping back to shared.
+            let old = std::mem::replace(&mut mesh_mat.0, original.clone());
+            materials.remove(old.id());
+        }
     }
 }
 
@@ -693,29 +935,49 @@ mod tests {
         assert!((b.x - 1.5).abs() < 1e-5);
         assert!(b.y > 1.0);
 
-        // Colors differ across kinds
+        // Colors differ across kinds (boosted contrast)
         let c0 = kind_color(0).to_srgba();
         let c1 = kind_color(1).to_srgba();
         let c2 = kind_color(2).to_srgba();
         assert!(
-            (c0.red - c1.red).abs() + (c0.green - c1.green).abs() > 0.05,
-            "walker vs runner colours should differ"
+            (c0.red - c1.red).abs() + (c0.green - c1.green).abs() > 0.12,
+            "walker vs runner colours should differ strongly"
         );
         assert!(
-            (c0.red - c2.red).abs() + (c0.green - c2.green).abs() > 0.05,
-            "walker vs brute colours should differ"
+            (c0.red - c2.red).abs() + (c0.green - c2.green).abs() > 0.12,
+            "walker vs brute colours should differ strongly"
         );
 
         // Cadence: runner > walker > brute
         assert!(kind_cadence(1) > kind_cadence(0));
         assert!(kind_cadence(0) > kind_cadence(2));
 
-        // Total over kinds 0/1/2: scales and colours all defined (no panic)
+        // Silhouette tables total per kind and stay distinct
+        let mut head_sum = 0.0f32;
+        let mut arm_sum = 0.0f32;
         for k in 0u8..3 {
             let _ = kind_scale(k);
             let _ = kind_color(k);
             let _ = kind_cadence(k);
+            let (h, a) = silhouette_scale_table(k);
+            assert!(h > 0.5 && a > 0.5, "silhouette scales positive");
+            head_sum += h;
+            arm_sum += a;
         }
+        assert!(head_sum > 3.0 && arm_sum > 3.0);
+        assert!((silhouette_scale_table(2).0 - silhouette_scale_table(0).0).abs() > 0.1);
+    }
+
+    #[test]
+    fn telegraph_and_lod_tables() {
+        assert!((telegraph_scale_pulse(false, 0.0) - 1.0).abs() < 1e-5);
+        let p = telegraph_scale_pulse(true, 0.5);
+        assert!((1.0..=1.12).contains(&p), "telegraph pulse in range, got {p}");
+
+        assert_eq!(anim_lod_for_distance(10.0), AnimLod::Full);
+        assert_eq!(anim_lod_for_distance(LOD_FULL_M), AnimLod::Full);
+        assert_eq!(anim_lod_for_distance(LOD_FULL_M + 1.0), AnimLod::Bob);
+        assert_eq!(anim_lod_for_distance(LOD_BOB_M + 1.0), AnimLod::Static);
     }
 
     #[test]

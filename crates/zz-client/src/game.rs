@@ -18,7 +18,8 @@ use zz_core::types::{Body, PlayerInput};
 
 use crate::map_render::CurrentMap;
 use crate::models::{
-    self, CrumpleFx, HumanoidRig, RigAssets, Viewmodel, GROWL_RANGE,
+    self, AnimLod, CrumpleFx, HitFlash, HumanoidRig, RigAssets, Viewmodel, GROWL_RANGE,
+    HIT_FLASH_S, LOD_FULL_CAP, LOD_FULL_M,
 };
 use crate::net::{NetClient, NetEvent};
 use crate::platform;
@@ -57,6 +58,8 @@ impl Plugin for GamePlugin {
             .insert_resource(PrevSelf::default())
             .insert_resource(ViewmodelKick::default())
             .insert_resource(GrowlMemory::default())
+            .insert_resource(CameraNudge::default())
+            .insert_resource(PendingHitFlashes::default())
             .configure_sets(Update, GameSessionSet)
             .add_systems(
                 Update,
@@ -71,10 +74,13 @@ impl Plugin for GamePlugin {
                     apply_camera.run_if(in_match),
                     interpolate_remotes.run_if(playing),
                     animate_rigs.run_if(playing),
+                    apply_pending_hit_flashes.run_if(playing),
+                    tick_hit_flashes.run_if(playing),
                     tick_crumples.run_if(in_match),
                     ensure_viewmodel.run_if(in_match),
                     tick_viewmodel_sys.run_if(playing),
                     proximity_growls.run_if(playing),
+                    hide_horde_on_ended,
                     cleanup_match_visuals,
                 )
                     .chain()
@@ -229,6 +235,19 @@ struct ViewmodelKick {
     pending: u32,
 }
 
+/// Tiny camera kick when own hits land (decays each frame).
+#[derive(Resource, Default)]
+pub struct CameraNudge {
+    /// Current kick magnitude (metres / radians mixed via axes).
+    pub amount: f32,
+}
+
+/// Shot endpoints that need a zombie hit flash this frame (from net_poll).
+#[derive(Resource, Default)]
+struct PendingHitFlashes {
+    ends: Vec<Vec3>,
+}
+
 /// Last half-second growl bucket we already fired for, so each (id, bucket)
 /// yields at most one growl (not one per frame while the hash is hot).
 #[derive(Resource, Default)]
@@ -280,6 +299,8 @@ fn net_poll(
     mut seams: SeamWrites,
     mut vm_kick: ResMut<ViewmodelKick>,
     mut voice_rx: ResMut<VoiceRx>,
+    mut hit_flashes: ResMut<PendingHitFlashes>,
+    mut cam_nudge: ResMut<CameraNudge>,
 ) {
     // one-time shared rig mesh/material bank
     if assets.is_none() {
@@ -436,6 +457,11 @@ fn net_poll(
                         seams.sfx.0.push_back(crate::seams::Sfx::KillConfirm {
                             headshot: s.hit_kind == 3,
                         });
+                    }
+                    // Zombie white flash + camera nudge on own hits landing.
+                    if from_me && s.hit_kind >= 1 {
+                        hit_flashes.ends.push(end);
+                        cam_nudge.amount = (cam_nudge.amount + 0.045).min(0.12);
                     }
                 }
                 for b in &snap.booms {
@@ -807,11 +833,14 @@ fn fps_controller(
 fn apply_camera(
     time: Res<Time>,
     mut predicted: ResMut<Predicted>,
+    mut nudge: ResMut<CameraNudge>,
     mut cam: Query<&mut Transform, With<Camera3d>>,
 ) {
     // exponential decay of the correction offset
     let k = (0.5f32).powf(time.delta_secs() / ERROR_HALF_LIFE_S);
     predicted.error_offset *= k;
+    // Hit-land camera kick decays quickly (not a full screen shake).
+    nudge.amount = (nudge.amount - time.delta_secs() * 0.55).max(0.0);
 
     let Ok(mut tf) = cam.single_mut() else { return };
     let eye = Vec3::new(
@@ -819,8 +848,15 @@ fn apply_camera(
         predicted.body.y + PLAYER_EYE,
         predicted.body.z,
     ) + predicted.error_offset;
-    tf.translation = eye;
-    tf.rotation = Quat::from_euler(EulerRot::YXZ, predicted.yaw, predicted.pitch, 0.0);
+    // Subtle vertical + yaw nudge when own hits land.
+    let n = nudge.amount;
+    tf.translation = eye + Vec3::new(0.0, n * 0.35, 0.0);
+    tf.rotation = Quat::from_euler(
+        EulerRot::YXZ,
+        predicted.yaw + n * 0.08,
+        predicted.pitch - n * 0.12,
+        0.0,
+    );
 }
 
 // ── remote interpolation ───────────────────────────────────────────────────
@@ -876,12 +912,20 @@ fn angle_lerp(a: f32, b: f32, k: f32) -> f32 {
 
 /// Sync attack telegraph from snapshot state, then pose limbs from motion.
 ///
+/// Animation LOD: full limb cycle for the nearest [`LOD_FULL_CAP`] zombies
+/// within [`LOD_FULL_M`]; bob-only to 80 m; single-cuboid impostor beyond.
+/// Shared mesh/material handles stay batched (see `RigAssets`).
+///
 /// Root transforms (on Remote*) and joint transforms (body/limb pivots) are
 /// disjoint via Without filters, so both queries can coexist.
 #[allow(clippy::type_complexity)]
 fn animate_rigs(
     time: Res<Time>,
-    mut zombies: Query<(&RemoteZombie, &Transform, &mut HumanoidRig), Without<RemotePlayer>>,
+    cam: Query<&Transform, (With<Camera3d>, Without<RemoteZombie>, Without<RemotePlayer>)>,
+    mut zombies: Query<
+        (Entity, &RemoteZombie, &mut Transform, &mut HumanoidRig),
+        Without<RemotePlayer>,
+    >,
     mut players: Query<
         (&Transform, &mut HumanoidRig),
         (With<RemotePlayer>, Without<RemoteZombie>),
@@ -892,19 +936,65 @@ fn animate_rigs(
             Without<RemotePlayer>,
             Without<RemoteZombie>,
             Without<HumanoidRig>,
+            Without<Camera3d>,
         ),
     >,
+    mut vis_q: Query<&mut Visibility, Without<HumanoidRig>>,
 ) {
     let dt = time.delta_secs().max(1e-4);
+    let cam_pos = cam
+        .single()
+        .map(|t| t.translation)
+        .unwrap_or(Vec3::ZERO);
 
-    for (rz, tf, mut rig) in zombies.iter_mut() {
+    // Rank zombies by distance; only the nearest LOD_FULL_CAP get Full limbs.
+    let mut ranked: Vec<(Entity, f32)> = zombies
+        .iter()
+        .map(|(e, _, tf, _)| {
+            let d = tf.translation.distance(cam_pos);
+            (e, d)
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let full_set: HashSet<Entity> = ranked
+        .iter()
+        .filter(|(_, d)| *d <= LOD_FULL_M)
+        .take(LOD_FULL_CAP)
+        .map(|(e, _)| *e)
+        .collect();
+
+    for (e, rz, mut tf, mut rig) in zombies.iter_mut() {
         rig.attacking = rz.state == 1;
-        let pose = models::compute_rig_pose(&mut rig, tf.translation, dt);
+        let dist = tf.translation.distance(cam_pos);
+        let mut lod = models::anim_lod_for_distance(dist);
+        if lod == AnimLod::Full && !full_set.contains(&e) {
+            lod = AnimLod::Bob;
+        }
+        // Impostor swap for Static: one cuboid vs full joint tree.
+        let use_impostor = lod == AnimLod::Static;
+        if let Ok(mut v) = vis_q.get_mut(rig.detailed) {
+            *v = if use_impostor {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            };
+        }
+        if let Ok(mut v) = vis_q.get_mut(rig.impostor) {
+            *v = if use_impostor {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+        }
+
+        let base_scale = models::kind_scale(rz.kind);
+        let pose = models::compute_rig_pose(&mut rig, tf.translation, dt, lod);
+        tf.scale = base_scale * pose.root_scale;
         apply_joint_pose(&mut joints, &rig, pose);
     }
     for (tf, mut rig) in players.iter_mut() {
         rig.attacking = false;
-        let pose = models::compute_rig_pose(&mut rig, tf.translation, dt);
+        let pose = models::compute_rig_pose(&mut rig, tf.translation, dt, AnimLod::Full);
         apply_joint_pose(&mut joints, &rig, pose);
     }
 }
@@ -917,13 +1007,24 @@ fn apply_joint_pose(
             Without<RemotePlayer>,
             Without<RemoteZombie>,
             Without<HumanoidRig>,
+            Without<Camera3d>,
         ),
     >,
     rig: &HumanoidRig,
     pose: models::RigPose,
 ) {
     if let Ok(mut body) = joints.get_mut(rig.body) {
+        // Preserve zombie hunch pitch; only bob Y.
+        let hunch = if rig.is_zombie {
+            Quat::from_rotation_x(models::ZOMBIE_HUNCH_PITCH)
+        } else {
+            Quat::IDENTITY
+        };
         body.translation.y = pose.body_y;
+        body.rotation = hunch;
+    }
+    if !pose.write_limbs {
+        return;
     }
     for (e, angle) in [
         (rig.left_arm, pose.left_arm_x),
@@ -934,6 +1035,79 @@ fn apply_joint_pose(
         if let Ok(mut tf) = joints.get_mut(e) {
             tf.rotation = Quat::from_rotation_x(angle);
         }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn apply_pending_hit_flashes(
+    mut commands: Commands,
+    mut pending: ResMut<PendingHitFlashes>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    zombies: Query<(Entity, &Transform, &HumanoidRig), (With<RemoteZombie>, Without<HitFlash>)>,
+    mut mesh_mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
+) {
+    if pending.ends.is_empty() {
+        return;
+    }
+    let ends = std::mem::take(&mut pending.ends);
+    for end in ends {
+        // Nearest zombie to the shot endpoint (body/head hit sphere area).
+        let mut best: Option<(Entity, f32, &HumanoidRig)> = None;
+        for (e, tf, rig) in zombies.iter() {
+            let d = tf.translation.distance(end);
+            if d > 2.5 {
+                continue;
+            }
+            if best.is_none_or(|(_, bd, _)| d < bd) {
+                best = Some((e, d, rig));
+            }
+        }
+        let Some((e, _, rig)) = best else {
+            continue;
+        };
+        let restore =
+            models::apply_hit_flash_materials(&mut materials, &rig.body_parts, &mut mesh_mats);
+        if !restore.is_empty() {
+            commands.entity(e).insert(HitFlash { age: 0.0, restore });
+        }
+    }
+}
+
+fn tick_hit_flashes(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut q: Query<(Entity, &mut HitFlash)>,
+    mut mesh_mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
+) {
+    let dt = time.delta_secs();
+    for (e, mut flash) in q.iter_mut() {
+        flash.age += dt;
+        if flash.age >= HIT_FLASH_S {
+            models::end_hit_flash(&mut materials, &flash, &mut mesh_mats);
+            commands.entity(e).remove::<HitFlash>();
+        }
+    }
+}
+
+/// On OVERRUN, hide the horde so the stats card stays cheap (no 200-rig drain).
+fn hide_horde_on_ended(
+    session: Res<Session>,
+    mut zombies: Query<&mut Visibility, (With<RemoteZombie>, Without<RemotePlayer>)>,
+    mut players: Query<&mut Visibility, (With<RemotePlayer>, Without<RemoteZombie>)>,
+) {
+    if !session.is_changed() {
+        return;
+    }
+    let hide = matches!(*session, Session::Ended { .. });
+    if !hide {
+        return;
+    }
+    for mut v in zombies.iter_mut() {
+        *v = Visibility::Hidden;
+    }
+    for mut v in players.iter_mut() {
+        *v = Visibility::Hidden;
     }
 }
 

@@ -23,8 +23,12 @@ use crate::voice::VoiceState;
 // ── timing / layout constants ──────────────────────────────────────────────
 
 const CROSSHAIR_FLASH_S: f32 = 0.120;
-const VIGNETTE_PEAK: f32 = 0.35;
-const VIGNETTE_DECAY_S: f32 = 0.5;
+/// Absolute ceiling on edge vignette alpha — NEVER a full-frame opaque wash.
+const VIGNETTE_MAX: f32 = 0.55;
+/// Fast decay so a graze is a pulse, not a linger.
+const VIGNETTE_DECAY_S: f32 = 0.28;
+/// Edge strip thickness as a fraction of the short viewport axis.
+const VIGNETTE_EDGE_FRAC: f32 = 0.14;
 const TRACER_LIFE_S: f32 = 0.080;
 const SPARK_LIFE_S: f32 = 0.150;
 const BOOM_LIFE_S: f32 = 0.350;
@@ -245,6 +249,10 @@ struct TeammateDeadMark;
 
 #[derive(Component)]
 struct VignetteNode;
+
+/// One of four edge strips under [`VignetteNode`].
+#[derive(Component)]
+struct VignetteEdge;
 
 #[derive(Component)]
 struct PausedOverlay;
@@ -512,22 +520,77 @@ fn setup_hud_ui(mut commands: Commands) {
         Visibility::Hidden,
     ));
 
-    // Damage vignette — full-screen, non-interactive.
-    commands.spawn((
-        VignetteNode,
-        Node {
-            position_type: PositionType::Absolute,
-            width: percent(100),
-            height: percent(100),
-            left: px(0),
-            top: px(0),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.85, 0.05, 0.05, 0.0)),
-        bevy::ui::FocusPolicy::Pass,
-        GlobalZIndex(10),
-        Visibility::Hidden,
-    ));
+    // Damage vignette — EDGE ONLY (four strips). Never a full-frame wash.
+    // Parent is layout-only; children carry the red. FocusPolicy::Pass so
+    // clicks fall through (README item 22).
+    commands
+        .spawn((
+            VignetteNode,
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100),
+                height: percent(100),
+                left: px(0),
+                top: px(0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
+            bevy::ui::FocusPolicy::Pass,
+            GlobalZIndex(10),
+            Visibility::Hidden,
+        ))
+        .with_children(|p| {
+            let strip = |w: Val, h: Val, left: Val, top: Val, right: Val, bottom: Val| {
+                (
+                    VignetteEdge,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: w,
+                        height: h,
+                        left,
+                        top,
+                        right,
+                        bottom,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.9, 0.05, 0.05, 0.0)),
+                    bevy::ui::FocusPolicy::Pass,
+                )
+            };
+            // Top / bottom full width; left / right between the horizontal strips.
+            p.spawn(strip(
+                percent(100),
+                percent(VIGNETTE_EDGE_FRAC * 100.0),
+                px(0),
+                px(0),
+                Val::Auto,
+                Val::Auto,
+            ));
+            p.spawn(strip(
+                percent(100),
+                percent(VIGNETTE_EDGE_FRAC * 100.0),
+                px(0),
+                Val::Auto,
+                Val::Auto,
+                px(0),
+            ));
+            p.spawn(strip(
+                percent(VIGNETTE_EDGE_FRAC * 100.0),
+                percent(100.0 - VIGNETTE_EDGE_FRAC * 200.0),
+                px(0),
+                percent(VIGNETTE_EDGE_FRAC * 100.0),
+                Val::Auto,
+                Val::Auto,
+            ));
+            p.spawn(strip(
+                percent(VIGNETTE_EDGE_FRAC * 100.0),
+                percent(100.0 - VIGNETTE_EDGE_FRAC * 200.0),
+                Val::Auto,
+                percent(VIGNETTE_EDGE_FRAC * 100.0),
+                px(0),
+                Val::Auto,
+            ));
+        });
 
     // Paused overlay.
     commands
@@ -581,7 +644,8 @@ fn setup_hud_ui(mut commands: Commands) {
             ));
         });
 
-    // Stats overlay (Session::Ended).
+    // Stats overlay (Session::Ended): gentle desat tint + centered card.
+    // Avoid a near-opaque full-frame wash (FPS drain + "corrupt bands" look).
     commands
         .spawn((
             StatsRoot,
@@ -594,58 +658,74 @@ fn setup_hud_ui(mut commands: Commands) {
                 flex_direction: FlexDirection::Column,
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
-                row_gap: px(12),
                 padding: UiRect::all(px(24)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.02, 0.02, 0.04, 0.92)),
+            // Soft cool desaturation — world still readable underneath.
+            BackgroundColor(Color::srgba(0.04, 0.05, 0.08, 0.42)),
             GlobalZIndex(50),
             Visibility::Hidden,
         ))
         .with_children(|p| {
             p.spawn((
-                Text::new("OVERRUN"),
-                mono(42.0),
-                TextColor(Color::srgb(0.95, 0.3, 0.22)),
-            ));
-            p.spawn((
-                StatsMatchLine,
-                Text::new(""),
-                mono(16.0),
-                TextColor(Color::srgb(0.8, 0.82, 0.78)),
-            ));
-            p.spawn((
-                StatsPlayerList,
                 Node {
                     flex_direction: FlexDirection::Column,
-                    row_gap: px(6),
-                    padding: UiRect::all(px(12)),
-                    min_width: px(420),
-                    ..default()
-                },
-                panel_bg(),
-            ));
-            p.spawn((
-                Button,
-                StatsBackButton,
-                StatsBackWasPressed(false),
-                Node {
-                    margin: UiRect::top(px(16)),
-                    padding: UiRect::axes(px(20), px(12)),
-                    border: UiRect::all(px(2)),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
+                    row_gap: px(12),
+                    padding: UiRect::all(px(28)),
+                    min_width: px(440),
+                    border: UiRect::all(px(2)),
                     ..default()
                 },
-                BorderColor::all(Color::srgb(0.7, 0.75, 0.55)),
-                BackgroundColor(Color::srgb(0.12, 0.14, 0.10)),
+                BackgroundColor(Color::srgba(0.06, 0.07, 0.09, 0.88)),
+                BorderColor::all(Color::srgb(0.55, 0.22, 0.18)),
             ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("[ BACK TO LOBBY ]"),
-                    mono(18.0),
-                    TextColor(Color::srgb(0.9, 0.95, 0.7)),
+            .with_children(|card| {
+                card.spawn((
+                    Text::new("OVERRUN"),
+                    mono(42.0),
+                    TextColor(Color::srgb(0.95, 0.3, 0.22)),
                 ));
+                card.spawn((
+                    StatsMatchLine,
+                    Text::new(""),
+                    mono(16.0),
+                    TextColor(Color::srgb(0.8, 0.82, 0.78)),
+                ));
+                card.spawn((
+                    StatsPlayerList,
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(6),
+                        padding: UiRect::all(px(12)),
+                        min_width: px(400),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.03, 0.04, 0.05, 0.65)),
+                ));
+                card.spawn((
+                    Button,
+                    StatsBackButton,
+                    StatsBackWasPressed(false),
+                    Node {
+                        margin: UiRect::top(px(8)),
+                        padding: UiRect::axes(px(20), px(12)),
+                        border: UiRect::all(px(2)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgb(0.7, 0.75, 0.55)),
+                    BackgroundColor(Color::srgb(0.12, 0.14, 0.10)),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        Text::new("[ BACK TO LOBBY ]"),
+                        mono(18.0),
+                        TextColor(Color::srgb(0.9, 0.95, 0.7)),
+                    ));
+                });
             });
         });
 }
@@ -1018,7 +1098,8 @@ fn update_vignette(
     session: Res<Session>,
     latest: Res<LatestSnapshot>,
     time: Res<Time>,
-    mut q: Query<(&mut BackgroundColor, &mut Visibility), With<VignetteNode>>,
+    mut root: Query<&mut Visibility, With<VignetteNode>>,
+    mut edges: Query<&mut BackgroundColor, With<VignetteEdge>>,
 ) {
     let Some(my_slot) = session_slot(&session) else {
         return;
@@ -1029,19 +1110,27 @@ fn update_vignette(
         if let Some(prev) = local.prev_health
             && me.health < prev
         {
-            local.vignette = VIGNETTE_PEAK;
+            let dmg = f32::from(prev.saturating_sub(me.health));
+            // Stack lightly if multi-hit; never exceed VIGNETTE_MAX.
+            let peak = vignette_intensity(dmg, me.health);
+            local.vignette = (local.vignette + peak).min(VIGNETTE_MAX);
         }
         local.prev_health = Some(me.health);
     }
     local.vignette = vignette_decay(local.vignette, time.delta_secs(), VIGNETTE_DECAY_S);
 
-    for (mut bg, mut vis) in &mut q {
-        *vis = if local.vignette > 0.001 {
+    let show = local.vignette > 0.001;
+    for mut vis in &mut root {
+        *vis = if show {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
-        *bg = BackgroundColor(Color::srgba(0.85, 0.05, 0.05, local.vignette));
+    }
+    // Edge strips only — parent stays fully transparent (no full-frame wash).
+    let a = local.vignette;
+    for mut bg in &mut edges {
+        *bg = BackgroundColor(Color::srgba(0.9, 0.05, 0.05, a));
     }
 }
 
@@ -1489,12 +1578,32 @@ pub(crate) fn accuracy_pct(hits: u32, shots_fired: u32) -> f32 {
     }
 }
 
-/// Linear decay of vignette alpha toward 0 over `decay_s` seconds from peak.
+/// Peak edge-vignette alpha from a single hit.
+///
+/// - Proportional to damage taken (2 HP graze → subtle ~0.04).
+/// - Stronger only when health is under 30 (critical pulse).
+/// - Always bounded by [`VIGNETTE_MAX`]; never a full-frame opaque wash.
+pub(crate) fn vignette_intensity(damage: f32, health_after: u8) -> f32 {
+    let dmg = damage.max(0.0);
+    // Soft curve: 2 dmg ≈ 0.04, 10 dmg ≈ 0.12, 25 dmg ≈ 0.22
+    let from_dmg = (dmg / MAX_HEALTH as f32).clamp(0.0, 1.0).powf(0.75) * 0.50;
+    let hp = f32::from(health_after);
+    let from_hp = if hp < 30.0 {
+        // Ramp 0 at 30 HP → +0.28 at 0 HP
+        (1.0 - hp / 30.0) * 0.28
+    } else {
+        0.0
+    };
+    (from_dmg + from_hp).clamp(0.0, VIGNETTE_MAX)
+}
+
+/// Linear decay of vignette alpha toward 0. Rate is absolute (α per second
+/// of full [`VIGNETTE_MAX`]), so small pulses vanish quickly.
 pub(crate) fn vignette_decay(current: f32, dt: f32, decay_s: f32) -> f32 {
     if decay_s <= 0.0 || current <= 0.0 {
         return 0.0;
     }
-    (current - (VIGNETTE_PEAK / decay_s) * dt).max(0.0)
+    (current - (VIGNETTE_MAX / decay_s) * dt).max(0.0)
 }
 
 /// Thin cuboid from `from` to `to`: Z-axis aligned with the segment, unit cube scaled.
@@ -1530,13 +1639,45 @@ mod tests {
     }
 
     #[test]
+    fn vignette_intensity_bounded_and_monotonic() {
+        // Graze: 2 HP on full health is subtle edge-only.
+        let graze = vignette_intensity(2.0, 98);
+        assert!(graze > 0.0 && graze < 0.10, "graze too strong: {graze}");
+
+        // Bigger hit → higher peak (same remaining health).
+        let mid = vignette_intensity(10.0, 90);
+        let big = vignette_intensity(25.0, 75);
+        assert!(mid > graze, "damage should increase intensity");
+        assert!(big > mid);
+
+        // Low HP amplifies.
+        let critical = vignette_intensity(2.0, 15);
+        assert!(critical > graze, "low HP should strengthen vignette");
+
+        // Absolute bound.
+        for dmg in [0.0_f32, 1.0, 2.0, 10.0, 50.0, 100.0, 200.0] {
+            for hp in [0u8, 15, 29, 30, 50, 100] {
+                let a = vignette_intensity(dmg, hp);
+                assert!((0.0..=VIGNETTE_MAX).contains(&a), "alpha {a} out of bounds");
+            }
+        }
+
+        // Zero damage → only HP contribution (none at full health).
+        assert!(vignette_intensity(0.0, 100) < 1e-5);
+    }
+
+    #[test]
     fn vignette_decays_linearly() {
-        let v0 = VIGNETTE_PEAK;
+        let v0 = VIGNETTE_MAX;
         let half = vignette_decay(v0, VIGNETTE_DECAY_S * 0.5, VIGNETTE_DECAY_S);
-        assert!((half - VIGNETTE_PEAK * 0.5).abs() < 1e-4);
+        assert!((half - VIGNETTE_MAX * 0.5).abs() < 1e-4);
         let done = vignette_decay(v0, VIGNETTE_DECAY_S, VIGNETTE_DECAY_S);
         assert!(done <= 1e-5);
         assert_eq!(vignette_decay(0.0, 0.1, VIGNETTE_DECAY_S), 0.0);
+        // Small pulses clear in well under a second.
+        let graze = vignette_intensity(2.0, 98);
+        let after = vignette_decay(graze, 0.2, VIGNETTE_DECAY_S);
+        assert!(after < graze * 0.5 || after < 0.02);
     }
 
     #[test]
