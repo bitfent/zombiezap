@@ -212,6 +212,10 @@ mod tests {
             windup_left: 0,
             cooldown_left: 0,
             target_slot: 0,
+            from_wave: true,
+            flank_xz: None,
+            smash_cooldown: 0,
+            frenzy: false,
         }
     }
 

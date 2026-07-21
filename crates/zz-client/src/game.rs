@@ -57,6 +57,7 @@ impl Plugin for GamePlugin {
             .insert_resource(crate::seams::FxQueue::default())
             .insert_resource(crate::seams::SfxQueue::default())
             .insert_resource(crate::seams::Roster::default())
+            .insert_resource(crate::seams::WaveUi::default())
             // M19 HTML-first boot handoff (also used headless when LobbyUi is absent).
             .init_resource::<crate::seams::HtmlBoot>()
             .insert_resource(MyId::default())
@@ -89,6 +90,7 @@ impl Plugin for GamePlugin {
                     ensure_viewmodel.run_if(in_match),
                     tick_viewmodel_sys.run_if(playing),
                     proximity_growls.run_if(playing),
+                    horde_bed_audio.run_if(playing),
                     hide_horde_on_ended,
                     cleanup_match_visuals,
                 )
@@ -246,8 +248,10 @@ impl RemotePlayer {
 pub struct RemoteZombie {
     pub id: u16,
     pub kind: u8,
-    /// Snapshot attack state (1 = telegraph / windup).
+    /// Snapshot attack state (1 = telegraph / windup). Low 7 bits only.
     pub state: u8,
+    /// Frenzy walker (wire high bit on state) — brighter eyes / tint.
+    pub frenzy: bool,
     buf: VecDeque<(f64, Vec3, f32)>,
 }
 
@@ -258,6 +262,7 @@ impl RemoteZombie {
             id,
             kind,
             state: 0,
+            frenzy: false,
             buf: VecDeque::new(),
         }
     }
@@ -332,6 +337,7 @@ struct SeamWrites<'w> {
     sfx: ResMut<'w, crate::seams::SfxQueue>,
     prev_self: ResMut<'w, PrevSelf>,
     roster: ResMut<'w, crate::seams::Roster>,
+    wave_ui: ResMut<'w, crate::seams::WaveUi>,
 }
 
 // ── connection + message flow ──────────────────────────────────────────────
@@ -471,6 +477,7 @@ fn net_poll(
                 seams.latest.0 = None;
                 seams.last_stats.0 = None;
                 seams.fx.0.clear();
+                *seams.wave_ui = crate::seams::WaveUi::default();
                 // Insert immediately so same-frame Snaps (and fps_controller
                 // on the next system) see walls — commands.apply is end-of-stage.
                 commands.insert_resource(CurrentMap(generate_map(env, &map_seed)));
@@ -507,6 +514,69 @@ fn net_poll(
                 if let Some(slot) = session.my_slot() {
                     *session = Session::Ended { my_slot: slot };
                 }
+            }
+            NetEvent::Msg(ServerMsg::WaveStart { wave }) => {
+                if !matches!(*session, Session::Playing { .. }) {
+                    continue;
+                }
+                seams.wave_ui.wave = wave;
+                seams.wave_ui.banner = format!("WAVE {wave}");
+                seams.wave_ui.banner_timer = crate::seams::WAVE_BANNER_SEC;
+                seams.sfx.0.push_back(crate::seams::Sfx::WaveHorn);
+            }
+            NetEvent::Msg(ServerMsg::WaveClear { wave, .. }) => {
+                if !matches!(*session, Session::Playing { .. }) {
+                    continue;
+                }
+                seams.wave_ui.wave = wave;
+                seams.wave_ui.banner = "WAVE CLEAR".into();
+                seams.wave_ui.banner_timer = crate::seams::WAVE_BANNER_SEC;
+                seams.sfx.0.push_back(crate::seams::Sfx::WaveClearChime);
+            }
+            NetEvent::Msg(ServerMsg::SupplyDrop { id, x, z }) => {
+                if !matches!(*session, Session::Playing { .. }) {
+                    continue;
+                }
+                seams.wave_ui.drop_beacon = Some((x, z));
+                seams.wave_ui.drop_id = Some(id);
+            }
+            NetEvent::Msg(ServerMsg::CoverSmashed {
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+            }) => {
+                if !matches!(*session, Session::Playing { .. }) {
+                    continue;
+                }
+                let cx = (x0 + x1) * 0.5;
+                let cy = (y0 + y1) * 0.5;
+                let cz = (z0 + z1) * 0.5;
+                let he = Vec3::new(
+                    (x1 - x0).abs() * 0.5,
+                    (y1 - y0).abs() * 0.5,
+                    (z1 - z0).abs() * 0.5,
+                );
+                seams.fx.0.push_back(crate::seams::VisualEvent::CoverCrumble {
+                    pos: Vec3::new(cx, cy, cz),
+                    half_extents: he,
+                });
+                // Drop the AABB from CurrentMap so prediction + rebuild match.
+                commands.queue(move |world: &mut World| {
+                    let Some(mut current) = world.get_resource_mut::<CurrentMap>() else {
+                        return;
+                    };
+                    current.0.walls.retain(|w| {
+                        !((w.x0 - x0).abs() < 1e-3
+                            && (w.x1 - x1).abs() < 1e-3
+                            && (w.y0 - y0).abs() < 1e-3
+                            && (w.y1 - y1).abs() < 1e-3
+                            && (w.z0 - z0).abs() < 1e-3
+                            && (w.z1 - z1).abs() < 1e-3)
+                    });
+                });
             }
             NetEvent::Msg(ServerMsg::Error { message }) => {
                 warn!("server error: {message}");
@@ -560,9 +630,14 @@ fn net_poll(
                         seams.sfx.0.push_back(crate::seams::Sfx::HitConfirm);
                     }
                     if from_me && s.hit_kind >= 2 {
-                        seams.sfx.0.push_back(crate::seams::Sfx::KillConfirm {
-                            headshot: s.hit_kind == 3,
+                        let headshot = s.hit_kind == 3;
+                        seams.sfx.0.push_back(crate::seams::Sfx::KillConfirm { headshot });
+                        seams.fx.0.push_back(crate::seams::VisualEvent::KillPopup {
+                            pos: end,
+                            headshot,
                         });
+                        seams.wave_ui.combo = seams.wave_ui.combo.saturating_add(1);
+                        seams.wave_ui.combo_idle = 0.0;
                     }
                     // Zombie white flash + camera nudge on own hits landing.
                     if from_me && s.hit_kind >= 1 {
@@ -712,16 +787,20 @@ fn net_poll(
                     );
                     let yaw = dequant_yaw8(z.yaw);
                     let kind = z.kind.min(2);
+                    let frenzy = (z.state & zz_core::constants::ZS_FRENZY_BIT) != 0;
+                    let anim = z.state & !zz_core::constants::ZS_FRENZY_BIT;
                     if let Some((_, mut rz, _, _)) =
                         zombies.iter_mut().find(|(_, rz, _, _)| rz.id == z.id)
                     {
-                        rz.state = z.state;
+                        rz.state = anim;
+                        rz.frenzy = frenzy;
                         rz.kind = kind;
                         push_sample(&mut rz.buf, now, pos, yaw);
                     } else {
                         let scale = models::kind_scale(kind);
                         let mut rz = RemoteZombie::new(z.id, kind);
-                        rz.state = z.state;
+                        rz.state = anim;
+                        rz.frenzy = frenzy;
                         push_sample(&mut rz.buf, now, pos, yaw);
                         let mut ent = commands.spawn((
                             rz,
@@ -1084,9 +1163,11 @@ fn angle_lerp(a: f32, b: f32, k: f32) -> f32 {
 /// Root transforms (on Remote*) and joint transforms (body/limb pivots) are
 /// disjoint via Without filters, so both queries can coexist.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)] // Bevy system params
 fn animate_rigs(
     time: Res<Time>,
     mut metrics: ResMut<LodMetrics>,
+    assets: Option<Res<RigAssets>>,
     cam: Query<&Transform, (With<Camera3d>, Without<RemoteZombie>, Without<RemotePlayer>)>,
     mut zombies: Query<
         (Entity, &RemoteZombie, &mut Transform, &mut HumanoidRig),
@@ -1106,6 +1187,7 @@ fn animate_rigs(
         ),
     >,
     mut vis_q: Query<&mut Visibility, Without<HumanoidRig>>,
+    mut mats_q: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
     let dt = time.delta_secs().max(1e-4);
     let cam_pos = cam
@@ -1142,6 +1224,22 @@ fn animate_rigs(
     for (e, rz, mut tf, mut rig) in zombies.iter_mut() {
         roots += 1;
         rig.attacking = rz.state == 1;
+        if rig.frenzy != rz.frenzy {
+            rig.frenzy = rz.frenzy;
+            if let Some(assets) = assets.as_ref() {
+                let eye = if rz.frenzy {
+                    assets.eye_mat_frenzy.clone()
+                } else {
+                    assets.eye_mat.clone()
+                };
+                if let Ok(mut m) = mats_q.get_mut(rig.eye_l) {
+                    m.0 = eye.clone();
+                }
+                if let Ok(mut m) = mats_q.get_mut(rig.eye_r) {
+                    m.0 = eye;
+                }
+            }
+        }
         let prev_lod = rig.lod;
         let refreshing = rig.lod_refresh_in == LOD_DIST_PERIOD as u8;
         // Band changes only on distance refresh (hysteresis). Cap demotion is
@@ -1486,6 +1584,31 @@ fn local_combat_feedback(
     } else if fire_edge && me.ammo_mag == 0 && me.ammo_reserve > 0 && me.reload_ticks_left == 0 {
         // Auto-reload path — no dry click (reload clack will fire from snap).
     }
+}
+
+/// Distant horde bed: volume scales with live zombie count (capped).
+fn horde_bed_audio(
+    time: Res<Time>,
+    latest: Res<crate::seams::LatestSnapshot>,
+    mut sfx: ResMut<crate::seams::SfxQueue>,
+    mut last: Local<f32>,
+) {
+    let Some(snap) = latest.0.as_ref() else {
+        return;
+    };
+    let n = snap.zombies.len();
+    if n < 4 {
+        return;
+    }
+    // Re-trigger about every 0.55 s so the bed stitches without stacking hard.
+    let now = time.elapsed_secs();
+    if now - *last < 0.55 {
+        return;
+    }
+    *last = now;
+    // Cap pressure: 4 zeds ~0.08, 40+ ~0.4.
+    let volume = ((n as f32 - 3.0) / 50.0).clamp(0.05, 0.4);
+    sfx.0.push_back(crate::seams::Sfx::HordeBed { volume });
 }
 
 /// Nearby zombies growl occasionally (deterministic id+time hash, no rand).

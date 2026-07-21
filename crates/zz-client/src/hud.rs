@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
 
 use bevy::prelude::*;
-use bevy::text::FontSize;
+use bevy::text::{FontSize, LineBreak};
 use zz_core::constants::{MAX_HEALTH, PLAYER_EYE};
 use zz_core::snapshot::{Snapshot, WireLoot, WirePlayer, dequant_pos};
 
@@ -19,7 +19,9 @@ use crate::game::{self, Predicted, Session};
 use crate::models::{
     muzzle_world_from_camera, remote_muzzle_from_feet, viewmodel_muzzle_camera_offset,
 };
-use crate::seams::{FxQueue, LastStats, LatestSnapshot, Roster, UiIntent, UiQueue, VisualEvent};
+use crate::seams::{
+    FxQueue, LastStats, LatestSnapshot, Roster, UiIntent, UiQueue, VisualEvent, WaveUi,
+};
 use crate::touch::TouchIntent;
 use crate::voice::VoiceState;
 
@@ -38,6 +40,8 @@ const SPARK_LIFE_S: f32 = 0.200;
 const BOOM_LIFE_S: f32 = 0.350;
 const BOOM_R0: f32 = 0.5;
 const BOOM_R1: f32 = 4.0;
+const KILL_POPUP_LIFE_S: f32 = 0.85;
+const CRUMBLE_LIFE_S: f32 = 0.45;
 const EYE: f32 = PLAYER_EYE;
 const HEALTH_BAR_W: f32 = 200.0;
 const HEALTH_BAR_H: f32 = 14.0;
@@ -76,11 +80,21 @@ impl Plugin for HudPlugin {
                         update_paused_overlay,
                         update_death_banner,
                         update_mic_chip,
+                        update_wave_banner,
+                        update_combo,
+                        tick_wave_ui,
                     )
                         .run_if(playing),
                     (update_stats_overlay, stats_back_button).run_if(ended),
                     // FX only while playing — Ended freezes the world (S7).
-                    (drain_fx, tick_fx, sync_loot, sync_flight_grenades).run_if(playing),
+                    (
+                        drain_fx,
+                        tick_fx,
+                        sync_loot,
+                        sync_flight_grenades,
+                        sync_drop_beacon,
+                    )
+                        .run_if(playing),
                 ),
             );
     }
@@ -150,6 +164,8 @@ struct FxAssets {
     loot_health: Handle<StandardMaterial>,
     loot_health_band: Handle<StandardMaterial>,
     loot_grenade: Handle<StandardMaterial>,
+    loot_supply: Handle<StandardMaterial>,
+    drop_beacon: Handle<StandardMaterial>,
     flight_grenade: Handle<StandardMaterial>,
 }
 
@@ -177,6 +193,16 @@ fn setup_fx_assets(
         loot_health: materials.add(unlit(Color::srgb(0.85, 0.12, 0.12), AlphaMode::Opaque)),
         loot_health_band: materials.add(unlit(Color::srgb(0.95, 0.95, 0.95), AlphaMode::Opaque)),
         loot_grenade: materials.add(unlit(Color::srgb(0.45, 0.55, 0.18), AlphaMode::Opaque)),
+        loot_supply: materials.add(unlit(Color::srgb(0.25, 0.55, 0.95), AlphaMode::Opaque)),
+        drop_beacon: materials.add(StandardMaterial {
+            base_color: Color::srgba(0.3, 0.85, 1.0, 0.55),
+            emissive: LinearRgba::rgb(0.6, 2.4, 3.5),
+            unlit: true,
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 1.0,
+            metallic: 0.0,
+            ..default()
+        }),
         flight_grenade: materials.add(unlit(Color::srgb(0.12, 0.12, 0.10), AlphaMode::Opaque)),
     });
 }
@@ -280,7 +306,28 @@ struct ZombiesText;
 struct WaveText;
 
 #[derive(Component)]
+struct WaveBannerText;
+
+#[derive(Component)]
+struct ComboText;
+
+#[derive(Component)]
 struct TeammateList;
+
+#[derive(Component)]
+struct DropBeaconFx;
+
+#[derive(Component)]
+struct KillPopupFx {
+    age: f32,
+    start_y: f32,
+}
+
+#[derive(Component)]
+struct CrumbleFx {
+    age: f32,
+    mat: Handle<StandardMaterial>,
+}
 
 #[derive(Component)]
 struct TeammateRow {
@@ -586,7 +633,34 @@ fn setup_hud_ui(mut commands: Commands) {
                 mono(15.0),
                 TextColor(Color::srgb(0.7, 0.9, 0.95)),
             ));
+            p.spawn((
+                ComboText,
+                Text::new(""),
+                mono(14.0),
+                TextColor(Color::srgb(1.0, 0.75, 0.25)),
+            ));
         });
+
+    // Center wave banner (big retro "WAVE 3" / "WAVE CLEAR").
+    commands.spawn((
+        HudChrome,
+        WaveBannerText,
+        Text::new(""),
+        mono(48.0),
+        TextColor(Color::srgb(0.95, 0.2, 0.15)),
+        TextLayout::new(Justify::Center, LineBreak::NoWrap),
+        Node {
+            position_type: PositionType::Absolute,
+            top: percent(28.0),
+            width: percent(100.0),
+            height: px(56.0),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        GlobalZIndex(20),
+        Visibility::Hidden,
+    ));
 
     // Top-right: teammate rows.
     commands.spawn((
@@ -1105,7 +1179,8 @@ fn update_top_left(
     };
     let kills_n = my_player(snap, my_slot).map(|p| p.kills).unwrap_or(0);
     let zed_n = snap.zombies.len();
-    let wave_n = u16::from(snap.difficulty) + 1;
+    // Server difficulty is the wave number (1-indexed after WaveStart).
+    let wave_n = u16::from(snap.difficulty).max(1);
 
     for mut t in &mut kills {
         **t = format!("KILLS {kills_n}");
@@ -1115,6 +1190,48 @@ fn update_top_left(
     }
     for mut t in &mut wave {
         **t = format!("WAVE {wave_n}");
+    }
+}
+
+fn tick_wave_ui(time: Res<Time>, mut wave: ResMut<WaveUi>) {
+    let dt = time.delta_secs();
+    if wave.banner_timer > 0.0 {
+        wave.banner_timer = (wave.banner_timer - dt).max(0.0);
+        if wave.banner_timer <= 0.0 {
+            wave.banner.clear();
+        }
+    }
+    if wave.combo > 0 {
+        wave.combo_idle += dt;
+        if wave.combo_idle >= crate::seams::COMBO_RESET_SEC {
+            wave.combo = 0;
+            wave.combo_idle = 0.0;
+        }
+    }
+}
+
+fn update_wave_banner(
+    wave: Res<WaveUi>,
+    mut q: Query<(&mut Text, &mut Visibility), With<WaveBannerText>>,
+) {
+    for (mut t, mut vis) in &mut q {
+        if wave.banner.is_empty() || wave.banner_timer <= 0.0 {
+            **t = String::new();
+            *vis = Visibility::Hidden;
+        } else {
+            **t = wave.banner.clone();
+            *vis = Visibility::Visible;
+        }
+    }
+}
+
+fn update_combo(wave: Res<WaveUi>, mut q: Query<&mut Text, With<ComboText>>) {
+    for mut t in &mut q {
+        if wave.combo >= 2 {
+            **t = format!("COMBO x{}", wave.combo);
+        } else {
+            **t = String::new();
+        }
     }
 }
 
@@ -1357,10 +1474,11 @@ fn update_stats_overlay(
     };
 
     let dur_s = stats.duration_ms as f32 / 1000.0;
-    let wave = u16::from(stats.difficulty_reached) + 1;
+    let waves = stats.waves_cleared;
+    let wave_reached = u16::from(stats.difficulty_reached).max(waves);
     for mut t in &mut match_line {
         **t = format!(
-            "{dur_s:.0}s  ·  {zk} zombies killed  ·  peak horde {peak}  ·  wave {wave}",
+            "WAVES CLEARED {waves}  ·  reached wave {wave_reached}  ·  {zk} kills  ·  peak {peak}  ·  {dur_s:.0}s",
             zk = stats.zombies_killed,
             peak = stats.peak_zombies,
         );
@@ -1525,6 +1643,51 @@ fn drain_fx(
                     ));
                 });
             }
+            VisualEvent::KillPopup { pos, headshot } => {
+                let label = if headshot { "+25" } else { "+10" };
+                let color = if headshot {
+                    Color::srgb(1.0, 0.85, 0.2)
+                } else {
+                    Color::srgb(0.95, 0.95, 0.9)
+                };
+                // World-space billboard-ish text as a small bright cube rising
+                // is cheap; use a Text2d-less unlit cube stack + label via
+                // scaled emissive bars for retro readability without fonts in 3D.
+                let mat = materials.add(unlit(color, AlphaMode::Blend));
+                let start_y = pos.y + 1.6;
+                commands.entity(root.0).with_children(|c| {
+                    c.spawn((
+                        KillPopupFx {
+                            age: 0.0,
+                            start_y,
+                        },
+                        Mesh3d(assets.unit_cube.clone()),
+                        MeshMaterial3d(mat),
+                        Transform::from_translation(Vec3::new(pos.x, start_y, pos.z))
+                            .with_scale(Vec3::new(0.35, 0.12, 0.08)),
+                        Name::new(label),
+                    ));
+                });
+            }
+            VisualEvent::CoverCrumble {
+                pos,
+                half_extents,
+            } => {
+                let mat =
+                    materials.add(unlit(Color::srgba(0.55, 0.5, 0.4, 0.85), AlphaMode::Blend));
+                let scale = half_extents * 2.0;
+                commands.entity(root.0).with_children(|c| {
+                    c.spawn((
+                        CrumbleFx {
+                            age: 0.0,
+                            mat: mat.clone(),
+                        },
+                        Mesh3d(assets.unit_cube.clone()),
+                        MeshMaterial3d(mat),
+                        Transform::from_translation(pos).with_scale(scale.max(Vec3::splat(0.2))),
+                    ));
+                });
+            }
         }
     }
 }
@@ -1580,6 +1743,19 @@ fn tick_fx(
     mut tracers: Query<(Entity, &mut TracerFx, &mut Transform)>,
     mut sparks: Query<(Entity, &mut SparkFx, &mut Transform), Without<TracerFx>>,
     mut booms: Query<(Entity, &mut BoomFx, &mut Transform), (Without<TracerFx>, Without<SparkFx>)>,
+    mut popups: Query<
+        (Entity, &mut KillPopupFx, &mut Transform),
+        (Without<TracerFx>, Without<SparkFx>, Without<BoomFx>),
+    >,
+    mut crumbles: Query<
+        (Entity, &mut CrumbleFx, &mut Transform),
+        (
+            Without<TracerFx>,
+            Without<SparkFx>,
+            Without<BoomFx>,
+            Without<KillPopupFx>,
+        ),
+    >,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let dt = time.delta_secs();
@@ -1626,6 +1802,31 @@ fn tick_fx(
             mat.base_color = Color::Srgba(c);
         }
         if fx.age >= BOOM_LIFE_S {
+            commands.entity(e).despawn();
+        }
+    }
+
+    for (e, mut fx, mut tf) in &mut popups {
+        fx.age += dt;
+        let t = (fx.age / KILL_POPUP_LIFE_S).clamp(0.0, 1.0);
+        tf.translation.y = fx.start_y + t * 1.2;
+        tf.scale = Vec3::new(0.35 * (1.0 - t * 0.3), 0.12 * (1.0 - t * 0.3), 0.08);
+        if fx.age >= KILL_POPUP_LIFE_S {
+            commands.entity(e).despawn();
+        }
+    }
+
+    for (e, mut fx, mut tf) in &mut crumbles {
+        fx.age += dt;
+        let t = (fx.age / CRUMBLE_LIFE_S).clamp(0.0, 1.0);
+        tf.scale *= 1.0 - dt * 1.5;
+        tf.translation.y -= dt * 0.8;
+        if let Some(mut mat) = materials.get_mut(&fx.mat) {
+            let mut c = mat.base_color.to_srgba();
+            c.alpha = 0.85 * (1.0 - t);
+            mat.base_color = Color::Srgba(c);
+        }
+        if fx.age >= CRUMBLE_LIFE_S {
             commands.entity(e).despawn();
         }
     }
@@ -1700,6 +1901,15 @@ fn sync_loot(
                     ));
                 });
             }
+            3 => {
+                // Supply crate — larger blue box.
+                c.spawn((
+                    LootFx { id },
+                    Mesh3d(assets.unit_cube.clone()),
+                    MeshMaterial3d(assets.loot_supply.clone()),
+                    Transform::from_translation(pos).with_scale(Vec3::new(0.55, 0.4, 0.55)),
+                ));
+            }
             _ => {
                 c.spawn((
                     LootFx { id },
@@ -1710,6 +1920,47 @@ fn sync_loot(
             }
         });
     }
+}
+
+/// Emissive light pillar at the active supply-drop location.
+fn sync_drop_beacon(
+    mut commands: Commands,
+    mut wave: ResMut<WaveUi>,
+    assets: Res<FxAssets>,
+    root: Res<FxRootEntity>,
+    latest: Res<LatestSnapshot>,
+    mut existing: Query<(Entity, &mut Transform), With<DropBeaconFx>>,
+) {
+    // Drop the beacon once the supply crate leaves the snapshot (picked up).
+    if let Some(id) = wave.drop_id
+        && let Some(snap) = latest.0.as_ref()
+        && !snap.loot.iter().any(|l| l.id == id)
+    {
+        wave.drop_beacon = None;
+        wave.drop_id = None;
+    }
+    let Some((x, z)) = wave.drop_beacon else {
+        for (e, _) in existing.iter() {
+            commands.entity(e).despawn();
+        }
+        return;
+    };
+
+    if let Some((_, mut tf)) = existing.iter_mut().next() {
+        tf.translation = Vec3::new(x, 4.0, z);
+        return;
+    }
+    for (e, _) in existing.iter() {
+        commands.entity(e).despawn();
+    }
+    commands.entity(root.0).with_children(|c| {
+        c.spawn((
+            DropBeaconFx,
+            Mesh3d(assets.unit_cube.clone()),
+            MeshMaterial3d(assets.drop_beacon.clone()),
+            Transform::from_translation(Vec3::new(x, 4.0, z)).with_scale(Vec3::new(0.35, 8.0, 0.35)),
+        ));
+    });
 }
 
 fn sync_flight_grenades(

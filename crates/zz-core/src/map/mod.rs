@@ -16,7 +16,7 @@ mod rome_eur;
 mod sea;
 mod urban;
 
-pub use coop::{Billboard, GameMap, Gate, generate_map};
+pub use coop::{Billboard, GameMap, Gate, generate_map, is_destructible_cover};
 pub use grid::WalkGrid;
 pub use urban::{find_open_spot, generate_arena};
 

@@ -196,6 +196,29 @@ pub struct LastStats(pub Option<MatchStats>);
 #[derive(Resource, Default)]
 pub struct Roster(pub Vec<(u8, String, bool)>);
 
+/// Big retro wave banner ("WAVE 3" / "WAVE CLEAR") + combo juice (client-only).
+#[derive(Resource, Default, Debug, Clone)]
+pub struct WaveUi {
+    /// Banner text; empty = hidden.
+    pub banner: String,
+    /// Seconds remaining to show the banner.
+    pub banner_timer: f32,
+    /// Current kill combo (resets after [`COMBO_RESET_SEC`] without a kill).
+    pub combo: u32,
+    /// Seconds since last kill (combo timer).
+    pub combo_idle: f32,
+    /// Last known wave number from WaveStart.
+    pub wave: u16,
+    /// Supply-drop beacon world xz (None = none active).
+    pub drop_beacon: Option<(f32, f32)>,
+    pub drop_id: Option<u16>,
+}
+
+/// Combo resets after this many seconds without a kill.
+pub const COMBO_RESET_SEC: f32 = 4.0;
+/// Wave banner display duration.
+pub const WAVE_BANNER_SEC: f32 = 2.8;
+
 /// Transient visual events derived from snapshots (shots are per-snapshot
 /// transients on the wire; game.rs re-emits them here for fx to consume).
 pub enum VisualEvent {
@@ -209,6 +232,16 @@ pub enum VisualEvent {
     },
     Boom {
         pos: Vec3,
+    },
+    /// Floating score popup at a kill point (+10 / +25 headshot).
+    KillPopup {
+        pos: Vec3,
+        headshot: bool,
+    },
+    /// Brute smashed cover — dust/crumble at the AABB centre.
+    CoverCrumble {
+        pos: Vec3,
+        half_extents: Vec3,
     },
 }
 
@@ -236,6 +269,12 @@ pub enum Sfx {
     ReloadClack,
     /// Proximity zombie growl; volume already distance-scaled by game.rs.
     Growl { volume: f32 },
+    /// Wave start horn / sting.
+    WaveHorn,
+    /// Wave clear calmer chime.
+    WaveClearChime,
+    /// Distant horde bed (volume pre-scaled by live-zombie count).
+    HordeBed { volume: f32 },
 }
 
 #[derive(Resource, Default)]

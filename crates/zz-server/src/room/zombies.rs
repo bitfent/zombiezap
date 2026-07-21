@@ -7,10 +7,25 @@ use zz_core::map::WalkGrid;
 use zz_core::types::{Aabb, Body, PlayerInput};
 
 /// Wire states (snapshot `state` byte drives client anims).
+/// Low 7 bits = anim state; high bit [`ZS_FRENZY_BIT`] = frenzy walker.
 pub const ZS_WALK: u8 = 0;
 pub const ZS_ATTACK: u8 = 1;
 #[allow(dead_code)] // wire state reserved for hit-stagger (client anims)
 pub const ZS_STAGGER: u8 = 2;
+
+#[inline]
+pub fn anim_state(state: u8) -> u8 {
+    state & !ZS_FRENZY_BIT
+}
+
+#[inline]
+pub fn with_frenzy(state: u8, frenzy: bool) -> u8 {
+    if frenzy {
+        (state & !ZS_FRENZY_BIT) | ZS_FRENZY_BIT
+    } else {
+        state & !ZS_FRENZY_BIT
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ZombieKind {
@@ -50,6 +65,14 @@ pub struct Zombie {
     /// Slot of the player being attacked when the windup ends.
     #[allow(dead_code)] // read by the M4 client half (attack telegraphs)
     pub target_slot: u8,
+    /// Counts toward the current wave's clear condition.
+    pub from_wave: bool,
+    /// Runner flank waypoint (xz); cleared on arrival / close pursuit.
+    pub flank_xz: Option<(f32, f32)>,
+    /// Brute cover-smash cooldown.
+    pub smash_cooldown: u32,
+    /// Frenzy walker: +speed, glowing eyes (wire bit on `state`).
+    pub frenzy: bool,
 }
 
 /// Flow field: per-cell unit direction toward the nearest alive player,
@@ -152,10 +175,18 @@ pub fn step_zombie(
     walls: &[Aabb],
     arena_half: f32,
 ) -> Option<(u8, f32)> {
-    let (speed, _hp, dmg, _cost) = z.kind.stats();
+    let (base_speed, _hp, dmg, _cost) = z.kind.stats();
+    let speed = if z.frenzy {
+        base_speed * FRENZY_SPEED_MUL
+    } else {
+        base_speed
+    };
 
     if z.cooldown_left > 0 {
         z.cooldown_left -= 1;
+    }
+    if z.smash_cooldown > 0 {
+        z.smash_cooldown -= 1;
     }
 
     // nearest alive player (squared distances — cheap)
@@ -170,19 +201,19 @@ pub fn step_zombie(
         }
     }
     let Some((tslot, tx, tz, d2)) = nearest else {
-        z.state = ZS_WALK;
+        z.state = with_frenzy(ZS_WALK, z.frenzy);
         return None; // nobody left to eat
     };
 
-    // attack state machine
-    if z.state == ZS_ATTACK {
+    // attack state machine (anim bits only)
+    if anim_state(z.state) == ZS_ATTACK {
         if z.windup_left > 0 {
             z.windup_left -= 1;
             // face the victim through the windup; no movement (telegraph)
             z.yaw = yaw_toward(z.body.x, z.body.z, tx, tz);
             return None;
         }
-        z.state = ZS_WALK;
+        z.state = with_frenzy(ZS_WALK, z.frenzy);
         z.cooldown_left = ZOMBIE_ATTACK_COOLDOWN_TICKS;
         // the bite lands only if the victim is STILL in reach
         if d2 <= (ZOMBIE_ATTACK_RANGE * 1.25).powi(2) {
@@ -192,16 +223,30 @@ pub fn step_zombie(
     }
 
     if d2 <= ZOMBIE_ATTACK_RANGE * ZOMBIE_ATTACK_RANGE && z.cooldown_left == 0 {
-        z.state = ZS_ATTACK;
+        z.state = with_frenzy(ZS_ATTACK, z.frenzy);
         z.windup_left = ZOMBIE_ATTACK_WINDUP_TICKS;
         z.yaw = yaw_toward(z.body.x, z.body.z, tx, tz);
         return None;
     }
 
-    // steering: direct pursuit in close range, flow field otherwise
+    // Runner flank: bias pathing toward offset waypoint until close.
+    if let Some((fx, fz)) = z.flank_xz {
+        let fd2 = (fx - z.body.x).powi(2) + (fz - z.body.z).powi(2);
+        if fd2 <= RUNNER_FLANK_ARRIVE_M * RUNNER_FLANK_ARRIVE_M
+            || d2 <= ZOMBIE_PURSUE_RANGE * ZOMBIE_PURSUE_RANGE
+        {
+            z.flank_xz = None;
+        }
+    }
+
+    // steering: direct pursuit in close range, flank target, or flow field
     let (mut dx, mut dz) = if d2 <= ZOMBIE_PURSUE_RANGE * ZOMBIE_PURSUE_RANGE {
         let len = d2.sqrt().max(1e-3);
         ((tx - z.body.x) / len, (tz - z.body.z) / len)
+    } else if let Some((fx, fz)) = z.flank_xz {
+        let fd2 = (fx - z.body.x).powi(2) + (fz - z.body.z).powi(2);
+        let len = fd2.sqrt().max(1e-3);
+        ((fx - z.body.x) / len, (fz - z.body.z) / len)
     } else {
         flow.dir_at(grid, z.body.x, z.body.z)
     };
@@ -212,7 +257,7 @@ pub fn step_zombie(
 
     let len = (dx * dx + dz * dz).sqrt();
     if len < 1e-3 {
-        z.state = ZS_WALK;
+        z.state = with_frenzy(ZS_WALK, z.frenzy);
         return None; // unreachable pocket — idle (director avoids these gates)
     }
     let (dx, dz) = (dx / len, dz / len);
@@ -224,7 +269,7 @@ pub fn step_zombie(
         ..Default::default()
     };
     zz_core::movement::step_body(&mut z.body, &input, TICK_DT, speed, walls, arena_half);
-    z.state = ZS_WALK;
+    z.state = with_frenzy(ZS_WALK, z.frenzy);
     None
 }
 

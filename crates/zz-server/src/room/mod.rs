@@ -10,13 +10,14 @@ mod zombies;
 use combat::{Grenade, explosion_damage, find_melee_target, fire_hitscan};
 use director::Director;
 use tokio::sync::mpsc;
-use zombies::{FlowField, SpatialHash, Zombie};
+use zombies::{FlowField, SpatialHash, Zombie, ZombieKind};
 use zz_core::constants::*;
-use zz_core::map::{GameMap, WalkGrid, generate_map};
+use zz_core::map::{GameMap, WalkGrid, generate_map, is_destructible_cover};
 use zz_core::movement::step_body;
 use zz_core::protocol::{
     MatchStats, PlayerStats, RosterPlayer, ServerMsg, decode_voice, encode_voice,
 };
+use zz_core::types::Aabb;
 use zz_core::snapshot::{
     Snapshot, SnapshotEncoder, WireBoom, WireGrenade, WireLoot, WirePlayer, WireShot, WireZombie,
     quant_pitch, quant_pos3, quant_yaw8, quant_yaw16,
@@ -186,7 +187,7 @@ impl Room {
         let map = generate_map(env, &map_seed);
         let grid = WalkGrid::rasterize(&map.walls, map.arena_half);
         let loot_rng = zz_core::rng::Mulberry32::from_seed(&format!("{map_seed}|loot"));
-        let director = Director::new(&map_seed);
+        let director = Director::new(&map_seed, env);
         let room = Room {
             cmds: rx,
             players: Vec::new(),
@@ -469,13 +470,21 @@ impl Room {
             .iter()
             .map(|p| (p.body.x, p.body.y + PLAYER_EYE, p.body.z, p.yaw, p.alive))
             .collect();
-        self.director.step(
-            now,
+        let dir_ev = self.director.step(
             &self.map,
             &self.grid,
             &mut self.zombies,
             &player_views,
         );
+        if let Some(wave) = dir_ev.wave_start {
+            self.broadcast_json(&ServerMsg::WaveStart { wave });
+        }
+        if let Some((wave, bonus_ammo)) = dir_ev.wave_clear {
+            self.broadcast_json(&ServerMsg::WaveClear { wave, bonus_ammo });
+        }
+        if dir_ev.supply_drop {
+            self.spawn_supply_drop();
+        }
         self.peak_zombies = self.peak_zombies.max(self.zombies.len() as u32);
 
         // Rebuild on the periodic cadence, and immediately when the field is
@@ -519,6 +528,19 @@ impl Room {
             self.damage_player(slot, dmg, now);
         }
 
+        // Wave clear after kills (director.step only sees pre-combat counts).
+        let alive_n = self.players.iter().filter(|p| p.alive).count();
+        let clear_ev = self.director.check_clear_after_kills(alive_n);
+        if let Some((wave, bonus_ammo)) = clear_ev.wave_clear {
+            self.broadcast_json(&ServerMsg::WaveClear { wave, bonus_ammo });
+        }
+        if clear_ev.supply_drop {
+            self.spawn_supply_drop();
+        }
+
+        // Brute cover smash — after movement so adjacency uses new positions.
+        self.brute_smash_cover();
+
         // ── loot: expiry + pickup ──────────────────────────────────────────
         self.loot.retain(|l| l.despawn_at_sim_tick > now);
         let mut taken: Vec<u16> = Vec::new();
@@ -543,6 +565,24 @@ impl Room {
                     2 if p.grenades < MAX_GRENADES => {
                         p.grenades += 1;
                         true
+                    }
+                    k if k == LOOT_KIND_SUPPLY => {
+                        // Grant everything the player still has room for.
+                        let mut any = false;
+                        if p.ammo_reserve < u8::MAX - LOOT_AMMO_AMOUNT {
+                            p.ammo_reserve += LOOT_AMMO_AMOUNT;
+                            any = true;
+                        }
+                        if p.health < MAX_HEALTH as f32 {
+                            p.health =
+                                (p.health + LOOT_HEAL_AMOUNT as f32).min(MAX_HEALTH as f32);
+                            any = true;
+                        }
+                        if p.grenades < MAX_GRENADES {
+                            p.grenades += 1;
+                            any = true;
+                        }
+                        any
                     }
                     _ => false,
                 };
@@ -692,11 +732,14 @@ impl Room {
 
     fn kill_zombie(&mut self, zi: usize, killer_slot: u8) {
         let z = self.zombies.swap_remove(zi);
+        if z.from_wave {
+            self.director.on_wave_zombie_killed();
+        }
         self.zombies_killed += 1;
         if let Some(p) = self.players.iter_mut().find(|p| p.slot == killer_slot) {
             p.kills += 1;
         }
-        // drop roll (mutually exclusive bands)
+        // drop roll (mutually exclusive bands) — supply crates are director-only
         let roll = self.loot_rng.next();
         let kind = if roll < DROP_CHANCE_AMMO {
             Some(0u8)
@@ -718,6 +761,125 @@ impl Room {
             });
             self.next_loot_id = self.next_loot_id.wrapping_add(1).max(1);
         }
+    }
+
+    /// Spawn a supply crate at a map pickup during the post-wave breather.
+    fn spawn_supply_drop(&mut self) {
+        if self.map.pickups.is_empty() {
+            return;
+        }
+        // Prefer a pickup ~8–22 m from the alive centroid (run for it, but
+        // still pathable — farthest edge spots were often behind walls).
+        let (cx, cz) = {
+            let mut cx = 0.0f32;
+            let mut cz = 0.0f32;
+            let mut n = 0u32;
+            for p in self.players.iter().filter(|p| p.alive) {
+                cx += p.body.x;
+                cz += p.body.z;
+                n += 1;
+            }
+            if n == 0 {
+                (0.0, 0.0)
+            } else {
+                (cx / n as f32, cz / n as f32)
+            }
+        };
+        let mut best_i = 0usize;
+        let mut best_score = f32::MAX;
+        for (i, &(px, pz)) in self.map.pickups.iter().enumerate() {
+            let d = ((px - cx).powi(2) + (pz - cz).powi(2)).sqrt();
+            // Score: prefer mid-range; heavily penalize underfoot.
+            let score = if d < 4.0 {
+                100.0 + (4.0 - d)
+            } else if d <= 22.0 {
+                (d - 12.0).abs()
+            } else {
+                40.0 + (d - 22.0)
+            };
+            if score < best_score {
+                best_score = score;
+                best_i = i;
+            }
+        }
+        let (x, z) = self.map.pickups[best_i];
+        let id = self.next_loot_id;
+        self.next_loot_id = self.next_loot_id.wrapping_add(1).max(1);
+        self.loot.push(LootItem {
+            id,
+            kind: LOOT_KIND_SUPPLY,
+            x,
+            y: 0.0,
+            z,
+            despawn_at_sim_tick: self.sim_tick + SUPPLY_DESPAWN_TICKS,
+        });
+        self.broadcast_json(&ServerMsg::SupplyDrop { id, x, z });
+    }
+
+    /// Brutes adjacent to Cover-family AABBs destroy them (camping decay).
+    fn brute_smash_cover(&mut self) {
+        let arena_half = self.map.arena_half;
+        let mut smashed: Vec<Aabb> = Vec::new();
+        for z in self.zombies.iter_mut() {
+            if z.kind != ZombieKind::Brute || z.smash_cooldown > 0 {
+                continue;
+            }
+            let zx = z.body.x;
+            let zz = z.body.z;
+            let mut hit: Option<usize> = None;
+            for (wi, w) in self.map.walls.iter().enumerate() {
+                if !is_destructible_cover(w, arena_half) {
+                    continue;
+                }
+                // Expand AABB by smash range on xz; require feet near cover height.
+                let cx = zx.clamp(w.x0, w.x1);
+                let cz = zz.clamp(w.z0, w.z1);
+                let d2 = (zx - cx).powi(2) + (zz - cz).powi(2);
+                if d2 <= BRUTE_SMASH_RANGE * BRUTE_SMASH_RANGE && w.y0 <= 1.2 {
+                    hit = Some(wi);
+                    break;
+                }
+            }
+            if let Some(wi) = hit {
+                let aabb = self.map.walls[wi];
+                smashed.push(aabb);
+                z.smash_cooldown = BRUTE_SMASH_COOLDOWN_TICKS;
+                // Mark wall for removal after the loop (indices shift).
+                // Store index via a sentinel: we collect AABBs and remove by match.
+            }
+        }
+        if smashed.is_empty() {
+            return;
+        }
+        // Remove each smashed AABB once; rebuild walk grid + flow.
+        for aabb in &smashed {
+            if let Some(i) = self.map.walls.iter().position(|w| {
+                (w.x0 - aabb.x0).abs() < 1e-4
+                    && (w.x1 - aabb.x1).abs() < 1e-4
+                    && (w.y0 - aabb.y0).abs() < 1e-4
+                    && (w.y1 - aabb.y1).abs() < 1e-4
+                    && (w.z0 - aabb.z0).abs() < 1e-4
+                    && (w.z1 - aabb.z1).abs() < 1e-4
+            }) {
+                self.map.walls.swap_remove(i);
+                self.broadcast_json(&ServerMsg::CoverSmashed {
+                    x0: aabb.x0,
+                    x1: aabb.x1,
+                    y0: aabb.y0,
+                    y1: aabb.y1,
+                    z0: aabb.z0,
+                    z1: aabb.z1,
+                });
+            }
+        }
+        self.grid = WalkGrid::rasterize(&self.map.walls, self.map.arena_half);
+        let alive_pos: Vec<(f32, f32)> = self
+            .players
+            .iter()
+            .filter(|p| p.alive)
+            .map(|p| (p.body.x, p.body.z))
+            .collect();
+        self.flow = FlowField::rebuild(&self.grid, &alive_pos);
     }
 
     fn explode(&mut self, g: &Grenade, now: u32) {
@@ -801,7 +963,8 @@ impl Room {
             duration_ms,
             zombies_killed: self.zombies_killed,
             peak_zombies: self.peak_zombies,
-            difficulty_reached: Director::difficulty(now),
+            difficulty_reached: self.director.difficulty(),
+            waves_cleared: self.director.waves_cleared(),
             players: self
                 .players
                 .iter()
@@ -837,7 +1000,7 @@ impl Room {
         Snapshot {
             tick: self.wire_tick,
             game_time_ms: (self.sim_tick as u64 * 1000 / TICK_RATE as u64) as u32,
-            difficulty: Director::difficulty(self.sim_tick),
+            difficulty: self.director.difficulty(),
             paused: self.paused,
             players: self
                 .players

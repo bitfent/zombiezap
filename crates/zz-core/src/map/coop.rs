@@ -32,6 +32,46 @@ pub struct Billboard {
     pub ad_slot: u8,
 }
 
+/// True when an AABB is smashable Cover-family street furniture (crates, low
+/// barriers) — never buildings, roofs, or perimeter walls. Shared server/client
+/// heuristic so brute smash and client despawn agree.
+pub fn is_destructible_cover(aabb: &Aabb, arena_half: f32) -> bool {
+    let height = (aabb.y1 - aabb.y0).abs();
+    // Perimeter slabs: tall edge walls.
+    if height >= 5.0 && is_near_perimeter_edge(aabb, arena_half) {
+        return false;
+    }
+    // Roofs.
+    if aabb.y0 >= 2.5 {
+        return false;
+    }
+    // Buildings + doorway sills/headers (ShotAnte paint rules).
+    let is_sill = aabb.y0.abs() <= 1e-3 && (aabb.y1 - 1.3).abs() <= 1e-2;
+    if aabb.y1 > 2.5 || is_sill {
+        return false;
+    }
+    // Remaining = Cover family. Prefer compact props so we never open a
+    // multi-metre retaining wall or terrace deck that would re-route BFS oddly.
+    if height > 1.45 {
+        return false;
+    }
+    let sx = (aabb.x1 - aabb.x0).abs();
+    let sz = (aabb.z1 - aabb.z0).abs();
+    if sx.max(sz) > 3.2 {
+        return false;
+    }
+    if sx * sz > 6.5 {
+        return false;
+    }
+    true
+}
+
+fn is_near_perimeter_edge(aabb: &Aabb, arena_half: f32) -> bool {
+    const EPS: f32 = 0.6;
+    let near = |v: f32| (v.abs() - arena_half).abs() <= EPS;
+    near(aabb.x0) || near(aabb.x1) || near(aabb.z0) || near(aabb.z1)
+}
+
 /// Everything the server and client need to run a match on a map.
 #[derive(Clone, Debug)]
 pub struct GameMap {

@@ -22,7 +22,7 @@ const MAX_CONCURRENT: usize = 8;
 fn sfx_priority(sfx: &Sfx) -> u8 {
     match sfx {
         Sfx::Shoot { from_me: false } => 0,
-        Sfx::Growl { .. } => 1,
+        Sfx::Growl { .. } | Sfx::HordeBed { .. } => 1,
         Sfx::Click | Sfx::DryClick => 2,
         Sfx::ReloadClack => 3,
         Sfx::MeleeSwing => 3,
@@ -33,6 +33,8 @@ fn sfx_priority(sfx: &Sfx) -> u8 {
         Sfx::Hurt => 7,
         Sfx::KillConfirm { .. } => 8,
         Sfx::Explosion { .. } => 9,
+        Sfx::WaveClearChime => 9,
+        Sfx::WaveHorn => 10,
         Sfx::TeamWipe => 10,
     }
 }
@@ -128,6 +130,9 @@ struct SfxBank {
     melee_hit: Handle<SynthClip>,
     reload_clack: Handle<SynthClip>,
     growl: Handle<SynthClip>,
+    wave_horn: Handle<SynthClip>,
+    wave_clear: Handle<SynthClip>,
+    horde_bed: Handle<SynthClip>,
 }
 
 /// Marks a spawned one-shot SFX voice for concurrent-count queries.
@@ -192,6 +197,15 @@ fn setup_sfx_bank(mut commands: Commands, mut clips: ResMut<Assets<SynthClip>>) 
         growl: clips.add(SynthClip {
             samples: Arc::from(synth_growl()),
         }),
+        wave_horn: clips.add(SynthClip {
+            samples: Arc::from(synth_wave_horn()),
+        }),
+        wave_clear: clips.add(SynthClip {
+            samples: Arc::from(synth_wave_clear()),
+        }),
+        horde_bed: clips.add(SynthClip {
+            samples: Arc::from(synth_horde_bed()),
+        }),
     };
     commands.insert_resource(bank);
 }
@@ -252,6 +266,9 @@ fn drain_sfx_queue(
             Sfx::MeleeHit => (bank.melee_hit.clone(), 1.0),
             Sfx::ReloadClack => (bank.reload_clack.clone(), 0.85),
             Sfx::Growl { volume } => (bank.growl.clone(), volume.clamp(0.05, 0.85)),
+            Sfx::WaveHorn => (bank.wave_horn.clone(), 1.0),
+            Sfx::WaveClearChime => (bank.wave_clear.clone(), 0.9),
+            Sfx::HordeBed { volume } => (bank.horde_bed.clone(), volume.clamp(0.02, 0.45)),
         };
 
         if is_growl {
@@ -586,6 +603,73 @@ pub(crate) fn synth_growl() -> Vec<f32> {
         // Mild amplitude modulation for a throaty pulse.
         let throat = 0.7 + 0.3 * sine(t * 7.0);
         *s = (rumble + grit) * 0.55 * env * throat;
+    }
+    finalize(buf)
+}
+
+/// ~450 ms wave-start horn: brass-ish rising fifth + low thump.
+pub(crate) fn synth_wave_horn() -> Vec<f32> {
+    let n = samples_for_ms(450.0);
+    let mut buf = vec![0.0; n];
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let u = i as f32 / n as f32;
+        let env = if u < 0.08 {
+            u / 0.08
+        } else {
+            (1.0 - (u - 0.08) / 0.92).max(0.0).powf(0.7)
+        };
+        let f0 = 110.0 + 40.0 * u;
+        let brass = square(t * f0) * 0.35 + square(t * f0 * 1.5) * 0.22 + sine(t * f0 * 2.0) * 0.15;
+        let thump = sine(t * 55.0) * (1.0 - u).powf(3.0) * 0.4;
+        *s = (brass + thump) * env * 0.7;
+    }
+    finalize(buf)
+}
+
+/// ~380 ms wave-clear chime: soft major arpeggio.
+pub(crate) fn synth_wave_clear() -> Vec<f32> {
+    let n = samples_for_ms(380.0);
+    let mut buf = vec![0.0; n];
+    let notes = [523.25_f32, 659.25, 783.99]; // C5 E5 G5
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let u = i as f32 / n as f32;
+        let mut v = 0.0f32;
+        for (k, &f) in notes.iter().enumerate() {
+            let start = k as f32 * 0.08;
+            if u < start {
+                continue;
+            }
+            let local = ((u - start) / (1.0 - start)).clamp(0.0, 1.0);
+            let env = (1.0 - local).powf(1.6);
+            v += sine(t * f) * env * 0.28;
+        }
+        *s = v;
+    }
+    finalize(buf)
+}
+
+/// ~600 ms distant horde bed: low rumble + filtered noise (loopable-ish).
+pub(crate) fn synth_horde_bed() -> Vec<f32> {
+    let n = samples_for_ms(600.0);
+    let mut buf = vec![0.0; n];
+    let mut noise = XorShift32::new(0xB0DE_CAFE);
+    let mut lp = 0.0_f32;
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let u = i as f32 / n as f32;
+        let env = if u < 0.1 {
+            u / 0.1
+        } else if u > 0.85 {
+            (1.0 - u) / 0.15
+        } else {
+            1.0
+        };
+        let white = noise.next_f32();
+        lp += 0.04 * (white - lp);
+        let rumble = sine(t * 40.0) * 0.4 + sine(t * 63.0 + 0.5) * 0.25;
+        *s = (rumble + lp * 0.35) * env * 0.5;
     }
     finalize(buf)
 }

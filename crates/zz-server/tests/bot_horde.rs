@@ -2,8 +2,13 @@
 //! overrun to a MatchEnd with coherent stats, and pause freezes the sim.
 //! Separate test binary from bot_match so ZZ_DIRECTOR_RATE (process-global)
 //! never leaks into the M2 netcode tests.
+//!
+//! Env lock is held across `await` on purpose (serializes process-global
+//! `ZZ_DIRECTOR_RATE` / `MAP_SEED` for the whole match).
+#![allow(clippy::await_holding_lock)]
 
 use futures_util::{SinkExt, StreamExt};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use zz_core::constants::PLAYER_EYE;
@@ -14,9 +19,16 @@ use zz_core::types::PlayerInput;
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Process-global env (ZZ_DIRECTOR_RATE / MAP_SEED) is shared by parallel
+/// tests in this binary — hold this for the whole test body.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_env() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn fast_director(rate: &str) {
-    // safe here: every test in THIS binary wants an aggressive director, and
-    // the room reads the vars once at creation
+    // Caller must hold `lock_env()`. Room reads vars once at creation.
     unsafe {
         std::env::set_var("ZZ_DIRECTOR_RATE", rate);
         std::env::set_var("MAP_SEED", "m4-dev");
@@ -113,6 +125,7 @@ fn aim_at(own: (f32, f32, f32), target: (f32, f32, f32)) -> (f32, f32) {
 
 #[tokio::test]
 async fn horde_grows_and_gunfire_thins_it() {
+    let _env = lock_env();
     fast_director("40");
     let url = start_server().await;
     let (mut ws, slot) = connect(&url, "gunner").await;
@@ -196,6 +209,7 @@ async fn horde_grows_and_gunfire_thins_it() {
 
 #[tokio::test]
 async fn idle_team_gets_overrun_to_match_end() {
+    let _env = lock_env();
     fast_director("300");
     let url = start_server().await;
     let (mut ws, _slot) = connect(&url, "victim").await;
@@ -232,6 +246,7 @@ async fn idle_team_gets_overrun_to_match_end() {
 
 #[tokio::test]
 async fn pause_freezes_game_time_and_zombies() {
+    let _env = lock_env();
     fast_director("40");
     let url = start_server().await;
     let (mut ws, _slot) = connect(&url, "pauser").await;
@@ -320,6 +335,7 @@ async fn pause_freezes_game_time_and_zombies() {
 /// this asserts authoritative health drop (the live bar the dispatcher reads).
 #[tokio::test]
 async fn time_to_first_damage_under_25s_urban_and_rome() {
+    let _env = lock_env();
     // Default director rate (1.0) — not the turbo used by other tests.
     // Clear MAP_SEED so Room::spawn uses the lobby-provided `{code}-N` seed
     // exactly as lobby.rs does for a real match.
@@ -396,6 +412,7 @@ async fn time_to_first_damage_under_25s_urban_and_rome() {
 /// ≤ match duration, and a second MatchEnd is a fresh room (not stale stats).
 #[tokio::test]
 async fn rematch_resets_peak_horde_and_time_alive_bounded() {
+    let _env = lock_env();
     fast_director("300");
     let url = start_server().await;
     let (mut ws, _slot) = connect(&url, "rematcher").await;
@@ -491,6 +508,7 @@ async fn idle_standing_inputs_takes_damage_and_match_ends() {
 }
 
 async fn idle_player_engagement(send_idle_inputs: bool) {
+    let _env = lock_env();
     // Same aggressive rate band as other tests in this binary (env is
     // process-global and tests share a process — do not set "1" here or a
     // parallel horde_grows can starve). Pin seed for stable travel time.

@@ -93,7 +93,7 @@ pub const ZOMBIE_WALKER: (f32, f32, f32, u32) = (2.2, 100.0, 10.0, 10);
 pub const ZOMBIE_RUNNER: (f32, f32, f32, u32) = (4.5, 60.0, 8.0, 15);
 pub const ZOMBIE_BRUTE: (f32, f32, f32, u32) = (1.6, 400.0, 25.0, 40);
 
-// ── spawn director ─────────────────────────────────────────────────────────
+// ── spawn director (legacy continuous rate; still used as within-wave drip) ─
 pub const DIRECTOR_BASE_POINTS_PER_SEC: f32 = 6.0;
 /// Spawn budget multiplier grows by this per minute survived (endless ramp).
 pub const DIRECTOR_RAMP_PER_MIN: f32 = 0.35;
@@ -103,6 +103,75 @@ pub const DIRECTOR_PULSE_AMPLITUDE: f32 = 0.4;
 /// Runners join the mix after this many minutes; brutes after twice this.
 pub const RUNNERS_FROM_MIN: f32 = 2.0;
 pub const BRUTES_FROM_MIN: f32 = 4.0;
+
+// ── wave rhythm (M22 horde feel) ───────────────────────────────────────────
+/// Points budget for wave 1 before player/env multipliers.
+/// ~6 walkers (cost 10) so a rate=1 first push already feels like a pack.
+pub const WAVE_BASE_POINTS: f32 = 60.0;
+/// Extra points added per wave after the first.
+pub const WAVE_POINTS_PER_WAVE: f32 = 28.0;
+/// Each extra alive player multiplies wave budget by this (duo ≈ 1.4× solo).
+pub const WAVE_PLAYER_BUDGET_STEP: f32 = 0.40;
+/// Calm seconds before wave 1 (players settle / read the map).
+pub const WAVE_INTRO_SEC: f32 = 2.5;
+/// Breather between waves (seconds, inclusive range).
+pub const WAVE_BREATHER_MIN_SEC: f32 = 8.0;
+pub const WAVE_BREATHER_MAX_SEC: f32 = 12.0;
+/// Within a wave, spend at least this fraction of remaining budget per second
+/// so the horde appears as a push rather than a trickle (capped by MAX_ZOMBIES).
+pub const WAVE_SPAWN_BURST_FRAC_PER_SEC: f32 = 0.55;
+/// Runners appear from this wave number (1-indexed).
+pub const RUNNERS_FROM_WAVE: u16 = 3;
+/// Brutes appear from this wave number (1-indexed).
+pub const BRUTES_FROM_WAVE: u16 = 5;
+/// Frenzy walkers (speed buff + state bit) from this wave.
+pub const FRENZY_FROM_WAVE: u16 = 4;
+/// Chance a late-wave walker is frenzied.
+pub const FRENZY_WALKER_CHANCE: f64 = 0.28;
+/// Frenzy speed multiplier on walker base speed.
+pub const FRENZY_SPEED_MUL: f32 = 1.40;
+/// High bit on the zombie snapshot `state` byte: frenzy (anim uses low 7 bits).
+pub const ZS_FRENZY_BIT: u8 = 0x80;
+/// Supply-crate loot kind on the wire (grants ammo + health + grenade).
+pub const LOOT_KIND_SUPPLY: u8 = 3;
+/// How long a supply crate stays on the ground (ticks).
+pub const SUPPLY_DESPAWN_TICKS: u32 = 900; // 30 s
+/// Runner flank offset from the player-group centroid (metres).
+pub const RUNNER_FLANK_OFFSET_M: f32 = 10.0;
+/// Clear flank waypoint once the runner is this close.
+pub const RUNNER_FLANK_ARRIVE_M: f32 = 3.5;
+/// Brute smash: must be within this xz distance of a cover AABB edge.
+pub const BRUTE_SMASH_RANGE: f32 = 1.35;
+/// Cooldown between smash attempts per brute (ticks).
+pub const BRUTE_SMASH_COOLDOWN_TICKS: u32 = 45;
+
+/// Per-environment director pressure. Tuned for the four main maps; Rome is
+/// left soft (experiment). Higher = more points per wave.
+///
+/// Targets (first-run feel): solo urban dies ~wave 2–3; duo reaches wave 4–6.
+pub fn env_pressure(env: crate::types::EnvKind) -> f32 {
+    use crate::types::EnvKind::*;
+    match env {
+        Urban => 1.00,
+        // Terraces / stairs give natural chokepoints — slightly softer.
+        MountainTown => 0.92,
+        // Open sightlines and sparse cover — denser waves to force movement.
+        DesertTown => 1.18,
+        // Dock edge + warehouse chokes — defender-favoured.
+        SeaTown => 0.90,
+        // Big map experiment: do not over-pressure (M15 approach already helps).
+        RomeEur => 0.80,
+    }
+}
+
+/// Wave-N point budget for `alive_players` on `env` (before ZZ_DIRECTOR_RATE).
+pub fn wave_budget_points(wave: u16, alive_players: usize, env: crate::types::EnvKind) -> f32 {
+    let w = wave.max(1) as f32;
+    let base = WAVE_BASE_POINTS + (w - 1.0) * WAVE_POINTS_PER_WAVE;
+    let n = alive_players.max(1) as f32;
+    let player_scale = 1.0 + (n - 1.0) * WAVE_PLAYER_BUDGET_STEP;
+    base * player_scale * env_pressure(env)
+}
 
 // ── director pacing vs map size (M15) ───────────────────────────────────────
 // Urban/Mountain/Desert/Sea use arena_half ≈ 30. Rome EUR is 250. Without
@@ -153,6 +222,7 @@ pub const LOBBY_CODE_LEN: usize = 5;
 #[cfg(test)]
 mod director_pacing_tests {
     use super::*;
+    use crate::types::EnvKind;
 
     #[test]
     fn rate_scale_vs_arena_half() {
@@ -178,5 +248,36 @@ mod director_pacing_tests {
         // Walkers at 2.2 m/s: approach/speed < 25 s
         let t = rome / 2.2;
         assert!(t < 25.0, "approach walk time {t}s should be < 25s");
+    }
+
+    #[test]
+    fn env_pressure_table_four_main_envs() {
+        let urban = env_pressure(EnvKind::Urban);
+        let mountain = env_pressure(EnvKind::MountainTown);
+        let desert = env_pressure(EnvKind::DesertTown);
+        let sea = env_pressure(EnvKind::SeaTown);
+        let rome = env_pressure(EnvKind::RomeEur);
+        assert!((urban - 1.0).abs() < 1e-4);
+        assert!(desert > urban, "desert open sightlines → higher pressure");
+        assert!(sea < urban, "sea chokes → lower pressure");
+        assert!(mountain < urban);
+        assert!(rome < urban, "rome experiment stays soft");
+        // Sum over the four main envs stays in a sane band for tuning audits.
+        let total = urban + mountain + desert + sea;
+        assert!(
+            (3.8..=4.2).contains(&total),
+            "four-env pressure total {total} expected ~4.0"
+        );
+    }
+
+    #[test]
+    fn wave_budget_scales_with_wave_and_players() {
+        let solo_w1 = wave_budget_points(1, 1, EnvKind::Urban);
+        let solo_w3 = wave_budget_points(3, 1, EnvKind::Urban);
+        let duo_w1 = wave_budget_points(1, 2, EnvKind::Urban);
+        assert!(solo_w3 > solo_w1);
+        assert!(duo_w1 > solo_w1);
+        // Duo wave 1 should still be approachable (not 3× solo).
+        assert!(duo_w1 < solo_w1 * 2.0);
     }
 }

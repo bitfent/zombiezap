@@ -254,6 +254,8 @@ pub struct RigAssets {
     pub zombie_mats: [Handle<StandardMaterial>; 3],
     /// Glowing eyes — one handle for all zombies (high emissive for 30 m+).
     pub eye_mat: Handle<StandardMaterial>,
+    /// Brighter frenzy eyes (late-wave walkers).
+    pub eye_mat_frenzy: Handle<StandardMaterial>,
     pub player_mats: Vec<Handle<StandardMaterial>>,
     pub gun_mat: Handle<StandardMaterial>,
     /// Base colour for muzzle-flash clones (each flash gets a unique handle).
@@ -287,6 +289,13 @@ impl RigAssets {
             metallic: 0.0,
             ..default()
         });
+        let eye_mat_frenzy = materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.35, 0.08),
+            emissive: LinearRgba::rgb(36.0, 6.0, 0.6),
+            perceptual_roughness: 1.0,
+            metallic: 0.0,
+            ..default()
+        });
 
         let player_mats: Vec<_> = (0..5u8)
             .map(|s| materials.add(entity_mat(slot_color(s), 0.10)))
@@ -304,6 +313,7 @@ impl RigAssets {
             unit_cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
             zombie_mats,
             eye_mat,
+            eye_mat_frenzy,
             player_mats,
             gun_mat,
             muzzle_flash_color: Color::srgba(1.0, 0.85, 0.35, 0.95),
@@ -344,6 +354,11 @@ pub struct HumanoidRig {
     pub is_zombie: bool,
     /// Snapshot `state == 1` attack telegraph.
     pub attacking: bool,
+    /// Late-wave frenzy walker (brighter eyes).
+    pub frenzy: bool,
+    /// Left/right eye mesh entities (zombies only; Entity::PLACEHOLDER else).
+    pub eye_l: Entity,
+    pub eye_r: Entity,
     /// Current animation LOD (hysteretic; refreshed every [`LOD_DIST_PERIOD`]).
     pub lod: AnimLod,
     /// Cached camera distance used between LOD refresh frames.
@@ -449,6 +464,8 @@ pub fn attach_humanoid(
     let mut right_arm = Entity::PLACEHOLDER;
     let mut left_leg = Entity::PLACEHOLDER;
     let mut right_leg = Entity::PLACEHOLDER;
+    let mut eye_l = Entity::PLACEHOLDER;
+    let mut eye_r = Entity::PLACEHOLDER;
     let mut detailed_e = Entity::PLACEHOLDER;
     let mut impostor_e = Entity::PLACEHOLDER;
     let mut body_parts: Vec<Entity> = Vec::new();
@@ -524,18 +541,26 @@ pub fn attach_humanoid(
                                 .id(),
                             );
                             // Emissive eyes — large, forward, shared eye mat.
-                            body.spawn((
-                                Mesh3d(cube.clone()),
-                                MeshMaterial3d(eye_mat.clone()),
-                                Transform::from_translation(Vec3::new(-Z_EYE_X, Z_EYE_Y, Z_EYE_Z))
+                            eye_l = body
+                                .spawn((
+                                    Mesh3d(cube.clone()),
+                                    MeshMaterial3d(eye_mat.clone()),
+                                    Transform::from_translation(Vec3::new(
+                                        -Z_EYE_X, Z_EYE_Y, Z_EYE_Z,
+                                    ))
                                     .with_scale(Vec3::splat(Z_EYE_S)),
-                            ));
-                            body.spawn((
-                                Mesh3d(cube.clone()),
-                                MeshMaterial3d(eye_mat),
-                                Transform::from_translation(Vec3::new(Z_EYE_X, Z_EYE_Y, Z_EYE_Z))
+                                ))
+                                .id();
+                            eye_r = body
+                                .spawn((
+                                    Mesh3d(cube.clone()),
+                                    MeshMaterial3d(eye_mat),
+                                    Transform::from_translation(Vec3::new(
+                                        Z_EYE_X, Z_EYE_Y, Z_EYE_Z,
+                                    ))
                                     .with_scale(Vec3::splat(Z_EYE_S)),
-                            ));
+                                ))
+                                .id();
                         }
 
                         left_leg = limb_pivot(
@@ -594,6 +619,9 @@ pub fn attach_humanoid(
         kind: kind_or_slot,
         is_zombie,
         attacking: false,
+        frenzy: false,
+        eye_l,
+        eye_r,
         lod: AnimLod::Full,
         lod_dist: 0.0,
         // Stagger first refresh by phase hash so the horde doesn't all recompute

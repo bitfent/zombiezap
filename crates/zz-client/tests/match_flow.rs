@@ -13,7 +13,7 @@ use zz_client::game::{GamePlugin, LodMetrics, Predicted, RemotePlayer, RemoteZom
 use zz_client::hud::{HudChrome, HudPlugin};
 use zz_client::map_render::{CurrentMap, MapRenderPlugin, MapRoot, Placeholder};
 use zz_client::net::{NetClient, NetEvent};
-use zz_client::seams::{LastStats, LatestSnapshot, Roster};
+use zz_client::seams::{COMBO_RESET_SEC, LastStats, LatestSnapshot, Roster, WaveUi};
 use zz_client::touch::TouchIntent;
 use zz_client::voice::{VoiceRx, VoiceState};
 use zz_core::constants::{
@@ -22,7 +22,9 @@ use zz_core::constants::{
 use zz_core::map::generate_map;
 use zz_core::movement::step_body;
 use zz_core::protocol::{MatchStats, PlayerStats, RosterPlayer, ServerMsg};
-use zz_core::snapshot::{Snapshot, WirePlayer, WireZombie, quant_pos3, quant_yaw8, quant_yaw16};
+use zz_core::snapshot::{
+    Snapshot, WirePlayer, WireShot, WireZombie, quant_pos3, quant_yaw8, quant_yaw16,
+};
 use zz_core::types::{EnvKind, PlayerInput};
 
 /// Fixed sim step for headless Time — exactly one 30 Hz input cadence per
@@ -179,6 +181,7 @@ fn rematch_wipes_stale_horde_stats_and_rebuilds_map() {
         zombies_killed: 25,
         peak_zombies: 25,
         difficulty_reached: 0,
+        waves_cleared: 0,
         players: vec![PlayerStats {
             slot: 0,
             name: "tester".into(),
@@ -759,4 +762,94 @@ fn touch_reload_and_melee_chips_set_bits() {
     let input = decode_input(frame).expect("decode");
     assert!(input.reload, "touch.reload must set reload bit");
     assert!(input.melee, "touch.melee must set melee bit");
+}
+
+/// M22: WaveStart JSON sets WaveUi banner state.
+#[test]
+fn wave_start_sets_banner_state() {
+    let mut app = headless_app();
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    tick(&mut app);
+    enter_playing_with_snap(&mut app, "m22-banner");
+
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Msg(ServerMsg::WaveStart { wave: 3 }));
+    }
+    tick(&mut app);
+
+    let wu = app.world().resource::<WaveUi>();
+    assert_eq!(wu.wave, 3);
+    assert_eq!(wu.banner, "WAVE 3");
+    assert!(wu.banner_timer > 0.0, "banner timer armed");
+}
+
+/// M22: kill event increments combo; idle timeout resets it.
+#[test]
+fn kill_increments_combo_and_timeout_resets() {
+    let mut app = headless_app();
+    *app.world_mut().resource_mut::<Session>() = Session::InLobby;
+    tick(&mut app);
+    let slot = enter_playing_with_snap(&mut app, "m22-combo");
+
+    // Own-shot kill (hit_kind 2) on the next snap.
+    let mut snap = Snapshot {
+        tick: 2,
+        game_time_ms: 66,
+        difficulty: 1,
+        paused: false,
+        players: vec![WirePlayer {
+            slot,
+            pos: quant_pos3(0.0, 0.0, 0.0),
+            yaw: quant_yaw16(0.0),
+            pitch: 0,
+            health: MAX_HEALTH,
+            ammo_mag: MAG_SIZE,
+            ammo_reserve: START_RESERVE_AMMO,
+            grenades: START_GRENADES,
+            kills: 1,
+            alive: true,
+            last_acked_seq: 1,
+            reload_ticks_left: 0,
+        }],
+        zombies: vec![],
+        loot: vec![],
+        grenades: vec![],
+        shots: vec![WireShot {
+            slot,
+            end: quant_pos3(1.0, 1.0, 1.0),
+            hit_kind: 2,
+        }],
+        booms: vec![],
+    };
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Snap(snap.clone()));
+    }
+    tick(&mut app);
+    assert_eq!(app.world().resource::<WaveUi>().combo, 1);
+
+    snap.tick = 3;
+    snap.shots = vec![WireShot {
+        slot,
+        end: quant_pos3(2.0, 1.0, 1.0),
+        hit_kind: 3, // headshot kill
+    }];
+    {
+        let mut net = app.world_mut().resource_mut::<NetClient>();
+        net.inject(NetEvent::Snap(snap));
+    }
+    tick(&mut app);
+    assert_eq!(app.world().resource::<WaveUi>().combo, 2);
+
+    // Advance virtual time past combo timeout via many fixed ticks.
+    let steps = ((COMBO_RESET_SEC + 0.5) / TICK_DT).ceil() as u32 + 2;
+    for _ in 0..steps {
+        tick(&mut app);
+    }
+    assert_eq!(
+        app.world().resource::<WaveUi>().combo,
+        0,
+        "combo should reset after idle timeout"
+    );
 }

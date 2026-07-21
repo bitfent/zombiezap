@@ -77,6 +77,31 @@ pub enum ServerMsg {
     MatchEnd {
         stats: MatchStats,
     },
+    /// A wave of the horde begins (1-indexed). Client: banner + horn.
+    WaveStart {
+        wave: u16,
+    },
+    /// All zombies from this wave are dead. `bonus_ammo` is a small reserve
+    /// top-up granted to every alive player (0 if none). Client: clear banner.
+    WaveClear {
+        wave: u16,
+        bonus_ammo: u8,
+    },
+    /// Supply crate spawned at a map pickup during the breather.
+    SupplyDrop {
+        id: u16,
+        x: f32,
+        z: f32,
+    },
+    /// A Cover-family wall AABB was destroyed by a brute.
+    CoverSmashed {
+        x0: f32,
+        x1: f32,
+        y0: f32,
+        y1: f32,
+        z0: f32,
+        z1: f32,
+    },
     Error {
         message: String,
     },
@@ -101,6 +126,9 @@ pub struct MatchStats {
     pub zombies_killed: u32,
     pub peak_zombies: u32,
     pub difficulty_reached: u8,
+    /// Waves fully cleared (WaveClear count). End-screen headline.
+    #[serde(default)]
+    pub waves_cleared: u16,
     pub players: Vec<PlayerStats>,
 }
 
@@ -340,6 +368,7 @@ mod tests {
                 zombies_killed: 10,
                 peak_zombies: 5,
                 difficulty_reached: 2,
+                waves_cleared: 2,
                 players: vec![PlayerStats {
                     slot: 0,
                     name: "Alice".into(),
@@ -351,6 +380,24 @@ mod tests {
                     time_alive_ms: 55_000,
                 }],
             },
+        });
+        rt_server(ServerMsg::WaveStart { wave: 3 });
+        rt_server(ServerMsg::WaveClear {
+            wave: 3,
+            bonus_ammo: 6,
+        });
+        rt_server(ServerMsg::SupplyDrop {
+            id: 7,
+            x: 1.5,
+            z: -2.0,
+        });
+        rt_server(ServerMsg::CoverSmashed {
+            x0: 0.0,
+            x1: 1.0,
+            y0: 0.0,
+            y1: 1.0,
+            z0: 0.0,
+            z1: 1.0,
         });
         rt_server(ServerMsg::Error {
             message: "nope".into(),
