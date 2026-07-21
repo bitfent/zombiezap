@@ -18,6 +18,7 @@ use zz_core::snapshot::{Snapshot, WireLoot, WirePlayer, dequant_pos};
 use crate::game::{self, Predicted, Session};
 use crate::seams::{FxQueue, LastStats, LatestSnapshot, Roster, UiIntent, UiQueue, VisualEvent};
 use crate::touch::TouchIntent;
+use crate::voice::VoiceState;
 
 // ── timing / layout constants ──────────────────────────────────────────────
 
@@ -61,6 +62,7 @@ impl Plugin for HudPlugin {
                     update_vignette,
                     update_paused_overlay,
                     update_death_banner,
+                    update_mic_chip,
                 )
                     .run_if(playing),
                 (update_stats_overlay, stats_back_button).run_if(ended),
@@ -196,6 +198,13 @@ struct HealthFill;
 
 #[derive(Component)]
 struct HealthNum;
+
+/// Proximity-voice mic chip (muted / live).
+#[derive(Component)]
+struct MicChip;
+
+#[derive(Component)]
+struct MicChipText;
 
 #[derive(Component)]
 struct AmmoText;
@@ -340,8 +349,10 @@ fn setup_hud_ui(mut commands: Commands) {
     commands.spawn(arm(2.0, 10.0, 0.0, -11.0));
     commands.spawn(arm(2.0, 10.0, 0.0, 11.0));
 
-    // Bottom-left: health bar + numeric.
+    // Bottom-left: mic chip (above) + health bar + numeric.
     // Markers used by `lift_hud_for_thumbs` so touch mode can clear the stick zone.
+    // Mic chip sits at the top of this column (left: 16, bottom: 28 desktop /
+    // 200 touch) — muted by default, live when open-mic is transmitting.
     commands
         .spawn((
             HudChrome,
@@ -359,6 +370,25 @@ fn setup_hud_ui(mut commands: Commands) {
             Visibility::Hidden,
         ))
         .with_children(|p| {
+            // Tiny mic chip: "MIC · MUTED" / "MIC · LIVE" / "MIC · …"
+            p.spawn((
+                MicChip,
+                Node {
+                    padding: UiRect::axes(px(6), px(3)),
+                    border: UiRect::all(px(1)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.12, 0.12, 0.14, 0.9)),
+                BorderColor::all(Color::srgba(0.45, 0.45, 0.5, 0.85)),
+            ))
+            .with_children(|chip| {
+                chip.spawn((
+                    MicChipText,
+                    Text::new("MIC · MUTED"),
+                    mono(12.0),
+                    TextColor(Color::srgb(0.7, 0.72, 0.75)),
+                ));
+            });
             p.spawn((
                 Node {
                     width: px(HEALTH_BAR_W),
@@ -739,6 +769,62 @@ fn update_vitals(
     }
     for mut t in &mut pips {
         **t = "●".repeat(me.grenades as usize);
+    }
+}
+
+/// Mic chip bottom-left (above health): MUTED (default) / LIVE / DENIED / ….
+fn update_mic_chip(
+    voice: Res<VoiceState>,
+    mut text_q: Query<&mut Text, With<MicChipText>>,
+    mut chip_q: Query<(&mut BackgroundColor, &mut BorderColor), With<MicChip>>,
+    mut color_q: Query<&mut TextColor, With<MicChipText>>,
+) {
+    let (label, bg, border, fg) = if voice.mic_denied {
+        (
+            "MIC · DENIED",
+            Color::srgba(0.25, 0.08, 0.08, 0.92),
+            Color::srgba(0.7, 0.25, 0.2, 0.9),
+            Color::srgb(0.95, 0.55, 0.5),
+        )
+    } else if voice.muted {
+        (
+            "MIC · MUTED",
+            Color::srgba(0.12, 0.12, 0.14, 0.9),
+            Color::srgba(0.45, 0.45, 0.5, 0.85),
+            Color::srgb(0.7, 0.72, 0.75),
+        )
+    } else if voice.self_live {
+        (
+            "MIC · LIVE",
+            Color::srgba(0.08, 0.22, 0.12, 0.92),
+            Color::srgba(0.35, 0.85, 0.45, 0.95),
+            Color::srgb(0.55, 0.98, 0.65),
+        )
+    } else if !voice.mic_ready {
+        (
+            "MIC · …",
+            Color::srgba(0.18, 0.16, 0.08, 0.92),
+            Color::srgba(0.75, 0.65, 0.3, 0.9),
+            Color::srgb(0.95, 0.88, 0.55),
+        )
+    } else {
+        (
+            "MIC · ON",
+            Color::srgba(0.08, 0.16, 0.12, 0.9),
+            Color::srgba(0.35, 0.65, 0.45, 0.85),
+            Color::srgb(0.65, 0.9, 0.7),
+        )
+    };
+
+    for mut t in &mut text_q {
+        **t = label.to_string();
+    }
+    for mut c in &mut color_q {
+        c.0 = fg;
+    }
+    for (mut bg_c, mut border_c) in &mut chip_q {
+        *bg_c = BackgroundColor(bg);
+        *border_c = BorderColor::all(border);
     }
 }
 

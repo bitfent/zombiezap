@@ -14,6 +14,7 @@ mod platform;
 mod retro;
 mod seams;
 mod touch;
+mod voice;
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
@@ -67,6 +68,7 @@ fn main() {
             hud::HudPlugin,
             audio::AudioPlugin,
             touch::TouchPlugin,
+            voice::VoicePlugin,
         ))
         .insert_resource(net::NetClient::disconnected())
         .add_systems(Startup, (setup_scene, setup_ui))
