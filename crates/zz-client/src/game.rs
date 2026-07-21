@@ -481,6 +481,8 @@ fn net_poll(
                 // Insert immediately so same-frame Snaps (and fps_controller
                 // on the next system) see walls — commands.apply is end-of-stage.
                 commands.insert_resource(CurrentMap(generate_map(env, &map_seed)));
+                // ODbL attribution footer: only Rome EUR renders OSM data.
+                platform::set_map_attrib_visible(env == zz_core::types::EnvKind::RomeEur);
                 // Also write through world-visible path for inject/headless:
                 // Bevy applies Commands after the system, so a Snap in this
                 // same drain would otherwise still see Option<Res<CurrentMap>>
@@ -1685,4 +1687,5 @@ fn cleanup_match_visuals(
     latest.0 = None;
     last_stats.0 = None;
     fx.0.clear();
+    platform::set_map_attrib_visible(false);
 }

@@ -294,6 +294,9 @@ body.touch #zz-landscape-hint {
 /* ── OSM / ODbL map attribution (Rome EUR) ───────────────────────────────── */
 
 #zz-map-attrib {
+  /* Hidden until the client shows it for a Rome EUR match (the only map
+     built from OSM data) — see platform::set_map_attrib_visible. */
+  display: none;
   position: fixed;
   bottom: 6px;
   left: 0;

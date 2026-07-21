@@ -213,6 +213,20 @@ pub fn set_touch_text_overlays(name: bool, code: bool) {
     }
 }
 
+/// Show/hide the fixed `#zz-map-attrib` footer (OSM/ODbL attribution).
+/// Only the Rome EUR map is baked from OpenStreetMap data, so the footer
+/// must appear exactly while a Rome EUR match is on screen. No-op on native.
+pub fn set_map_attrib_visible(visible: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_set_display("zz-map-attrib", visible, "block");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = visible;
+    }
+}
+
 // ── M19 HTML-first boot screen ─────────────────────────────────────────────
 
 /// Live CALLSIGN from the HTML start screen (wasm). Prefer over LobbyView
