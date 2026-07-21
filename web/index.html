@@ -53,6 +53,7 @@
       --strip-debug / --strip-producers: drop residual name/producers sections
       after rustc strip (small but free). Use data-wasm-opt="0" for faster
       local iteration without binaryen.
+      data-initializer: M19 boot telemetry around fetch / init / run.
     -->
     <link
       data-trunk
@@ -61,60 +62,80 @@
       data-bin="zz-client"
       data-wasm-opt="z"
       data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --strip-debug --strip-producers"
+      data-initializer="boot-init.mjs"
     />
   </head>
   <body>
     <!--
-      Shown until the wasm module finishes init. Trunk's generated module
-      script runs after this markup; we hide #zz-loading once the Bevy canvas
-      is sized (WebGL ready). No external fonts/CDNs.
+      M19 HTML-first start screen: interactive immediately (type name / code /
+      queue HOST|JOIN) while the wasm + Bevy engine boots behind it. Fades out
+      after Rust signals engine-ready and applies the handoff.
     -->
-    <div id="zz-loading" aria-live="polite" aria-busy="true">
-      <div class="zz-loading-card">
-        <div class="zz-loading-title">ZOMBIEZAP</div>
-        <div class="zz-loading-sub" id="zz-loading-sub">loading wasm…</div>
-        <div class="zz-loading-bar" aria-hidden="true">
-          <div class="zz-loading-bar-fill" id="zz-loading-bar-fill"></div>
+    <div id="zz-start" aria-live="polite" aria-busy="true">
+      <div class="zz-start-card">
+        <div class="zz-boot-chrome">
+          <div class="zz-start-title">Z O M B I E Z A P</div>
+          <div class="zz-start-status" id="zz-loading-sub">loading wasm…</div>
+          <div class="zz-loading-bar" aria-hidden="true">
+            <div class="zz-loading-bar-fill" id="zz-loading-bar-fill"></div>
+          </div>
         </div>
-        <div class="zz-loading-hint" id="zz-loading-hint">first load may take a moment</div>
+
+        <!--
+          Soft-keyboard bridge (touch + desktop start): same inputs as the
+          pre-M19 touch overlay. Inputs stay outside .zz-boot-chrome so touch
+          handoff can hide HOST/JOIN chrome while keeping CALLSIGN/CODE.
+          platform.rs toggles display after handoff.
+        -->
+        <div id="zz-touch-fields" style="display: flex" aria-hidden="false">
+          <label class="zz-start-label zz-touch-label" for="zz-name-input"
+            >CALLSIGN</label
+          >
+          <input
+            id="zz-name-input"
+            type="text"
+            name="zz-name"
+            autocomplete="nickname"
+            maxlength="24"
+            placeholder="survivor"
+            enterkeyhint="done"
+            autocapitalize="off"
+            spellcheck="false"
+            style="display: block"
+          />
+          <label class="zz-start-label zz-touch-label" for="zz-code-input"
+            >LOBBY CODE</label
+          >
+          <input
+            id="zz-code-input"
+            type="text"
+            name="zz-code"
+            autocomplete="off"
+            maxlength="5"
+            placeholder="XXXXX"
+            enterkeyhint="go"
+            autocapitalize="characters"
+            spellcheck="false"
+            inputmode="text"
+            style="display: block"
+          />
+        </div>
+
+        <div class="zz-boot-chrome">
+          <button type="button" class="zz-start-btn" id="zz-host-btn">
+            [ HOST A GAME ]
+          </button>
+          <div class="zz-start-or">— or join a friend —</div>
+          <button type="button" class="zz-start-btn" id="zz-join-btn">
+            [ JOIN ]
+          </button>
+          <div class="zz-start-hint" id="zz-loading-hint">
+            type while the engine starts
+          </div>
+        </div>
       </div>
     </div>
     <canvas id="zz-canvas"></canvas>
-
-    <!--
-      Soft-keyboard bridge (touch devices / ?touch=1): egui TextEdit does not
-      summon mobile keyboards. Shown only while the menu is up (platform.rs
-      toggles display). Values are polled into LobbyView / join draft.
-    -->
-    <div id="zz-touch-fields" style="display: none" aria-hidden="true">
-      <label class="zz-touch-label" for="zz-name-input">CALLSIGN</label>
-      <input
-        id="zz-name-input"
-        type="text"
-        name="zz-name"
-        autocomplete="nickname"
-        maxlength="24"
-        placeholder="survivor"
-        enterkeyhint="done"
-        autocapitalize="off"
-        spellcheck="false"
-        style="display: none"
-      />
-      <label class="zz-touch-label" for="zz-code-input">LOBBY CODE</label>
-      <input
-        id="zz-code-input"
-        type="text"
-        name="zz-code"
-        autocomplete="off"
-        maxlength="5"
-        placeholder="XXXXX"
-        enterkeyhint="go"
-        autocapitalize="characters"
-        spellcheck="false"
-        inputmode="text"
-        style="display: none"
-      />
-    </div>
 
     <!-- Portrait orientation: ask for landscape (touch CSS shows this). -->
     <div id="zz-landscape-hint" aria-live="polite">
@@ -132,72 +153,284 @@
 
     <script>
       (function () {
-        // Loading card is in the HTML above the wasm module script so it paints
-        // immediately on cold load (before the ~wasm-release bundle finishes).
-        var loader = document.getElementById("zz-loading");
-        var canvas = document.getElementById("zz-canvas");
-        var sub = document.getElementById("zz-loading-sub");
-        var fill = document.getElementById("zz-loading-bar-fill");
-        var hint = document.getElementById("zz-loading-hint");
-        if (!loader || !canvas) return;
+        // ── M19 boot bridge: HTML menu + honest phase telemetry ──────────
+        var pageAt = performance.now();
+        performance.mark("zz-page");
 
-        var hidden = false;
-        function hide() {
-          if (hidden) return;
-          hidden = true;
-          loader.classList.add("zz-hidden");
-          loader.setAttribute("aria-busy", "false");
+        var boot = {
+          pageAt: pageAt,
+          marks: { page: pageAt },
+          phases: {},
+          pendingAction: null, // { kind: 'host' } | { kind: 'join', code: string }
+          actionTaken: false,
+          engineReady: false,
+          handedOff: false,
+          touchMode: false,
+        };
+        window.__zzBoot = boot;
+
+        function mark(name) {
+          var t = performance.now();
+          boot.marks[name] = t;
+          try {
+            performance.mark("zz-" + name);
+          } catch (e) {}
+          return t;
         }
 
-        // Progress hint: size alone is not enough — wait until Bevy has
-        // actually presented frames (canvas still "alive" after size > 0).
-        var sizedAt = 0;
-        var stableFrames = 0;
-        var lastW = 0;
-        var lastH = 0;
+        function setStatus(text) {
+          var sub = document.getElementById("zz-loading-sub");
+          if (sub) sub.textContent = text;
+        }
+
+        function setHint(text) {
+          var hint = document.getElementById("zz-loading-hint");
+          if (hint) hint.textContent = text;
+        }
+
+        function setProgress(pct, solid) {
+          var fill = document.getElementById("zz-loading-bar-fill");
+          if (!fill) return;
+          fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+          if (solid) {
+            fill.classList.add("zz-solid");
+            fill.style.animation = "none";
+          }
+        }
+
+        function normalizeCode(raw) {
+          return String(raw || "")
+            .toUpperCase()
+            .replace(/[^A-Z0-9]/g, "")
+            .slice(0, 5);
+        }
+
+        function nameInput() {
+          return document.getElementById("zz-name-input");
+        }
+        function codeInput() {
+          return document.getElementById("zz-code-input");
+        }
+
+        // Prefill callsign from localStorage; lobby code from ?join=
+        (function prefill() {
+          try {
+            var n = localStorage.getItem("zz_name");
+            if (n && n.trim()) {
+              var ni = nameInput();
+              if (ni) ni.value = n.trim();
+            }
+          } catch (e) {}
+          try {
+            var q = (window.location.search || "").replace(/^\?/, "");
+            q.split("&").forEach(function (pair) {
+              var parts = pair.split("=");
+              if (parts[0] === "join" && parts[1]) {
+                var code = normalizeCode(decodeURIComponent(parts[1]));
+                var ci = codeInput();
+                if (ci) ci.value = code;
+              }
+            });
+          } catch (e) {}
+        })();
+
+        function queueHost() {
+          boot.pendingAction = { kind: "host" };
+          boot.actionTaken = false;
+          setHint("host queued — waiting for engine…");
+          setStatus("queued host");
+        }
+        function queueJoin() {
+          var code = normalizeCode(codeInput() && codeInput().value);
+          if (!code) {
+            setHint("enter a lobby code");
+            return;
+          }
+          if (codeInput()) codeInput().value = code;
+          boot.pendingAction = { kind: "join", code: code };
+          boot.actionTaken = false;
+          setHint("join queued — waiting for engine…");
+          setStatus("queued join " + code);
+        }
+
+        var hostBtn = document.getElementById("zz-host-btn");
+        var joinBtn = document.getElementById("zz-join-btn");
+        if (hostBtn) hostBtn.addEventListener("click", queueHost);
+        if (joinBtn) joinBtn.addEventListener("click", queueJoin);
+        // Enter in code field → join
+        var ci = codeInput();
+        if (ci) {
+          ci.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              queueJoin();
+            }
+          });
+        }
+
+        // Trunk initializer (boot-init.mjs) + Rust call these.
+        boot.mark = mark;
+        boot.setStatus = setStatus;
+        boot.setHint = setHint;
+        boot.setProgress = setProgress;
+        boot.getName = function () {
+          var el = nameInput();
+          return el ? el.value : "";
+        };
+        boot.getCode = function () {
+          var el = codeInput();
+          return el ? normalizeCode(el.value) : "";
+        };
+        /** Peek pending action without consuming (Rust copies into HtmlBoot). */
+        boot.peekAction = function () {
+          return boot.pendingAction;
+        };
+        /** Consume pending action once (handoff). */
+        boot.takeAction = function () {
+          if (boot.actionTaken) return null;
+          var a = boot.pendingAction;
+          boot.pendingAction = null;
+          boot.actionTaken = true;
+          return a;
+        };
+        boot.setEngineReady = function () {
+          boot.engineReady = true;
+          mark("engine_ready");
+          setStatus("engine ready");
+          setProgress(100, true);
+          setHint("handing off…");
+          var start = document.getElementById("zz-start");
+          if (start) start.setAttribute("aria-busy", "false");
+        };
+        /**
+         * Fade the full-screen start chrome. Touch mode keeps fields as a
+         * soft-keyboard overlay (class zz-post-handoff-touch); desktop hides all.
+         */
+        boot.handoff = function (isTouch) {
+          if (boot.handedOff) return;
+          boot.handedOff = true;
+          boot.touchMode = !!isTouch;
+          mark("handoff");
+          var start = document.getElementById("zz-start");
+          if (!start) return;
+          if (isTouch) {
+            start.classList.add("zz-post-handoff-touch");
+            // Hide host/join chrome; fields stay for soft keyboard.
+            var chromes = start.querySelectorAll(".zz-boot-chrome");
+            for (var i = 0; i < chromes.length; i++) {
+              chromes[i].style.display = "none";
+            }
+            // Code row had JOIN button inside boot-chrome; ensure code input
+            // still displays as a full-width field.
+            var code = codeInput();
+            if (code) {
+              code.style.display = "block";
+              code.style.width = "100%";
+            }
+            setStatus("");
+          } else {
+            start.classList.add("zz-hidden");
+          }
+          // One-line phase summary for load regressions.
+          boot.logPhases();
+        };
+        boot.hideAll = function () {
+          var start = document.getElementById("zz-start");
+          if (start) start.classList.add("zz-hidden");
+          var fields = document.getElementById("zz-touch-fields");
+          if (fields) fields.style.display = "none";
+          var ni = nameInput();
+          var ci2 = codeInput();
+          if (ni) ni.style.display = "none";
+          if (ci2) ci2.style.display = "none";
+        };
+        boot.logPhases = function () {
+          var m = boot.marks;
+          var p = boot.phases;
+          function ms(a, b) {
+            if (m[a] == null || m[b] == null) return -1;
+            return Math.round(m[b] - m[a]);
+          }
+          // Prefer explicit phase deltas recorded by initializer / Rust.
+          var fetchMs = p.fetch_ms != null ? p.fetch_ms : ms("page", "wasm_fetch_done");
+          var instMs =
+            p.instantiate_ms != null ? p.instantiate_ms : ms("wasm_fetch_done", "wasm_init_done");
+          var startMs =
+            p.startup_ms != null ? p.startup_ms : ms("wasm_init_done", "engine_ready");
+          var firstMs = p.first_frame_ms != null ? p.first_frame_ms : -1;
+          var hideMs =
+            p.loader_hide_ms != null
+              ? p.loader_hide_ms
+              : m.handoff != null
+                ? Math.round(m.handoff - pageAt)
+                : -1;
+          var line =
+            "[zz boot] fetch=" +
+            fetchMs +
+            "ms instantiate=" +
+            instMs +
+            "ms startup=" +
+            startMs +
+            "ms first_frame=" +
+            firstMs +
+            "ms loader_hide=" +
+            hideMs +
+            "ms";
+          console.log(line);
+          return line;
+        };
+        boot.recordPhase = function (name, msVal) {
+          boot.phases[name] = msVal;
+        };
+
+        // Progress while waiting for canvas / engine (status only; UI stays live).
+        var canvas = document.getElementById("zz-canvas");
         var n = 0;
         var id = setInterval(function () {
           n += 1;
-          var w = canvas.width | 0;
-          var h = canvas.height | 0;
+          if (boot.engineReady || boot.handedOff) {
+            clearInterval(id);
+            return;
+          }
+          var w = canvas ? canvas.width | 0 : 0;
+          var h = canvas ? canvas.height | 0 : 0;
           if (w > 0 && h > 0) {
-            if (!sizedAt) {
-              sizedAt = n;
-              if (sub) sub.textContent = "starting…";
-              if (fill) {
-                fill.style.width = "70%";
-                fill.style.animation = "none";
+            setStatus("starting…");
+            setProgress(70, true);
+          } else if (n > 8) {
+            setStatus("compiling…");
+            setHint("type a callsign — engine is booting");
+            setProgress(40, false);
+          }
+          if (n > 450) clearInterval(id);
+        }, 100);
+
+        // Resource Timing for the .wasm fetch (best-effort; may be 0 on cache).
+        function noteWasmResource() {
+          try {
+            var entries = performance.getEntriesByType("resource");
+            for (var i = 0; i < entries.length; i++) {
+              var e = entries[i];
+              if (e.name && e.name.indexOf(".wasm") >= 0) {
+                boot.phases.fetch_ms = Math.round(e.duration);
+                if (boot.marks.wasm_fetch_done == null) {
+                  boot.marks.wasm_fetch_done = pageAt + e.responseEnd;
+                }
+                break;
               }
             }
-            // Require the surface to stay non-zero for several ticks AND
-            // optionally that WebGL context exists — not just a transient size.
-            if (w === lastW && h === lastH) {
-              stableFrames += 1;
-            } else {
-              stableFrames = 0;
-              lastW = w;
-              lastH = h;
-            }
-            // ~300 ms of stable nonzero size after first size event.
-            if (stableFrames >= 3 && n - sizedAt >= 3) {
-              if (sub) sub.textContent = "ready";
-              if (fill) fill.style.width = "100%";
-              clearInterval(id);
-              // Brief beat so "ready" is visible, then fade.
-              setTimeout(hide, 120);
-              return;
-            }
-          } else if (n > 8 && sub && sub.textContent.indexOf("wasm") >= 0) {
-            if (sub) sub.textContent = "compiling…";
-            if (hint) hint.textContent = "cold start · please wait";
-            if (fill) fill.style.width = "40%";
-          }
-          if (n > 450) {
-            // ~45s safety so a failed init does not spin forever
-            clearInterval(id);
-            hide();
-          }
-        }, 100);
+          } catch (err) {}
+        }
+        if (typeof PerformanceObserver !== "undefined") {
+          try {
+            var po = new PerformanceObserver(function () {
+              noteWasmResource();
+            });
+            po.observe({ entryTypes: ["resource"] });
+          } catch (err) {}
+        }
+        setTimeout(noteWasmResource, 500);
+        setTimeout(noteWasmResource, 2000);
       })();
 
       // Audio unlock for browser autoplay policy. Bevy/rodio AudioContexts

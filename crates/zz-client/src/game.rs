@@ -57,6 +57,8 @@ impl Plugin for GamePlugin {
             .insert_resource(crate::seams::FxQueue::default())
             .insert_resource(crate::seams::SfxQueue::default())
             .insert_resource(crate::seams::Roster::default())
+            // M19 HTML-first boot handoff (also used headless when LobbyUi is absent).
+            .init_resource::<crate::seams::HtmlBoot>()
             .insert_resource(MyId::default())
             .insert_resource(PrevSelf::default())
             .insert_resource(ViewmodelKick::default())
@@ -364,7 +366,48 @@ fn net_poll(
     mut cam_nudge: ResMut<CameraNudge>,
 ) {
     // one-time shared rig mesh/material bank
+    // M19: defer until Menu (or later) so Boot/Connecting frames stay lean —
+    // match materials warm while the player is on the menu, not on frame 1.
     if assets.is_none() {
+        if matches!(*session, Session::Boot | Session::Connecting) {
+            for ev in net.drain() {
+                match ev {
+                    NetEvent::Connected => {
+                        info!("connected");
+                        if *session == Session::Connecting || *session == Session::Boot {
+                            *session = Session::Menu;
+                        }
+                    }
+                    NetEvent::Msg(ServerMsg::Welcome { player_id, .. }) => {
+                        seams.my_id.0 = player_id;
+                    }
+                    NetEvent::Msg(ServerMsg::LobbyState {
+                        code,
+                        host_id,
+                        players,
+                        env,
+                        invite_url,
+                    }) => {
+                        seams.lobby_view.code = code;
+                        seams.lobby_view.invite_url = invite_url;
+                        seams.lobby_view.is_host = host_id == seams.my_id.0;
+                        seams.lobby_view.env = Some(env);
+                        seams.lobby_view.players = players
+                            .iter()
+                            .map(|p| (p.name.clone(), p.id == host_id, p.id == seams.my_id.0))
+                            .collect();
+                        seams.lobby_view.status.clear();
+                        *session = Session::InLobby;
+                    }
+                    NetEvent::Closed(reason) => {
+                        warn!("disconnected: {reason}");
+                        *session = Session::Boot;
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         let bank = RigAssets::build(&mut meshes, &mut materials);
         commands.insert_resource(bank);
         return; // assets visible next frame; nothing else depends on this tick

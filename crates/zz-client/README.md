@@ -275,11 +275,19 @@ Override without config: `trunk build --release --cargo-profile wasm-release`.
     `Url` / `UrlSearchParams` — query parsing is a tiny split on
     `location.search` so the wasm dep graph stays small.
 
-32. **Trunk loader UI is plain HTML/CSS.** `#zz-loading` is in the static
-    markup *above* the wasm module so it paints on cold load (not a black
-    page). Hide only after the canvas stays nonzero for several ticks (real
-    frames, not a transient size blip). Progress copy: loading wasm →
-    compiling → starting → ready.
+32. **M19 HTML-first start screen (instant boot).** `#zz-start` is in the
+    static markup *above* the wasm module: CALLSIGN / LOBBY CODE / HOST /
+    JOIN are interactive immediately while Bevy boots. Typing works; HOST/
+    JOIN queue into `window.__zzBoot` and fire once after
+    `seams::HtmlBoot` engine-ready + Session::Menu (`apply_boot_handoff` —
+    no double-send). Trunk `data-initializer="boot-init.mjs"` marks
+    fetch/instantiate; Rust logs first Update as `first_frame_ms`. Console
+    one-liner: `[zz boot] fetch=…ms instantiate=…ms startup=…ms
+    first_frame=…ms loader_hide=…ms`. **KHR_parallel_shader_compile:**
+    wgpu 29 GLES does **not** use it (sync `compile_shader` +
+    `get_shader_compile_status` only; no feature flag) — unblock is
+    staggered pipeline warmup (camera-only Startup, skeleton cubes over
+    frames 2–8, match FX/rigs during menu).
 
 33. **`data-wasm-opt="z"` needs binaryen (`wasm-opt`) on PATH.** Without it,
     Trunk fails the release link step — install via package manager or

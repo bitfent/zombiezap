@@ -56,6 +56,7 @@ const MOVE_SPEED: f32 = 12.0;
 const SPRINT_MULT: f32 = 2.5;
 
 pub fn run() {
+    let boot_t0 = std::time::Instant::now();
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
@@ -83,10 +84,19 @@ pub fn run() {
             voice::VoicePlugin,
         ))
         .insert_resource(net::NetClient::disconnected())
-        .add_systems(Startup, (setup_scene, setup_ui))
+        .insert_resource(BootClock {
+            t0: boot_t0,
+            first_frame_logged: false,
+        })
+        .insert_resource(SkeletonSpawn::default())
+        // M19: lean Startup — camera only. Skeleton backdrop + match FX/rig
+        // materials warm on later frames so frame 1 is not a pipeline storm.
+        .add_systems(Startup, (setup_camera_only, setup_ui))
         .add_systems(
             Update,
             (
+                mark_engine_ready_first_frame,
+                stagger_skeleton_backdrop,
                 // click-to-grab only applies in a match; menus keep the cursor
                 toggle_cursor_grab.run_if(game::in_match),
                 // the fly camera only flies before a match starts; in-match
@@ -99,80 +109,48 @@ pub fn run() {
         .run();
 }
 
-/// Ground plane + ~30 colored AABB cubes + fly camera + light.
-///
-/// Everything except the camera is tagged [`map_render::Placeholder`]: the
-/// first real map build despawns the whole backdrop, lights included — the
-/// map owns its lighting (per-env sun/ambient/fog, shadows baked at build).
-fn setup_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    retro_target: Res<retro::RetroTarget>,
+/// Wall clock from `run()` for boot phase telemetry.
+#[derive(Resource)]
+struct BootClock {
+    t0: std::time::Instant,
+    first_frame_logged: bool,
+}
+
+/// Progressive menu backdrop spawn (M19 staggered pipeline warmup).
+#[derive(Resource, Default)]
+struct SkeletonSpawn {
+    /// Frames since first Update (0 = not started).
+    frame: u32,
+    done: bool,
+}
+
+/// End of first Update: engine is interactive for HTML handoff + telemetry.
+fn mark_engine_ready_first_frame(
+    mut boot: ResMut<seams::HtmlBoot>,
+    mut clock: ResMut<BootClock>,
 ) {
-    // ~80×80 m ground (dark procedural-ish slate).
-    let ground = meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(40.0)));
-    let ground_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.12, 0.14, 0.16),
-        perceptual_roughness: 0.95,
-        metallic: 0.0,
-        ..default()
-    });
-    commands.spawn((
-        map_render::Placeholder,
-        Mesh3d(ground),
-        MeshMaterial3d(ground_mat),
-        Transform::IDENTITY,
-    ));
-
-    // Placeholder "AABB map": grid of cubes with varied heights/colors.
-    let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-    let palette = [
-        Color::srgb(0.55, 0.22, 0.18),
-        Color::srgb(0.25, 0.45, 0.30),
-        Color::srgb(0.20, 0.35, 0.55),
-        Color::srgb(0.55, 0.45, 0.20),
-        Color::srgb(0.40, 0.25, 0.50),
-        Color::srgb(0.30, 0.50, 0.50),
-    ];
-
-    let mut i = 0usize;
-    // 5×6 = 30 cubes across a ~60 m patch centered on origin.
-    for gx in 0..5 {
-        for gz in 0..6 {
-            let x = -24.0 + gx as f32 * 12.0;
-            let z = -30.0 + gz as f32 * 12.0;
-            // Deterministic pseudo-height in [1.5, 8.0] m.
-            let h = 1.5 + ((i * 17 + gx * 3 + gz * 7) % 14) as f32 * 0.5;
-            let color = palette[i % palette.len()];
-            let mat = materials.add(StandardMaterial {
-                base_color: color,
-                perceptual_roughness: 0.85,
-                metallic: 0.05,
-                ..default()
-            });
-            commands.spawn((
-                map_render::Placeholder,
-                Mesh3d(unit_cube.clone()),
-                MeshMaterial3d(mat),
-                Transform::from_xyz(x, h * 0.5, z).with_scale(Vec3::new(3.0, h, 3.0)),
-            ));
-            i += 1;
-        }
+    if clock.first_frame_logged {
+        return;
     }
+    clock.first_frame_logged = true;
+    boot.engine_ready = true;
+    let ms = clock.t0.elapsed().as_millis() as u32;
+    platform::boot_record_phase("first_frame_ms", ms);
+    // startup_ms ≈ time from wasm init done to first frame; JS already has
+    // instantiate split — we report Bevy side as first_frame from run().
+    platform::boot_record_phase("startup_ms", ms);
+    bevy::log::info!(
+        "[zz boot] first Update complete in {ms}ms (engine ready for HTML handoff)"
+    );
+}
 
-    // Backdrop sun. Real-time shadow maps stay OFF everywhere: map shadows
-    // are baked once per map build (ShotAnte's frame-budget lesson).
-    commands.spawn((
-        map_render::Placeholder,
-        DirectionalLight {
-            illuminance: 12_000.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -PI * 0.35, PI * 0.2, 0.0)),
-    ));
-
+/// Lean Startup (M19): 3D camera only — no meshes/lights/materials.
+///
+/// Present camera + egui come from [`retro::RetroRenderPlugin`]. Skeleton
+/// backdrop (ground, cubes, sun) spawns a few frames later via
+/// [`stagger_skeleton_backdrop`] so the first WebGL pipeline compile is just
+/// the clear + blit path, not 30 unique StandardMaterials.
+fn setup_camera_only(mut commands: Commands, retro_target: Res<retro::RetroTarget>) {
     // The one 3D camera: renders the world at RETRO_W×RETRO_H into the retro
     // target (nearest-upscaled to the window by RetroRenderPlugin). MSAA off —
     // chunky pixels are the point. Fog is retuned per env on every map build.
@@ -207,6 +185,98 @@ fn setup_scene(
         },
         Transform::from_xyz(0.0, 4.0, 18.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
     ));
+}
+
+/// Spread first uses of StandardMaterial / PBR pipelines across menu frames.
+///
+/// Frame 2: ground + sun (one material + light). Frames 3–8: placeholder
+/// cubes in small batches. Match-only rigs/FX stay deferred (hud/game).
+fn stagger_skeleton_backdrop(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut spawn: ResMut<SkeletonSpawn>,
+    mut unit_cube: Local<Option<Handle<Mesh>>>,
+) {
+    if spawn.done {
+        return;
+    }
+    spawn.frame = spawn.frame.saturating_add(1);
+    let f = spawn.frame;
+
+    // Skip frame 1 entirely (engine-ready / present path only).
+    if f == 1 {
+        return;
+    }
+
+    if f == 2 {
+        // ~80×80 m ground (dark procedural-ish slate).
+        let ground = meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(40.0)));
+        let ground_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.12, 0.14, 0.16),
+            perceptual_roughness: 0.95,
+            metallic: 0.0,
+            ..default()
+        });
+        commands.spawn((
+            map_render::Placeholder,
+            Mesh3d(ground),
+            MeshMaterial3d(ground_mat),
+            Transform::IDENTITY,
+        ));
+        // Backdrop sun. Real-time shadow maps stay OFF everywhere: map shadows
+        // are baked once per map build (ShotAnte's frame-budget lesson).
+        commands.spawn((
+            map_render::Placeholder,
+            DirectionalLight {
+                illuminance: 12_000.0,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -PI * 0.35, PI * 0.2, 0.0)),
+        ));
+        *unit_cube = Some(meshes.add(Cuboid::new(1.0, 1.0, 1.0)));
+        return;
+    }
+
+    // Frames 3..=8: five cubes each → 30 total (5×6 grid).
+    if (3..=8).contains(&f) {
+        let Some(cube) = unit_cube.clone() else {
+            return;
+        };
+        let palette = [
+            Color::srgb(0.55, 0.22, 0.18),
+            Color::srgb(0.25, 0.45, 0.30),
+            Color::srgb(0.20, 0.35, 0.55),
+            Color::srgb(0.55, 0.45, 0.20),
+            Color::srgb(0.40, 0.25, 0.50),
+            Color::srgb(0.30, 0.50, 0.50),
+        ];
+        let batch = (f - 3) as usize; // 0..6
+        let gz = batch;
+        for gx in 0..5 {
+            let i = gx * 6 + gz;
+            let x = -24.0 + gx as f32 * 12.0;
+            let z = -30.0 + gz as f32 * 12.0;
+            let h = 1.5 + ((i * 17 + gx * 3 + gz * 7) % 14) as f32 * 0.5;
+            let color = palette[i % palette.len()];
+            let mat = materials.add(StandardMaterial {
+                base_color: color,
+                perceptual_roughness: 0.85,
+                metallic: 0.05,
+                ..default()
+            });
+            commands.spawn((
+                map_render::Placeholder,
+                Mesh3d(cube.clone()),
+                MeshMaterial3d(mat),
+                Transform::from_xyz(x, h * 0.5, z).with_scale(Vec3::new(3.0, h, 3.0)),
+            ));
+        }
+        if f == 8 {
+            spawn.done = true;
+        }
+    }
 }
 
 fn setup_ui(mut commands: Commands) {

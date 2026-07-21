@@ -1,7 +1,8 @@
 //! Platform seam: native vs wasm32 differences for server URL, invite join
-//! codes, player name persistence, touch-mode detection, and the mobile
-//! soft-keyboard HTML overlay bridge. game.rs / lobby_ui / touch call these
-//! only — no `cfg` elsewhere for these concerns.
+//! codes, player name persistence, touch-mode detection, the mobile
+//! soft-keyboard HTML overlay bridge, and the M19 HTML-first boot screen.
+//! game.rs / lobby_ui / touch call these only — no `cfg` elsewhere for these
+//! concerns.
 
 /// WebSocket URL for the game server.
 ///
@@ -124,6 +125,9 @@ pub fn apply_touch_body_class(enabled: bool) {
 /// * `code` — menu join-code field
 ///
 /// No-op on native (touch soft-keyboard bridge is wasm-only).
+///
+/// After M19 handoff on desktop the whole `#zz-start` is hidden; on touch the
+/// start chrome is stripped and these toggles control the floating fields.
 pub fn set_touch_text_overlays(name: bool, code: bool) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -131,10 +135,108 @@ pub fn set_touch_text_overlays(name: bool, code: bool) {
         wasm_set_display("zz-name-input", name, "block");
         wasm_set_display("zz-code-input", code, "block");
         wasm_set_display("zz-touch-fields", name || code, "flex");
+        // When leaving the menu entirely, hide the start shell if it was left
+        // in post-handoff-touch mode.
+        if !name && !code {
+            wasm_boot_hide_all();
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = (name, code);
+    }
+}
+
+// ── M19 HTML-first boot screen ─────────────────────────────────────────────
+
+/// Live CALLSIGN from the HTML start screen (wasm). Prefer over LobbyView
+/// until handoff. Always readable while `#zz-name-input` exists — even when
+/// `display:none` would hide it for the old touch poll path we still want
+/// the value at handoff time, so this does not require display != none.
+pub fn boot_html_name() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_input_value_raw("zz-name-input")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Live LOBBY CODE from the HTML start screen (wasm).
+pub fn boot_html_code() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_input_value_raw("zz-code-input")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Peek a queued HOST/JOIN from `window.__zzBoot` without consuming.
+pub fn boot_peek_action() -> Option<crate::seams::QueuedBootAction> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_boot_action(false)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Consume a queued HOST/JOIN from `window.__zzBoot` (one-shot).
+pub fn boot_take_action() -> Option<crate::seams::QueuedBootAction> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_boot_action(true)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Tell JS the first Update frame finished (engine ready for handoff).
+pub fn boot_signal_engine_ready() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_boot_call0("setEngineReady");
+    }
+}
+
+/// Dismiss the full-screen HTML start chrome after handoff.
+pub fn boot_dismiss_start(is_touch: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_boot_handoff(is_touch);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = is_touch;
+    }
+}
+
+/// Record a phase duration (ms) into `window.__zzBoot.phases` and log a line.
+pub fn boot_record_phase(name: &str, ms: u32) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_boot_record_phase(name, ms);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        bevy::log::info!("[zz boot] {name}={ms}ms");
+    }
+}
+
+/// Emit the one-line phase summary (`[zz boot] fetch=…`).
+pub fn boot_log_phases() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_boot_call0("logPhases");
     }
 }
 
@@ -382,6 +484,112 @@ fn wasm_input_value(id: &str) -> Option<String> {
         return None;
     }
     Some(input.value())
+}
+
+/// Like [`wasm_input_value`] but ignores `display` (handoff reads always).
+#[cfg(target_arch = "wasm32")]
+fn wasm_input_value_raw(id: &str) -> Option<String> {
+    use wasm_bindgen::JsCast;
+    let el = document_element(id)?;
+    let input: web_sys::HtmlInputElement = el.dyn_into().ok()?;
+    Some(input.value())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_boot_obj() -> Option<js_sys::Object> {
+    use wasm_bindgen::JsCast;
+    let window = web_sys::window()?;
+    let v = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__zzBoot")).ok()?;
+    if v.is_undefined() || v.is_null() {
+        return None;
+    }
+    v.dyn_into::<js_sys::Object>().ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_boot_call0(method: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(obj) = wasm_boot_obj() else {
+        return;
+    };
+    let Ok(f) = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str(method)) else {
+        return;
+    };
+    if let Ok(func) = f.dyn_into::<js_sys::Function>() {
+        let _ = func.call0(&obj);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_boot_handoff(is_touch: bool) {
+    use wasm_bindgen::JsCast;
+    let Some(obj) = wasm_boot_obj() else {
+        return;
+    };
+    let Ok(f) = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str("handoff")) else {
+        return;
+    };
+    if let Ok(func) = f.dyn_into::<js_sys::Function>() {
+        let _ = func.call1(&obj, &wasm_bindgen::JsValue::from_bool(is_touch));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_boot_hide_all() {
+    wasm_boot_call0("hideAll");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_boot_record_phase(name: &str, ms: u32) {
+    use wasm_bindgen::JsCast;
+    let Some(obj) = wasm_boot_obj() else {
+        bevy::log::info!("[zz boot] {name}={ms}ms");
+        return;
+    };
+    let Ok(f) = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str("recordPhase")) else {
+        bevy::log::info!("[zz boot] {name}={ms}ms");
+        return;
+    };
+    if let Ok(func) = f.dyn_into::<js_sys::Function>() {
+        let _ = func.call2(
+            &obj,
+            &wasm_bindgen::JsValue::from_str(name),
+            &wasm_bindgen::JsValue::from_f64(ms as f64),
+        );
+    }
+    bevy::log::info!("[zz boot] {name}={ms}ms");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_boot_action(take: bool) -> Option<crate::seams::QueuedBootAction> {
+    use wasm_bindgen::JsCast;
+    let obj = wasm_boot_obj()?;
+    let method = if take { "takeAction" } else { "peekAction" };
+    let f = js_sys::Reflect::get(&obj, &wasm_bindgen::JsValue::from_str(method)).ok()?;
+    let func = f.dyn_into::<js_sys::Function>().ok()?;
+    let ret = func.call0(&obj).ok()?;
+    if ret.is_null() || ret.is_undefined() {
+        return None;
+    }
+    let kind = js_sys::Reflect::get(&ret, &wasm_bindgen::JsValue::from_str("kind"))
+        .ok()
+        .and_then(|v| v.as_string())?;
+    match kind.as_str() {
+        "host" => Some(crate::seams::QueuedBootAction::Host),
+        "join" => {
+            let code = js_sys::Reflect::get(&ret, &wasm_bindgen::JsValue::from_str("code"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let code = code.trim().to_uppercase();
+            if code.is_empty() {
+                None
+            } else {
+                Some(crate::seams::QueuedBootAction::Join(code))
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

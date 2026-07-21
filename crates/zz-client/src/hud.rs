@@ -51,36 +51,67 @@ impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudLocal>()
             .init_resource::<AmmoFlash>()
+            // M19: UI chrome at Startup (no 3D materials). Match FX materials
+            // warm during the menu (deferred) so frame 1 is not a PBR storm.
+            .add_systems(Startup, (setup_hud_ui, setup_fx_root).chain())
+            // PreUpdate so insert_resource is applied before Update drain_fx
+            // (Commands flush between stages). Headless match_flow jumps to
+            // Playing in one tick — force-build there too.
+            .add_systems(PreUpdate, warm_fx_assets_during_menu)
             .add_systems(
-                Startup,
-                (setup_fx_assets, setup_hud_ui, setup_fx_root).chain(),
-            );
-        app.add_systems(
-            Update,
-            (
-                // After session so a same-frame GameStart → Playing makes chrome
-                // Visible immediately (no one-frame blank HUD).
-                gate_visibility.after(game::GameSessionSet),
-                reset_hud_on_match_start.after(game::GameSessionSet),
-                lift_hud_for_thumbs,
-                pause_key.run_if(game::playing),
+                Update,
                 (
-                    update_crosshair,
-                    update_vitals,
-                    update_top_left,
-                    update_teammates,
-                    update_vignette,
-                    update_paused_overlay,
-                    update_death_banner,
-                    update_mic_chip,
-                )
-                    .run_if(playing),
-                (update_stats_overlay, stats_back_button).run_if(ended),
-                // FX only while playing — Ended freezes the world (S7).
-                (drain_fx, tick_fx, sync_loot, sync_flight_grenades).run_if(playing),
-            ),
-        );
+                    // After session so a same-frame GameStart → Playing makes chrome
+                    // Visible immediately (no one-frame blank HUD).
+                    gate_visibility.after(game::GameSessionSet),
+                    reset_hud_on_match_start.after(game::GameSessionSet),
+                    lift_hud_for_thumbs,
+                    pause_key.run_if(game::playing),
+                    (
+                        update_crosshair,
+                        update_vitals,
+                        update_top_left,
+                        update_teammates,
+                        update_vignette,
+                        update_paused_overlay,
+                        update_death_banner,
+                        update_mic_chip,
+                    )
+                        .run_if(playing),
+                    (update_stats_overlay, stats_back_button).run_if(ended),
+                    // FX only while playing — Ended freezes the world (S7).
+                    (drain_fx, tick_fx, sync_loot, sync_flight_grenades).run_if(playing),
+                ),
+            );
     }
+}
+
+/// Build match FX materials once the menu is up (or as soon as we enter a
+/// match if the menu was skipped). Skips frame-1 pipeline compile cost.
+fn warm_fx_assets_during_menu(
+    commands: Commands,
+    meshes: ResMut<Assets<Mesh>>,
+    materials: ResMut<Assets<StandardMaterial>>,
+    existing: Option<Res<FxAssets>>,
+    session: Res<Session>,
+    boot: Res<crate::seams::HtmlBoot>,
+    mut frames: Local<u32>,
+) {
+    if existing.is_some() {
+        return;
+    }
+    *frames = frames.saturating_add(1);
+    let need_now = matches!(
+        *session,
+        Session::Playing { .. } | Session::Ended { .. } | Session::InLobby | Session::Menu
+    );
+    // Prefer deferring until engine_ready + frame 2 (lean first present).
+    // Headless / fast GameStart: build as soon as session needs FX.
+    let menu_warm = boot.engine_ready && *frames >= 2;
+    if !(need_now || menu_warm) {
+        return;
+    }
+    setup_fx_assets(commands, meshes, materials);
 }
 
 /// Seconds remaining for dry-fire ammo-counter flash (written by game.rs).

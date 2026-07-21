@@ -11,7 +11,9 @@ use zz_core::types::EnvKind;
 
 use crate::game::Session;
 use crate::platform;
-use crate::seams::{LobbyView, UiIntent, UiQueue};
+use crate::seams::{
+    apply_boot_handoff, BootHandoffInput, HtmlBoot, LobbyView, UiIntent, UiQueue,
+};
 use crate::touch::TouchIntent;
 
 /// Cyan accent for interactive controls (#2ee6d6).
@@ -49,6 +51,8 @@ impl Plugin for LobbyUiPlugin {
             app.add_plugins(EguiPlugin::default());
         }
         app.init_resource::<LobbyDraft>()
+            // HtmlBoot is inserted by GamePlugin (shared with headless tests).
+            .add_systems(Update, html_boot_handoff)
             .add_systems(
                 EguiPrimaryContextPass,
                 (sync_touch_text_bridge, paint_lobby_ui).chain(),
@@ -68,17 +72,84 @@ struct LobbyDraft {
     html_code_seeded: bool,
 }
 
+/// M19: poll HTML start screen → LobbyView / UiQueue once the engine is ready.
+///
+/// Runs every frame until handoff completes. Native has no HTML DOM — inputs
+/// stay `None` and handoff dismisses immediately once `engine_ready`.
+fn html_boot_handoff(
+    mut boot: ResMut<HtmlBoot>,
+    mut lobby: ResMut<LobbyView>,
+    mut draft: ResMut<LobbyDraft>,
+    mut queue: ResMut<UiQueue>,
+    session: Res<Session>,
+    touch: Res<TouchIntent>,
+    mut signaled_ready: Local<bool>,
+) {
+    // Native: no HTML start screen — hand off as soon as the first Update marks
+    // engine_ready so egui owns the menu without waiting on a DOM.
+    #[cfg(not(target_arch = "wasm32"))]
+    if boot.engine_ready && !boot.handed_off {
+        boot.handed_off = true;
+        boot.intent_fired = true;
+        return;
+    }
+
+    let session_is_menu = matches!(*session, Session::Menu);
+    let take = if boot.engine_ready && session_is_menu && !boot.intent_fired {
+        platform::boot_take_action()
+    } else {
+        None
+    };
+    let effect = apply_boot_handoff(
+        &mut boot,
+        &mut lobby,
+        &mut draft.join_code,
+        &mut queue,
+        BootHandoffInput {
+            html_name: platform::boot_html_name(),
+            html_code: platform::boot_html_code(),
+            peek_action: platform::boot_peek_action(),
+            take_action: take,
+            session_is_menu,
+            is_touch: touch.enabled,
+        },
+    );
+    if effect.signal_engine_ready && !*signaled_ready {
+        *signaled_ready = true;
+        platform::boot_signal_engine_ready();
+    }
+    if effect.dismiss_start {
+        platform::boot_dismiss_start(effect.dismiss_touch);
+        if !lobby.name.is_empty() {
+            platform::persist_name(&lobby.name);
+        }
+        if !draft.join_code.is_empty() {
+            draft.prefill_applied = true;
+        }
+        draft.html_name_seeded = true;
+        draft.html_code_seeded = true;
+    }
+}
+
 /// Soft-keyboard bridge: egui TextEdit does not summon mobile keyboards.
 /// On touch devices we show thin HTML `<input>` overlays (`web/index.html`)
 /// and poll their values into LobbyView / join draft each frame while Menu.
+///
+/// Before M19 handoff the full-screen start screen owns the fields — this
+/// bridge only runs after handoff (or on native, where it is a no-op).
 fn sync_touch_text_bridge(
     session: Res<Session>,
     touch: Res<TouchIntent>,
     lobby: Res<LobbyView>,
+    boot: Res<HtmlBoot>,
     mut draft: ResMut<LobbyDraft>,
     mut queue: ResMut<UiQueue>,
 ) {
     let in_menu = matches!(*session, Session::Menu);
+    // Full-screen HTML start owns inputs until handoff.
+    if !boot.handed_off {
+        return;
+    }
     let show = touch.enabled && in_menu;
     platform::set_touch_text_overlays(show, show);
 
@@ -120,6 +191,7 @@ fn paint_lobby_ui(
     session: Res<Session>,
     lobby: Res<LobbyView>,
     touch: Res<TouchIntent>,
+    boot: Res<HtmlBoot>,
     mut queue: ResMut<UiQueue>,
     mut draft: ResMut<LobbyDraft>,
 ) -> Result {
@@ -127,6 +199,18 @@ fn paint_lobby_ui(
     match *session {
         Session::Playing { .. } | Session::Ended { .. } => return Ok(()),
         Session::Boot | Session::Connecting | Session::Menu | Session::InLobby => {}
+    }
+
+    // M19: HTML start screen owns Boot/Connecting/Menu until handoff so we
+    // never double-paint HOST/JOIN or fight the HTML name field.
+    #[cfg(target_arch = "wasm32")]
+    if !boot.handed_off {
+        let _ = &touch;
+        return Ok(());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = &boot;
     }
 
     // One-shot: seed the join field from `?join=` / `ZZ_JOIN` without fighting
