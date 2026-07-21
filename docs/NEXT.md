@@ -240,3 +240,25 @@ with a bot test (two bots in range → frames relayed; out of range → dropped)
 Post-v1 parking lot: per-lobby OG unfurls, reconnect-to-match tokens,
 lag-compensated hitscan (rewind), interest-culled snapshots, persistence +
 accounts, the ad platform behind the billboards.
+
+---
+
+## Session log 2026-07-21: playtest-feedback hardening (M14-M15b)
+
+User playtest surfaced regressions from the M12/M13 wave; four fix
+rounds, each browser-verified frame-by-frame before acceptance:
+- M14 (bee1725): HUD gate, first-map build, rematch state, stats clamp,
+  Ended perf + headless match-flow test suite.
+- M14b (c419664): decoder-reset ordering ate the opening keyframe →
+  client never sent inputs → zombies ignored the ghost player. Idle-prey
+  bot tests added.
+- M15 (279998c): quality pass — vignette curve, zombie menace, sky
+  gradient/sun, per-map director scale, loading card, LOD (first cut).
+- M15b (f4c7044): LOD hysteresis + pooled impostors (the first cut
+  thrashed batches, starved the outbox and got the player KICKED —
+  root cause of "immortal at 100 HP"); walkable spawn pull-in; bot test
+  now asserts real HP damage on the live room construction path.
+Verified end state: match start → full HUD + lit world instantly;
+death ~20 s solo AFK urban; 200+ fps through match AND stats screen;
+clean rematch. Remaining for item 7: real-latency tuning on deploy,
+release-wasm size (needs binaryen on PATH for wasm-opt), human checklist.
