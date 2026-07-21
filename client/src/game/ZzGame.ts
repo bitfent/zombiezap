@@ -29,24 +29,41 @@ import {
   type ZzSnapshot,
 } from "@shotante/shared";
 import { Input } from "./Input.ts";
+import { Sfx } from "./Audio.ts";
 import type { GameSocket } from "../network/socket.ts";
 
-const INTERNAL_W = 960; // retro internal render res — chunky but readable
-const INTERNAL_H = 540;
+const INTERNAL_H = 540; // retro internal render height; width follows aspect
+const FIRE_COOLDOWN_MS = 250;
 
 /** How hard prediction may disagree with the server before we snap (m). */
 const RECONCILE_SNAP = 0.75;
 /** Gentle pull toward the server position below the snap threshold. */
 const RECONCILE_PULL = 6.0; // 1/s
 
-const ZOMBIE_COLORS: Record<number, number> = {
-  0: 0x5a7d4a, // walker — sickly green
-  1: 0x8a8a55, // runner — gaunt grey-yellow
-  2: 0x44502e, // brute — dark olive
+/** Per-kind skin palettes: [skin base, blotch, cloth] as CSS colors. */
+const ZOMBIE_SKINS: Record<number, [string, string, string]> = {
+  0: ["#6b8a58", "#41582f", "#4a4038"], // walker — sickly green, earth rags
+  1: ["#9a9a63", "#6d6b3c", "#3b3b33"], // runner — gaunt grey-yellow
+  2: ["#4e5a33", "#2f3a1c", "#5a2e24"], // brute — dark olive, wound-red rags
 };
+
+/** Jointed limbs for the shamble/gait cycle (pivots at shoulder/hip). */
+interface Rig {
+  body: THREE.Group;
+  lArm: THREE.Group;
+  rArm: THREE.Group;
+  lLeg: THREE.Group;
+  rLeg: THREE.Group;
+  phase: number;
+  speed: number;
+  px: number;
+  pz: number;
+  init: boolean;
+}
 
 interface RemoteAvatar {
   group: THREE.Group;
+  rig: Rig;
   target: THREE.Vector3;
   yaw: number;
   targetYaw: number;
@@ -54,6 +71,7 @@ interface RemoteAvatar {
 
 interface ZombieAvatar {
   group: THREE.Group;
+  rig: Rig;
   target: THREE.Vector3;
   yaw: number;
   targetYaw: number;
@@ -102,16 +120,68 @@ export class ZzGame {
     this.mySlot = mySlot;
     this.roster = roster;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
-    this.renderer.setSize(INTERNAL_W, INTERNAL_H, false); // CSS upscales, pixelated
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.BasicShadowMap; // hard edges = retro
     this.renderer.shadowMap.autoUpdate = false; // static map → bake once
-    this.camera = new THREE.PerspectiveCamera(80, INTERNAL_W / INTERNAL_H, 0.05, 120);
+    this.camera = new THREE.PerspectiveCamera(80, 16 / 9, 0.05, 120);
     this.camera.rotation.order = "YXZ";
+    // Aspect-true internal res: fixed height, width follows the window — the
+    // crosshair aims exactly where the camera ray goes at any window shape.
+    const fitViewport = () => {
+      const aspect = window.innerWidth / Math.max(1, window.innerHeight);
+      this.renderer.setSize(Math.round(INTERNAL_H * aspect), INTERNAL_H, false);
+      this.camera.aspect = aspect;
+      this.camera.updateProjectionMatrix();
+    };
+    fitViewport();
+    window.addEventListener("resize", fitViewport);
     this.input = new Input(canvas);
+    canvas.addEventListener("pointerdown", () => this.sfx.unlock(), { once: true });
     this.buildWorld();
     this.loadArena(generateArena(seed));
+    this.scene.add(this.camera); // camera hosts the viewmodel
+    this.buildViewmodel();
     if ((import.meta as any).env?.DEV) (window as any).__zz = this;
+  }
+
+  // ── viewmodel gun + muzzle flash (DAKKA) ─────────────────────────────────
+
+  private gun = new THREE.Group();
+  private flash = new THREE.Group();
+  private flashTtl = 0;
+  private recoil = 0;
+  private lastShotAt = 0;
+  private sfx = new Sfx();
+
+  private buildViewmodel(): void {
+    const metal = new THREE.MeshLambertMaterial({ color: 0x23262e });
+    const darker = new THREE.MeshLambertMaterial({ color: 0x171a20 });
+    const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.1, 0.34), metal);
+    const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.035, 0.3), darker);
+    barrel.position.set(0, 0.03, -0.3);
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.12, 0.06), darker);
+    grip.position.set(0, -0.09, 0.08);
+    const mag = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.12, 0.07), metal);
+    mag.position.set(0, -0.1, -0.04);
+    this.gun.add(receiver, barrel, grip, mag);
+    this.gun.position.set(0.26, -0.22, -0.55);
+    this.camera.add(this.gun);
+
+    // muzzle flash: two crossed additive quads at the barrel tip
+    const flashMat = new THREE.MeshBasicMaterial({
+      color: 0xffb347,
+      transparent: true,
+      opacity: 0.95,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    const q1 = new THREE.Mesh(new THREE.PlaneGeometry(0.22, 0.22), flashMat);
+    const q2 = q1.clone();
+    q2.rotation.z = Math.PI / 4;
+    this.flash.add(q1, q2);
+    this.flash.position.set(0, 0.03, -0.48);
+    this.flash.visible = false;
+    this.gun.add(this.flash);
   }
 
   // ── world (ShotAnte recipe) ──────────────────────────────────────────────
@@ -144,6 +214,48 @@ export class ZzGame {
       g.moveTo(i * step, 0);
       g.lineTo(i * step, 128);
       g.stroke();
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.magFilter = THREE.NearestFilter;
+    return tex;
+  }
+
+  /** Building facade: concrete base + two window rows (dark glass, a few lit
+   *  amber). Tinted per map by the material color like the plain concrete was. */
+  private static buildingTexture(base: string, seam: string): THREE.CanvasTexture {
+    const c = document.createElement("canvas");
+    c.width = c.height = 128;
+    const g = c.getContext("2d")!;
+    g.fillStyle = base;
+    g.fillRect(0, 0, 128, 128);
+    for (let i = 0; i < 700; i++) {
+      const v = Math.floor(Math.random() * 150);
+      g.fillStyle = `rgba(${v},${v},${v + 10},0.16)`;
+      g.fillRect(Math.floor(Math.random() * 128), Math.floor(Math.random() * 128), 2, 2);
+    }
+    g.strokeStyle = seam;
+    g.lineWidth = 2;
+    for (const y of [0, 64, 128]) {
+      g.beginPath();
+      g.moveTo(0, y);
+      g.lineTo(128, y);
+      g.stroke();
+    }
+    // two floors of windows: 5 columns × 2 rows
+    for (let row = 0; row < 2; row++) {
+      const wy = 14 + row * 64;
+      for (let col = 0; col < 5; col++) {
+        const wx = 8 + col * 25;
+        g.fillStyle = "#2a3138"; // frame/shadow
+        g.fillRect(wx, wy, 17, 30);
+        const lit = Math.random() < 0.18;
+        g.fillStyle = lit ? "#e8c26a" : "#5b6b7a";
+        g.fillRect(wx + 2, wy + 2, 13, 26);
+        // mullion
+        g.fillStyle = "#2a3138";
+        g.fillRect(wx + 2, wy + 14, 13, 2);
+      }
     }
     const tex = new THREE.CanvasTexture(c);
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
@@ -188,6 +300,7 @@ export class ZzGame {
     const hueA = PASTELS[Math.floor(rng() * PASTELS.length)];
     const hueB = PASTELS[Math.floor(rng() * PASTELS.length)];
     const perimTex = ZzGame.concreteTexture("#aeb6c4", "#9aa2b2", 2, 140);
+    // Plain block look by user decree — window facades tried and cut.
     const buildTex = ZzGame.concreteTexture("#ffffff", "#d8d2c4", 2, 150);
     const crateTex = ZzGame.concreteTexture("#caa36a", "#a8814c", 2, 110);
     const perimMat = new THREE.MeshLambertMaterial({ map: perimTex });
@@ -280,58 +393,174 @@ export class ZzGame {
 
   // ── avatars ──────────────────────────────────────────────────────────────
 
-  /** Boxy Minecraft-style rig (ShotAnte's makeAvatar, simplified: static limbs
-   *  v1 — gait animation returns with the polish pass). Forward is -Z. */
-  private static makeRig(color: number, scale = 1): THREE.Group {
-    const root = new THREE.Group();
-    const mat = new THREE.MeshLambertMaterial({ color });
-    const dark = new THREE.MeshLambertMaterial({
-      color: new THREE.Color(color).multiplyScalar(0.55),
-    });
-
-    const torso = new THREE.BoxGeometry(0.42, 0.62, 0.26).translate(0, 1.14, 0);
-    const head = new THREE.BoxGeometry(0.34, 0.34, 0.32).translate(0, 1.62, 0);
-    root.add(new THREE.Mesh(mergeGeometries([torso, head]), mat));
-
-    // face patch: read the facing at a glance
-    const face = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.12, 0.02), dark);
-    face.position.set(0, 1.64, -0.17);
-    root.add(face);
-
-    const armGeo = new THREE.BoxGeometry(0.12, 0.5, 0.12);
-    const lArm = new THREE.Mesh(armGeo, dark);
-    lArm.position.set(-0.3, 1.18, 0);
-    const rArm = new THREE.Mesh(armGeo, dark);
-    rArm.position.set(0.3, 1.18, 0);
-    const legGeo = new THREE.BoxGeometry(0.15, 0.8, 0.15);
-    const lLeg = new THREE.Mesh(legGeo, dark);
-    lLeg.position.set(-0.12, 0.4, 0);
-    const rLeg = new THREE.Mesh(legGeo, dark);
-    rLeg.position.set(0.12, 0.4, 0);
-    root.add(lArm, rArm, lLeg, rLeg);
-
-    root.traverse((o) => {
-      (o as THREE.Mesh).castShadow = false;
-    });
-    root.scale.setScalar(scale);
-    return root;
+  /** Mottled decayed-skin texture: base tone + blotch clusters + speckle.
+   *  Same canvas approach as the world's concrete — zero assets. */
+  private static skinTexture(base: string, blotch: string): THREE.CanvasTexture {
+    const c = document.createElement("canvas");
+    c.width = c.height = 64;
+    const g = c.getContext("2d")!;
+    g.fillStyle = base;
+    g.fillRect(0, 0, 64, 64);
+    g.fillStyle = blotch;
+    for (let i = 0; i < 26; i++) {
+      const x = Math.random() * 64;
+      const y = Math.random() * 64;
+      const r = 2 + Math.random() * 6;
+      g.globalAlpha = 0.35 + Math.random() * 0.35;
+      g.beginPath();
+      g.ellipse(x, y, r, r * (0.5 + Math.random()), Math.random() * Math.PI, 0, Math.PI * 2);
+      g.fill();
+    }
+    g.globalAlpha = 0.2;
+    for (let i = 0; i < 220; i++) {
+      const v = Math.floor(Math.random() * 70);
+      g.fillStyle = `rgb(${v},${v},${v})`;
+      g.fillRect(Math.floor(Math.random() * 64), Math.floor(Math.random() * 64), 1, 1);
+    }
+    g.globalAlpha = 1;
+    const tex = new THREE.CanvasTexture(c);
+    tex.magFilter = THREE.NearestFilter;
+    return tex;
   }
 
-  private zombieRig(kind: number): THREE.Group {
-    const color = ZOMBIE_COLORS[kind] ?? ZOMBIE_COLORS[0];
-    const scale = kind === 2 ? 1.45 : kind === 1 ? 0.95 : 1.0;
-    const g = ZzGame.makeRig(color, scale);
-    // zombie arms forward — the classic silhouette
-    const [, , lArm, rArm] = g.children as THREE.Mesh[];
-    if (lArm && rArm) {
-      lArm.rotation.x = -Math.PI / 2.3;
-      lArm.position.z = -0.22;
-      lArm.position.y = 1.3;
-      rArm.rotation.x = -Math.PI / 2.3;
-      rArm.position.z = -0.22;
-      rArm.position.y = 1.3;
+  /** Zombie face: dark sockets + glowing ember eyes on a small front plate. */
+  private static faceTexture(): THREE.CanvasTexture {
+    const c = document.createElement("canvas");
+    c.width = 32;
+    c.height = 16;
+    const g = c.getContext("2d")!;
+    g.fillStyle = "#181410";
+    g.fillRect(0, 0, 32, 16);
+    for (const ex of [9, 23]) {
+      g.fillStyle = "#000000";
+      g.fillRect(ex - 4, 3, 8, 8); // socket pit
+      g.fillStyle = "#ff5a2a";
+      g.fillRect(ex - 2, 5, 4, 4); // ember
+      g.fillStyle = "#ffd23f";
+      g.fillRect(ex - 1, 6, 2, 2); // hot core
     }
-    return g;
+    const tex = new THREE.CanvasTexture(c);
+    tex.magFilter = THREE.NearestFilter;
+    return tex;
+  }
+
+  /** Jointed boxy rig. Limb groups pivot at the shoulder/hip so the gait
+   *  cycle can swing them (ShotAnte's animateAvatar approach). Forward -Z. */
+  private static makeRig(
+    skinMat: THREE.Material,
+    clothMat: THREE.Material,
+    faceMat: THREE.Material | null,
+    scale = 1,
+  ): { group: THREE.Group; rig: Rig } {
+    const group = new THREE.Group();
+    const body = new THREE.Group();
+    group.add(body);
+
+    // torso wears cloth; head is skin
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.62, 0.26), clothMat);
+    torso.position.y = 1.14;
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.34, 0.32), skinMat);
+    head.position.y = 1.62;
+    body.add(torso, head);
+
+    if (faceMat) {
+      const face = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.15), faceMat);
+      face.position.set(0, 1.63, -0.165);
+      face.rotation.y = Math.PI; // plane faces +Z by default; rig forward is -Z
+      body.add(face);
+    }
+
+    // limbs: geometry hangs below the pivot so rotation swings from the joint
+    const limb = (w: number, len: number, mat: THREE.Material) => {
+      const g = new THREE.Group();
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, len, w), mat);
+      m.position.y = -len / 2;
+      g.add(m);
+      return g;
+    };
+    const lArm = limb(0.12, 0.52, skinMat);
+    lArm.position.set(-0.3, 1.42, 0);
+    const rArm = limb(0.12, 0.52, skinMat);
+    rArm.position.set(0.3, 1.42, 0);
+    const lLeg = limb(0.15, 0.8, clothMat);
+    lLeg.position.set(-0.12, 0.8, 0);
+    const rLeg = limb(0.15, 0.8, clothMat);
+    rLeg.position.set(0.12, 0.8, 0);
+    body.add(lArm, rArm, lLeg, rLeg);
+
+    group.scale.setScalar(scale);
+    return {
+      group,
+      rig: { body, lArm, rArm, lLeg, rLeg, phase: Math.random() * 6.28, speed: 0, px: 0, pz: 0, init: false },
+    };
+  }
+
+  private zombieMats = new Map<number, { skin: THREE.Material; cloth: THREE.Material; face: THREE.Material }>();
+  private survivorMats: { skin: THREE.Material; cloth: THREE.Material } | null = null;
+
+  private zombieRig(kind: number): { group: THREE.Group; rig: Rig } {
+    let mats = this.zombieMats.get(kind);
+    if (!mats) {
+      const [base, blotch, cloth] = ZOMBIE_SKINS[kind] ?? ZOMBIE_SKINS[0];
+      mats = {
+        skin: new THREE.MeshLambertMaterial({ map: ZzGame.skinTexture(base, blotch) }),
+        cloth: new THREE.MeshLambertMaterial({ map: ZzGame.skinTexture(cloth, "#1c1814") }),
+        face: new THREE.MeshBasicMaterial({ map: ZzGame.faceTexture() }),
+      };
+      this.zombieMats.set(kind, mats);
+    }
+    const scale = kind === 2 ? 1.45 : kind === 1 ? 0.95 : 1.0;
+    const made = ZzGame.makeRig(mats.skin, mats.cloth, mats.face, scale);
+    // arms raised forward + hungry forward hunch — the shamble silhouette
+    made.rig.lArm.rotation.x = -Math.PI / 2.4;
+    made.rig.rArm.rotation.x = -Math.PI / 2.4;
+    made.rig.body.rotation.x = kind === 1 ? 0.28 : 0.14; // runners lope low
+    return made;
+  }
+
+  /** Drive one rig's gait from its position delta (donor recipe: low-passed
+   *  speed → alternating swing + bob; zombies lurch, arms stay raised). */
+  private static animateRig(rig: Rig, x: number, y: number, z: number, dt: number, zombie: boolean): void {
+    if (!rig.init) {
+      rig.px = x;
+      rig.pz = z;
+      rig.init = true;
+    }
+    const raw = Math.hypot(x - rig.px, z - rig.pz) / Math.max(dt, 1e-3);
+    rig.px = x;
+    rig.pz = z;
+    rig.speed += (Math.min(raw, 9) - rig.speed) * Math.min(1, dt * 12);
+    const ease = Math.min(1, dt * 12);
+
+    if (y > 0.12) {
+      rig.lLeg.rotation.x += (-0.5 - rig.lLeg.rotation.x) * ease;
+      rig.rLeg.rotation.x += (0.5 - rig.rLeg.rotation.x) * ease;
+      rig.body.position.y += (0 - rig.body.position.y) * ease;
+    } else if (rig.speed > 0.3) {
+      const amp = Math.min(0.25 + rig.speed * 0.09, 0.8);
+      rig.phase += rig.speed * dt * 2.2;
+      const s = Math.sin(rig.phase);
+      rig.lLeg.rotation.x = s * amp;
+      rig.rLeg.rotation.x = -s * amp;
+      rig.body.position.y = Math.abs(s) * 0.05;
+      if (zombie) {
+        // shamble: heavy lateral lurch, uneven step, arms wavering off-phase
+        rig.body.rotation.z = s * 0.14;
+        rig.lLeg.rotation.x = s * amp * 1.15; // dragging, asymmetric gait
+        rig.rLeg.rotation.x = -s * amp * 0.8;
+        rig.lArm.rotation.x = -Math.PI / 2.4 + Math.sin(rig.phase * 0.9) * 0.18;
+        rig.rArm.rotation.x = -Math.PI / 2.4 + Math.cos(rig.phase * 1.1) * 0.18;
+        rig.lArm.rotation.z = Math.sin(rig.phase * 0.7) * 0.1;
+      } else {
+        rig.lArm.rotation.x = -s * amp * 0.7;
+        rig.rArm.rotation.x = s * amp * 0.7;
+      }
+    } else {
+      rig.lLeg.rotation.x += (0 - rig.lLeg.rotation.x) * ease;
+      rig.rLeg.rotation.x += (0 - rig.rLeg.rotation.x) * ease;
+      rig.body.position.y += (0 - rig.body.position.y) * ease;
+      if (zombie) rig.body.rotation.z += (0 - rig.body.rotation.z) * ease;
+    }
   }
 
   // ── snapshots ────────────────────────────────────────────────────────────
@@ -370,10 +599,16 @@ export class ZzGame {
       // remote player
       let av = this.remotes.get(p.slot);
       if (!av && p.alive) {
-        const group = ZzGame.makeRig(0x3a6ea5);
-        this.scene.add(group);
-        av = { group, target: new THREE.Vector3(x, y, z), yaw: 0, targetYaw: 0 };
-        group.position.set(x, y, z);
+        if (!this.survivorMats) {
+          this.survivorMats = {
+            skin: new THREE.MeshLambertMaterial({ color: 0xd8b590 }),
+            cloth: new THREE.MeshLambertMaterial({ map: ZzGame.skinTexture("#31527d", "#223a59") }),
+          };
+        }
+        const made = ZzGame.makeRig(this.survivorMats.skin, this.survivorMats.cloth, null);
+        this.scene.add(made.group);
+        av = { group: made.group, rig: made.rig, target: new THREE.Vector3(x, y, z), yaw: 0, targetYaw: 0 };
+        made.group.position.set(x, y, z);
         this.remotes.set(p.slot, av);
       }
       if (av) {
@@ -389,16 +624,17 @@ export class ZzGame {
       seen.add(z.id);
       let av = this.zombies.get(z.id);
       if (!av) {
-        const group = this.zombieRig(z.kind);
-        this.scene.add(group);
+        const made = this.zombieRig(z.kind);
+        this.scene.add(made.group);
         av = {
-          group,
+          group: made.group,
+          rig: made.rig,
           target: new THREE.Vector3(),
           yaw: 0,
           targetYaw: 0,
           kind: z.kind,
         };
-        group.position.set(dequantPos(z.pos[0]), dequantPos(z.pos[1]), dequantPos(z.pos[2]));
+        made.group.position.set(dequantPos(z.pos[0]), dequantPos(z.pos[1]), dequantPos(z.pos[2]));
         this.zombies.set(z.id, av);
       }
       av.target.set(dequantPos(z.pos[0]), dequantPos(z.pos[1]), dequantPos(z.pos[2]));
@@ -429,13 +665,14 @@ export class ZzGame {
       }
     }
 
-    // tracers for this tick's shots
+    // tracers + hit feedback for this tick's shots
     for (const sh of snap.shots) {
       this.addTracer(sh.slot, [
         dequantPos(sh.end[0]),
         dequantPos(sh.end[1]),
         dequantPos(sh.end[2]),
       ]);
+      if (sh.slot === this.mySlot && sh.hitKind > 0) this.sfx.hit();
     }
   }
 
@@ -520,21 +757,56 @@ export class ZzGame {
       this.sequence++;
     }
 
-    // camera
-    this.camera.position.set(this.body.x, this.body.y + PLAYER_EYE, this.body.z);
-    this.camera.rotation.set(this.input.pitch, this.input.yaw, 0);
+    // local fire feedback: flash + recoil kick + gunshot crack (server owns
+    // the actual hitscan; its tracer/hit arrives in the next snapshot)
+    const now = performance.now();
+    if (input.shoot && this.spawned && now - this.lastShotAt >= FIRE_COOLDOWN_MS) {
+      this.lastShotAt = now;
+      this.recoil = 1;
+      this.flashTtl = 0.05;
+      this.flash.visible = true;
+      this.flash.rotation.z = Math.random() * Math.PI;
+      this.sfx.shoot();
+    }
+    this.recoil += (0 - this.recoil) * Math.min(1, dt * 14);
+    if (this.flashTtl > 0) {
+      this.flashTtl -= dt;
+      if (this.flashTtl <= 0) this.flash.visible = false;
+    }
+    this.gun.position.z = -0.55 + this.recoil * 0.06; // gun kicks back
+    this.gun.rotation.x = this.recoil * 0.18;
 
-    // interpolate remotes + zombies toward their latest server targets
+    // camera (recoil lifts the view a touch)
+    this.camera.position.set(this.body.x, this.body.y + PLAYER_EYE, this.body.z);
+    this.camera.rotation.set(this.input.pitch + this.recoil * 0.035, this.input.yaw, 0);
+
+    // interpolate remotes + zombies toward their latest server targets.
+    // Large jumps (spawn reseats, watchdog teleports) SNAP — lerping them
+    // reads as zombies zooming across the map.
     const lerpK = Math.min(1, dt * 12);
+    const SNAP_DIST_SQ = 2.5 * 2.5;
     for (const av of this.remotes.values()) {
-      av.group.position.lerp(av.target, lerpK);
-      av.yaw = ZzGame.angleLerp(av.yaw, av.targetYaw, lerpK);
+      if (av.group.position.distanceToSquared(av.target) > SNAP_DIST_SQ) {
+        av.group.position.copy(av.target);
+        av.yaw = av.targetYaw;
+      } else {
+        av.group.position.lerp(av.target, lerpK);
+        av.yaw = ZzGame.angleLerp(av.yaw, av.targetYaw, lerpK);
+      }
       av.group.rotation.y = av.yaw;
+      ZzGame.animateRig(av.rig, av.group.position.x, av.group.position.y, av.group.position.z, dt, false);
     }
     for (const av of this.zombies.values()) {
-      av.group.position.lerp(av.target, lerpK);
-      av.yaw = ZzGame.angleLerp(av.yaw, av.targetYaw, lerpK);
+      if (av.group.position.distanceToSquared(av.target) > SNAP_DIST_SQ) {
+        av.group.position.copy(av.target);
+        av.yaw = av.targetYaw;
+        av.rig.init = false; // don't count the teleport as sprint speed
+      } else {
+        av.group.position.lerp(av.target, lerpK);
+        av.yaw = ZzGame.angleLerp(av.yaw, av.targetYaw, lerpK);
+      }
       av.group.rotation.y = av.yaw;
+      ZzGame.animateRig(av.rig, av.group.position.x, av.group.position.y, av.group.position.z, dt, true);
     }
 
     // loot idle spin
