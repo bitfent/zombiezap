@@ -73,6 +73,9 @@ impl Plugin for GamePlugin {
                 Update,
                 (
                     connect_on_start,
+                    // M25: bake shared zombie textures once Session leaves Boot.
+                    // Separate system keeps net_poll under Bevy's param-tuple limit.
+                    ensure_rig_assets,
                     net_poll,
                     process_intents,
                     sync_cursor,
@@ -352,6 +355,27 @@ fn connect_on_start(mut session: ResMut<Session>, mut net: ResMut<NetClient>) {
     }
 }
 
+/// One-shot shared mesh/material/texture bank for rigs (zombies + survivors).
+/// Runs after Boot so first frames stay lean; M25 bakes procedural skin/cloth
+/// textures here (shared handles — no per-entity allocation).
+fn ensure_rig_assets(
+    mut commands: Commands,
+    session: Res<Session>,
+    assets: Option<Res<RigAssets>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if assets.is_some() {
+        return;
+    }
+    if matches!(*session, Session::Boot | Session::Connecting) {
+        return;
+    }
+    let bank = RigAssets::build(&mut meshes, &mut materials, &mut images);
+    commands.insert_resource(bank);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn net_poll(
     mut commands: Commands,
@@ -363,17 +387,15 @@ fn net_poll(
     mut remotes: Query<(Entity, &mut RemotePlayer)>,
     mut zombies: Query<(Entity, &mut RemoteZombie, &Transform, Option<&HumanoidRig>)>,
     assets: Option<Res<RigAssets>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut seams: SeamWrites,
     mut vm_kick: ResMut<ViewmodelKick>,
     mut voice_rx: ResMut<VoiceRx>,
     mut hit_flashes: ResMut<PendingHitFlashes>,
     mut cam_nudge: ResMut<CameraNudge>,
 ) {
-    // one-time shared rig mesh/material bank
-    // M19: defer until Menu (or later) so Boot/Connecting frames stay lean —
-    // match materials warm while the player is on the menu, not on frame 1.
+    // Shared rig bank is built by [`ensure_rig_assets`] (M25 textures).
+    // M19: defer until Menu so Boot/Connecting frames stay lean — drain net
+    // while waiting so connect/lobby handshakes still land.
     if assets.is_none() {
         if matches!(*session, Session::Boot | Session::Connecting) {
             for ev in net.drain() {
@@ -414,9 +436,8 @@ fn net_poll(
             }
             return;
         }
-        let bank = RigAssets::build(&mut meshes, &mut materials);
-        commands.insert_resource(bank);
-        return; // assets visible next frame; nothing else depends on this tick
+        // Menu+ but bank not inserted yet (same-frame as ensure_rig_assets).
+        return;
     }
     let assets = assets.unwrap();
     let now = time.elapsed_secs_f64();

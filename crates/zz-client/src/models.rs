@@ -6,10 +6,19 @@
 //! Hierarchy (Minecraft-style pivots): root → body → {torso, head, eyes?,
 //! limb pivots → hanging cuboids}. Joint rotation swings limbs; the root
 //! carries world translation/yaw from interpolation.
+//!
+//! M25: zombie bodies use canvas-style procedural textures (mottled decayed
+//! skin + torn clothing) with per-part material handles so limbs/head/torso
+//! separate at close range. Materials stay shared across the horde.
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
-use bevy::prelude::*;
+use bevy::{
+    asset::RenderAssetUsages,
+    image::{Image, ImageSampler},
+    prelude::*,
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+};
 
 // ── shared geometry proportions (metres, upright rest pose) ────────────────
 // Zombie blocks intentionally read larger / more menacing than survivors:
@@ -56,6 +65,12 @@ const Z_EYE_S: f32 = 0.09;
 const Z_EYE_Y: f32 = 1.64;
 const Z_EYE_Z: f32 = -0.22;
 const Z_EYE_X: f32 = 0.10;
+/// Dark socket pits slightly larger and recessed behind the glow orbs.
+const Z_SOCKET_S: f32 = 0.13;
+const Z_SOCKET_Z: f32 = -0.175;
+
+/// Procedural body texture edge length (PS2/pixel grain, WebGL2-safe).
+const ZOMBIE_TEX_SIZE: u32 = 64;
 
 /// Max limb swing |angle| (radians) at any speed — tests assert against this.
 pub const MAX_LIMB_SWING: f32 = 0.85;
@@ -104,13 +119,62 @@ pub fn kind_scale(kind: u8) -> Vec3 {
 }
 
 /// Kind → high-contrast body colour (walker / runner / brute silhouettes).
-/// Boosted separation so kinds read at mid-range under sun-bleached fog.
+/// Matches the average of each kind's procedural skin texture so mid-range
+/// fog read and far LOD impostors stay in the same colour family.
 pub fn kind_color(kind: u8) -> Color {
     match kind {
-        1 => Color::srgb(0.72, 0.78, 0.18), // runner: sickly chartreuse
-        2 => Color::srgb(0.14, 0.22, 0.12), // brute: near-black bulk
-        _ => Color::srgb(0.22, 0.55, 0.20), // walker: saturated rotten green
+        1 => Color::srgb(0.62, 0.66, 0.28), // runner: gaunt grey-yellow
+        2 => Color::srgb(0.18, 0.26, 0.14), // brute: dark olive bulk
+        _ => Color::srgb(0.32, 0.48, 0.30), // walker: sickly grey-green
     }
+}
+
+/// Per-kind RGB palette for procedural skin / clothing textures (u8 sRGB).
+///
+/// - Walker: sickly grey-green skin, dull torn shirt
+/// - Runner: gaunt grey-yellow skin, darker rags
+/// - Brute: dark olive skin with red-brown wound blotches, heavy rags
+fn kind_texture_palette(kind: u8) -> KindTexPalette {
+    match kind {
+        1 => KindTexPalette {
+            skin_base: [148, 155, 72],
+            skin_blotch: [95, 88, 48],
+            cloth_base: [52, 48, 40],
+            cloth_seam: [32, 30, 26],
+            jaw: Color::srgb(0.22, 0.24, 0.10),
+            limb_tint: Color::srgb(0.82, 0.84, 0.78),
+            emissive: 0.12,
+        },
+        2 => KindTexPalette {
+            skin_base: [48, 68, 40],
+            skin_blotch: [110, 48, 36], // exposed-wound red-brown
+            cloth_base: [36, 38, 34],
+            cloth_seam: [22, 20, 18],
+            jaw: Color::srgb(0.08, 0.10, 0.06),
+            limb_tint: Color::srgb(0.78, 0.80, 0.72),
+            emissive: 0.08,
+        },
+        _ => KindTexPalette {
+            skin_base: [78, 118, 72],
+            skin_blotch: [48, 68, 42],
+            cloth_base: [88, 84, 72],
+            cloth_seam: [58, 54, 46],
+            jaw: Color::srgb(0.14, 0.18, 0.12),
+            limb_tint: Color::srgb(0.84, 0.88, 0.80),
+            emissive: 0.10,
+        },
+    }
+}
+
+struct KindTexPalette {
+    skin_base: [u8; 3],
+    skin_blotch: [u8; 3],
+    cloth_base: [u8; 3],
+    cloth_seam: [u8; 3],
+    jaw: Color,
+    /// Multiplies the shared skin texture on limbs so arms/legs separate.
+    limb_tint: Color,
+    emissive: f32,
 }
 
 /// Per-kind silhouette scale factors (head bulk × arm length) for tests /
@@ -240,22 +304,185 @@ pub fn slot_color(slot: u8) -> Color {
     PALETTE[slot as usize % PALETTE.len()]
 }
 
+// ── procedural zombie textures (M16 ShotAnte canvas recipe, bodies) ────────
+
+/// Tiny deterministic hash → [0, 1). Not rand; same recipe as map_render.
+fn tex_hash(x: u32, y: u32, salt: u32) -> f32 {
+    let mut n = x
+        .wrapping_mul(374761393)
+        .wrapping_add(y.wrapping_mul(668265263))
+        .wrapping_add(salt.wrapping_mul(2246822519));
+    n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+    n ^= n >> 16;
+    (n & 0xffff) as f32 / 65535.0
+}
+
+fn rgba_image(width: u32, height: u32, pixels: Vec<u8>) -> Image {
+    let mut image = Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    image
+}
+
+/// Mottled decayed skin: base fill + grain specks + darker blotch clusters.
+fn gen_decayed_skin(size: u32, base: [u8; 3], blotch: [u8; 3], salt: u32) -> Image {
+    let n = (size * size) as usize;
+    let mut px = vec![0u8; n * 4];
+    for i in 0..n {
+        let o = i * 4;
+        px[o] = base[0];
+        px[o + 1] = base[1];
+        px[o + 2] = base[2];
+        px[o + 3] = 255;
+    }
+    // ~700 grain 2×2 specks (ShotAnte-style canvas grit).
+    for i in 0..700u32 {
+        let u = (tex_hash(i, 0, salt.wrapping_add(701)) * size as f32).floor() as u32 % size;
+        let v = (tex_hash(i, 1, salt.wrapping_add(702)) * size as f32).floor() as u32 % size;
+        let g = (tex_hash(i, 2, salt.wrapping_add(703)) * 140.0).floor() as i32;
+        let gr = g.clamp(0, 255) as u8;
+        const A: f32 = 0.22;
+        for dy in 0..2u32 {
+            for dx in 0..2u32 {
+                let x = (u + dx) % size;
+                let y = (v + dy) % size;
+                let o = ((y * size + x) * 4) as usize;
+                px[o] = ((gr as f32) * A + px[o] as f32 * (1.0 - A)) as u8;
+                px[o + 1] = ((gr as f32) * A + px[o + 1] as f32 * (1.0 - A)) as u8;
+                px[o + 2] = ((gr as f32) * A + px[o + 2] as f32 * (1.0 - A)) as u8;
+            }
+        }
+    }
+    // Darker blotch clusters (decay / wound patches).
+    for i in 0..16u32 {
+        let cx = (tex_hash(i, 10, salt.wrapping_add(811)) * size as f32).floor() as i32;
+        let cy = (tex_hash(i, 11, salt.wrapping_add(812)) * size as f32).floor() as i32;
+        let rad = 2 + (tex_hash(i, 12, salt.wrapping_add(813)) * 6.0).floor() as i32;
+        let mix = 0.35 + tex_hash(i, 13, salt.wrapping_add(814)) * 0.45;
+        for dy in -rad..=rad {
+            for dx in -rad..=rad {
+                if dx * dx + dy * dy > rad * rad {
+                    continue;
+                }
+                let x = (cx + dx).rem_euclid(size as i32) as u32;
+                let y = (cy + dy).rem_euclid(size as i32) as u32;
+                let o = ((y * size + x) * 4) as usize;
+                // Soft falloff toward blotch colour.
+                let d = ((dx * dx + dy * dy) as f32).sqrt() / rad.max(1) as f32;
+                let a = mix * (1.0 - d * 0.85);
+                px[o] = ((blotch[0] as f32) * a + px[o] as f32 * (1.0 - a)) as u8;
+                px[o + 1] = ((blotch[1] as f32) * a + px[o + 1] as f32 * (1.0 - a)) as u8;
+                px[o + 2] = ((blotch[2] as f32) * a + px[o + 2] as f32 * (1.0 - a)) as u8;
+            }
+        }
+    }
+    rgba_image(size, size, px)
+}
+
+/// Torn clothing band: base fabric + grain + horizontal tear/seam strips.
+fn gen_torn_cloth(size: u32, base: [u8; 3], seam: [u8; 3], salt: u32) -> Image {
+    let n = (size * size) as usize;
+    let mut px = vec![0u8; n * 4];
+    for i in 0..n {
+        let o = i * 4;
+        px[o] = base[0];
+        px[o + 1] = base[1];
+        px[o + 2] = base[2];
+        px[o + 3] = 255;
+    }
+    // Fabric grain.
+    for i in 0..500u32 {
+        let u = (tex_hash(i, 0, salt.wrapping_add(901)) * size as f32).floor() as u32 % size;
+        let v = (tex_hash(i, 1, salt.wrapping_add(902)) * size as f32).floor() as u32 % size;
+        let g = (tex_hash(i, 2, salt.wrapping_add(903)) * 100.0).floor() as i32;
+        let gr = g.clamp(0, 255) as u8;
+        const A: f32 = 0.18;
+        let o = ((v * size + u) * 4) as usize;
+        px[o] = ((gr as f32) * A + px[o] as f32 * (1.0 - A)) as u8;
+        px[o + 1] = ((gr as f32) * A + px[o + 1] as f32 * (1.0 - A)) as u8;
+        px[o + 2] = ((gr as f32) * A + px[o + 2] as f32 * (1.0 - A)) as u8;
+    }
+    // Horizontal tear bands + a few vertical rips.
+    for band in 0..5u32 {
+        let y0 = ((band as f32 + 0.4) * size as f32 / 5.5).floor() as u32 % size;
+        let thickness = 1 + (tex_hash(band, 20, salt.wrapping_add(920)) * 2.5).floor() as u32;
+        for t in 0..thickness {
+            let y = (y0 + t) % size;
+            for x in 0..size {
+                // Jagged gap: skip some texels so it reads as torn, not a stripe.
+                if tex_hash(x, y, salt.wrapping_add(930 + band)) < 0.22 {
+                    continue;
+                }
+                let o = ((y * size + x) * 4) as usize;
+                px[o] = seam[0];
+                px[o + 1] = seam[1];
+                px[o + 2] = seam[2];
+            }
+        }
+    }
+    for rip in 0..4u32 {
+        let x0 = (tex_hash(rip, 30, salt.wrapping_add(940)) * size as f32).floor() as u32 % size;
+        let y_start = (tex_hash(rip, 31, salt.wrapping_add(941)) * size as f32 * 0.5).floor() as u32;
+        let len = size / 3 + (tex_hash(rip, 32, salt.wrapping_add(942)) * size as f32 * 0.3).floor() as u32;
+        for dy in 0..len {
+            let y = (y_start + dy) % size;
+            let x = (x0 + (tex_hash(dy, rip, salt.wrapping_add(950)) * 3.0).floor() as u32) % size;
+            let o = ((y * size + x) * 4) as usize;
+            px[o] = seam[0];
+            px[o + 1] = seam[1];
+            px[o + 2] = seam[2];
+        }
+    }
+    rgba_image(size, size, px)
+}
+
 // ── shared GPU assets ──────────────────────────────────────────────────────
+
+/// Per-kind zombie material set (shared across every zombie of that kind).
+///
+/// Skin / clothing / limb / jaw separate at point-blank so the body does not
+/// read as one flat mass. Far impostors use [`RigAssets::zombie_mats`] (skin).
+#[derive(Clone)]
+pub struct ZombieMatSet {
+    /// Mottled decayed skin (head + base colour family).
+    pub skin: Handle<StandardMaterial>,
+    /// Torn clothing band on the torso.
+    pub clothing: Handle<StandardMaterial>,
+    /// Same skin texture, darker tint — arms/legs form separation.
+    pub limb: Handle<StandardMaterial>,
+    /// Darker jaw / mouth shadow (2-tone face read).
+    pub jaw: Handle<StandardMaterial>,
+}
 
 /// Shared meshes + materials for every rigged entity and the viewmodel.
 ///
 /// **Batching contract (horde perf):** every zombie of kind K reuses the same
-/// `zombie_mats[K]` + `unit_cube` + `eye_mat` handles. Only hit-flash FX clones
-/// a material (README note 23). Do not add per-zombie mesh/material at spawn.
+/// `zombie_sets[K]` + `zombie_mats[K]` + `unit_cube` + eye handles. Only
+/// hit-flash FX clones a material (README note 23). Do not add per-zombie
+/// mesh/material at spawn.
 #[derive(Resource)]
 pub struct RigAssets {
     pub unit_cube: Handle<Mesh>,
-    /// Walker / runner / brute body materials (shared across the horde).
+    /// Walker / runner / brute primary mats (skin — impostor + `body_mat` API).
+    /// Always textured (`base_color_texture` is `Some`).
     pub zombie_mats: [Handle<StandardMaterial>; 3],
+    /// Full per-kind part sets (skin / clothing / limb / jaw).
+    pub zombie_sets: [ZombieMatSet; 3],
     /// Glowing eyes — one handle for all zombies (high emissive for 30 m+).
     pub eye_mat: Handle<StandardMaterial>,
     /// Brighter frenzy eyes (late-wave walkers).
     pub eye_mat_frenzy: Handle<StandardMaterial>,
+    /// Dark eye-socket pits behind the glow orbs (shared).
+    pub eye_socket_mat: Handle<StandardMaterial>,
     pub player_mats: Vec<Handle<StandardMaterial>>,
     pub gun_mat: Handle<StandardMaterial>,
     /// Base colour for muzzle-flash clones (each flash gets a unique handle).
@@ -266,6 +493,7 @@ impl RigAssets {
     pub fn build(
         meshes: &mut Assets<Mesh>,
         materials: &mut Assets<StandardMaterial>,
+        images: &mut Assets<Image>,
     ) -> Self {
         let entity_mat = |c: Color, emissive_scale: f32| StandardMaterial {
             base_color: c,
@@ -275,11 +503,87 @@ impl RigAssets {
             ..default()
         };
 
-        let zombie_mats = [
-            materials.add(entity_mat(kind_color(0), 0.14)),
-            materials.add(entity_mat(kind_color(1), 0.18)),
-            materials.add(entity_mat(kind_color(2), 0.10)),
+        let mut zombie_mats = [Handle::default(), Handle::default(), Handle::default()];
+        let mut zombie_sets: [ZombieMatSet; 3] = [
+            ZombieMatSet {
+                skin: Handle::default(),
+                clothing: Handle::default(),
+                limb: Handle::default(),
+                jaw: Handle::default(),
+            },
+            ZombieMatSet {
+                skin: Handle::default(),
+                clothing: Handle::default(),
+                limb: Handle::default(),
+                jaw: Handle::default(),
+            },
+            ZombieMatSet {
+                skin: Handle::default(),
+                clothing: Handle::default(),
+                limb: Handle::default(),
+                jaw: Handle::default(),
+            },
         ];
+
+        for kind in 0u8..3 {
+            let pal = kind_texture_palette(kind);
+            let salt = 1100u32.wrapping_add(kind as u32 * 97);
+            let skin_img = images.add(gen_decayed_skin(
+                ZOMBIE_TEX_SIZE,
+                pal.skin_base,
+                pal.skin_blotch,
+                salt,
+            ));
+            let cloth_img = images.add(gen_torn_cloth(
+                ZOMBIE_TEX_SIZE,
+                pal.cloth_base,
+                pal.cloth_seam,
+                salt.wrapping_add(50),
+            ));
+
+            let avg = kind_color(kind);
+            let skin = materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                base_color_texture: Some(skin_img.clone()),
+                emissive: avg.to_linear() * pal.emissive,
+                perceptual_roughness: 0.92,
+                metallic: 0.0,
+                ..default()
+            });
+            let clothing = materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                base_color_texture: Some(cloth_img),
+                emissive: avg.to_linear() * (pal.emissive * 0.45),
+                perceptual_roughness: 0.95,
+                metallic: 0.0,
+                ..default()
+            });
+            // Same skin map, darker value — limbs read separate without extra tex.
+            let limb = materials.add(StandardMaterial {
+                base_color: pal.limb_tint,
+                base_color_texture: Some(skin_img),
+                emissive: avg.to_linear() * (pal.emissive * 0.7),
+                perceptual_roughness: 0.92,
+                metallic: 0.0,
+                ..default()
+            });
+            let jaw = materials.add(StandardMaterial {
+                base_color: pal.jaw,
+                emissive: pal.jaw.to_linear() * 0.04,
+                perceptual_roughness: 0.95,
+                metallic: 0.0,
+                ..default()
+            });
+
+            let k = kind as usize;
+            zombie_mats[k] = skin.clone();
+            zombie_sets[k] = ZombieMatSet {
+                skin,
+                clothing,
+                limb,
+                jaw,
+            };
+        }
 
         // Hot emissive eyes — readable through fog at 30 m+ without bloom.
         let eye_mat = materials.add(StandardMaterial {
@@ -292,6 +596,14 @@ impl RigAssets {
         let eye_mat_frenzy = materials.add(StandardMaterial {
             base_color: Color::srgb(1.0, 0.35, 0.08),
             emissive: LinearRgba::rgb(36.0, 6.0, 0.6),
+            perceptual_roughness: 1.0,
+            metallic: 0.0,
+            ..default()
+        });
+        // Dark pits behind the glow so the face reads at 1–3 m.
+        let eye_socket_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.04, 0.05, 0.03),
+            emissive: LinearRgba::rgb(0.0, 0.0, 0.0),
             perceptual_roughness: 1.0,
             metallic: 0.0,
             ..default()
@@ -312,20 +624,28 @@ impl RigAssets {
         Self {
             unit_cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
             zombie_mats,
+            zombie_sets,
             eye_mat,
             eye_mat_frenzy,
+            eye_socket_mat,
             player_mats,
             gun_mat,
             muzzle_flash_color: Color::srgba(1.0, 0.85, 0.35, 0.95),
         }
     }
 
+    /// Primary body material: zombie skin (textured) or survivor slot colour.
     pub fn body_mat(&self, is_zombie: bool, kind_or_slot: u8) -> Handle<StandardMaterial> {
         if is_zombie {
             self.zombie_mats[kind_or_slot.min(2) as usize].clone()
         } else {
             self.player_mats[kind_or_slot as usize % self.player_mats.len()].clone()
         }
+    }
+
+    /// Per-kind part materials for zombie rigs (shared handles).
+    pub fn zombie_set(&self, kind: u8) -> &ZombieMatSet {
+        &self.zombie_sets[kind.min(2) as usize]
     }
 }
 
@@ -450,9 +770,23 @@ pub fn attach_humanoid(
     kind_or_slot: u8,
     id_for_phase: u16,
 ) -> HumanoidRig {
-    let mat = assets.body_mat(is_zombie, kind_or_slot);
     let cube = assets.unit_cube.clone();
     let eye_mat = assets.eye_mat.clone();
+    let socket_mat = assets.eye_socket_mat.clone();
+    // Survivors: one slot colour. Zombies: skin / clothing / limb / jaw set.
+    let (mat_impostor, mat_torso, mat_head, mat_jaw, mat_limb) = if is_zombie {
+        let set = assets.zombie_set(kind_or_slot);
+        (
+            set.skin.clone(),
+            set.clothing.clone(),
+            set.skin.clone(),
+            set.jaw.clone(),
+            set.limb.clone(),
+        )
+    } else {
+        let m = assets.body_mat(false, kind_or_slot);
+        (m.clone(), m.clone(), m.clone(), m.clone(), m)
+    };
     let (sil_head, _sil_arm) = silhouette_scale_table(if is_zombie {
         kind_or_slot.min(2)
     } else {
@@ -484,11 +818,11 @@ pub fn attach_humanoid(
     };
 
     root.with_children(|root_c| {
-        // Far-LOD impostor: one shared cuboid (hidden until Static band).
+        // Far-LOD impostor: skin colour family (matches detailed at 40–92 m swap).
         impostor_e = root_c
             .spawn((
                 Mesh3d(cube.clone()),
-                MeshMaterial3d(mat.clone()),
+                MeshMaterial3d(mat_impostor),
                 Transform::from_translation(Vec3::new(0.0, 0.95, 0.0))
                     .with_scale(Vec3::new(0.55, 1.75, 0.40)),
                 Visibility::Hidden,
@@ -509,38 +843,48 @@ pub fn attach_humanoid(
                         Visibility::default(),
                     ))
                     .with_children(|body| {
-                        // Torso
+                        // Torso — torn clothing band on zombies.
                         body_parts.push(
                             body.spawn((
                                 Mesh3d(cube.clone()),
-                                MeshMaterial3d(mat.clone()),
+                                MeshMaterial3d(mat_torso),
                                 Transform::from_translation(Vec3::new(0.0, TORSO_CY, 0.0))
                                     .with_scale(Vec3::new(TORSO_W, TORSO_H, TORSO_D)),
                             ))
                             .id(),
                         );
-                        // Head
+                        // Head — mottled skin.
                         body_parts.push(
                             body.spawn((
                                 Mesh3d(cube.clone()),
-                                MeshMaterial3d(mat.clone()),
+                                MeshMaterial3d(mat_head),
                                 Transform::from_translation(Vec3::new(0.0, head_cy, 0.0))
                                     .with_scale(Vec3::new(head_w, head_h, head_d)),
                             ))
                             .id(),
                         );
                         if is_zombie {
-                            // Jaw block — deep silhouette under the head.
+                            // Jaw block — darker mouth shadow under the head.
                             body_parts.push(
                                 body.spawn((
                                     Mesh3d(cube.clone()),
-                                    MeshMaterial3d(mat.clone()),
+                                    MeshMaterial3d(mat_jaw),
                                     Transform::from_translation(Vec3::new(0.0, Z_JAW_CY, -0.04))
                                         .with_scale(Vec3::new(Z_JAW_W, Z_JAW_H, Z_JAW_D)),
                                 ))
                                 .id(),
                             );
-                            // Emissive eyes — large, forward, shared eye mat.
+                            // Dark eye sockets (pits) + emissive glow orbs in front.
+                            for sx in [-Z_EYE_X, Z_EYE_X] {
+                                body.spawn((
+                                    Mesh3d(cube.clone()),
+                                    MeshMaterial3d(socket_mat.clone()),
+                                    Transform::from_translation(Vec3::new(
+                                        sx, Z_EYE_Y, Z_SOCKET_Z,
+                                    ))
+                                    .with_scale(Vec3::splat(Z_SOCKET_S)),
+                                ));
+                            }
                             eye_l = body
                                 .spawn((
                                     Mesh3d(cube.clone()),
@@ -566,7 +910,7 @@ pub fn attach_humanoid(
                         left_leg = limb_pivot(
                             body,
                             cube.clone(),
-                            mat.clone(),
+                            mat_limb.clone(),
                             Vec3::new(-LEG_X, LEG_JOINT_Y, 0.0),
                             LEG_W,
                             LEG_LEN,
@@ -574,7 +918,7 @@ pub fn attach_humanoid(
                         right_leg = limb_pivot(
                             body,
                             cube.clone(),
-                            mat.clone(),
+                            mat_limb.clone(),
                             Vec3::new(LEG_X, LEG_JOINT_Y, 0.0),
                             LEG_W,
                             LEG_LEN,
@@ -582,7 +926,7 @@ pub fn attach_humanoid(
                         left_arm = limb_pivot(
                             body,
                             cube.clone(),
-                            mat.clone(),
+                            mat_limb.clone(),
                             Vec3::new(-ARM_X, ARM_JOINT_Y, 0.0),
                             arm_w,
                             arm_len,
@@ -590,7 +934,7 @@ pub fn attach_humanoid(
                         right_arm = limb_pivot(
                             body,
                             cube.clone(),
-                            mat.clone(),
+                            mat_limb,
                             Vec3::new(ARM_X, ARM_JOINT_Y, 0.0),
                             arm_w,
                             arm_len,
@@ -1171,16 +1515,18 @@ mod tests {
         assert!((b.x - 1.5).abs() < 1e-5);
         assert!(b.y > 1.0);
 
-        // Colors differ across kinds (boosted contrast)
+        // Colors differ across kinds (grey-green / grey-yellow / dark olive)
         let c0 = kind_color(0).to_srgba();
         let c1 = kind_color(1).to_srgba();
         let c2 = kind_color(2).to_srgba();
         assert!(
-            (c0.red - c1.red).abs() + (c0.green - c1.green).abs() > 0.12,
+            (c0.red - c1.red).abs() + (c0.green - c1.green).abs() + (c0.blue - c1.blue).abs()
+                > 0.12,
             "walker vs runner colours should differ strongly"
         );
         assert!(
-            (c0.red - c2.red).abs() + (c0.green - c2.green).abs() > 0.12,
+            (c0.red - c2.red).abs() + (c0.green - c2.green).abs() + (c0.blue - c2.blue).abs()
+                > 0.12,
             "walker vs brute colours should differ strongly"
         );
 

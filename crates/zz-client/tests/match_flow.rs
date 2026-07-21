@@ -12,6 +12,7 @@ use bevy::time::TimeUpdateStrategy;
 use zz_client::game::{GamePlugin, LodMetrics, Predicted, RemotePlayer, RemoteZombie, Session};
 use zz_client::hud::{HudChrome, HudPlugin};
 use zz_client::map_render::{CurrentMap, MapRenderPlugin, MapRoot, Placeholder};
+use zz_client::models::RigAssets;
 use zz_client::net::{NetClient, NetEvent};
 use zz_client::seams::{COMBO_RESET_SEC, LastStats, LatestSnapshot, Roster, WAVE_BANNER_SEC, WaveUi};
 use zz_client::touch::TouchIntent;
@@ -654,6 +655,97 @@ fn horde_lod_transitions_bounded_and_entity_count_stable() {
 
 fn dequant_approx(q: i16) -> f32 {
     zz_core::snapshot::dequant_pos(q)
+}
+
+/// M25: three zombie kinds resolve to three DISTINCT material sets, and every
+/// primary zombie material carries a base_color_texture (fails on flat-colour
+/// HEAD; passes after procedural decayed-skin bake).
+#[test]
+fn zombie_materials_textured_and_kind_distinct() {
+    let app = headless_app();
+    // headless_app leaves Session::Menu so RigAssets builds on the next tick.
+    assert!(
+        app.world().get_resource::<RigAssets>().is_some(),
+        "RigAssets must land once Session leaves Boot/Connecting"
+    );
+
+    let skin_ids: Vec<_> = {
+        let assets = app.world().resource::<RigAssets>();
+        (0..3)
+            .map(|k| assets.zombie_mats[k].id())
+            .collect()
+    };
+    // Three distinct primary (skin) handles.
+    assert_ne!(skin_ids[0], skin_ids[1], "walker skin ≠ runner skin");
+    assert_ne!(skin_ids[0], skin_ids[2], "walker skin ≠ brute skin");
+    assert_ne!(skin_ids[1], skin_ids[2], "runner skin ≠ brute skin");
+
+    // Full per-kind sets: clothing / limb / jaw also distinct across kinds.
+    let set_ids: Vec<[bevy::asset::AssetId<StandardMaterial>; 4]> = {
+        let assets = app.world().resource::<RigAssets>();
+        (0..3)
+            .map(|k| {
+                let s = &assets.zombie_sets[k];
+                [s.skin.id(), s.clothing.id(), s.limb.id(), s.jaw.id()]
+            })
+            .collect()
+    };
+    for (part, _) in set_ids[0].iter().enumerate() {
+        assert_ne!(
+            set_ids[0][part], set_ids[1][part],
+            "part {part}: walker ≠ runner"
+        );
+        assert_ne!(
+            set_ids[0][part], set_ids[2][part],
+            "part {part}: walker ≠ brute"
+        );
+    }
+
+    // zombie_mats[k] is the skin handle (impostor colour family).
+    {
+        let assets = app.world().resource::<RigAssets>();
+        for k in 0..3 {
+            assert_eq!(
+                assets.zombie_mats[k].id(),
+                assets.zombie_sets[k].skin.id(),
+                "zombie_mats[{k}] must be the skin handle for LOD impostor"
+            );
+        }
+    }
+
+    // Every primary zombie material is textured (the M25 regression gate).
+    {
+        let assets = app.world().resource::<RigAssets>();
+        let mats = app.world().resource::<Assets<StandardMaterial>>();
+        for k in 0..3 {
+            let skin = mats
+                .get(&assets.zombie_mats[k])
+                .unwrap_or_else(|| panic!("missing zombie_mats[{k}]"));
+            assert!(
+                skin.base_color_texture.is_some(),
+                "zombie_mats[{k}] must carry base_color_texture (mottled skin); flat colour fails M25"
+            );
+            let set = &assets.zombie_sets[k];
+            for (label, h) in [
+                ("skin", &set.skin),
+                ("clothing", &set.clothing),
+                ("limb", &set.limb),
+            ] {
+                let m = mats
+                    .get(h)
+                    .unwrap_or_else(|| panic!("missing zombie_sets[{k}].{label}"));
+                assert!(
+                    m.base_color_texture.is_some(),
+                    "zombie_sets[{k}].{label} must be textured"
+                );
+            }
+            // Jaw is a dark solid for mouth-shadow read (no texture required).
+            let jaw = mats
+                .get(&set.jaw)
+                .unwrap_or_else(|| panic!("missing jaw[{k}]"));
+            let _ = jaw;
+        }
+    }
 }
 
 /// Seed Playing + first snap so fps_controller emits inputs.
